@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# Runtime state and generated config. These are bind-mounted at runtime and
+# carry credentials (SQLite ledger, config.json with the panel token, kernel
+# secret, exports, the tunnel token).
+# ---------------------------------------------------------------------------
+data/
+core/
+
+# Deployment credentials. Never commit: holds TUNNEL_TOKEN and the keyed
+# SUBSTORE_BACKEND URL.
+.env
+
+# ---------------------------------------------------------------------------
+# Local tooling output. .local/ holds diagnostic snapshots and screenshots
+# that embed the live panel token.
+# ---------------------------------------------------------------------------
+.local/
+.pi/
+.tmpcheck/
+
+# Workspace / assistant metadata (project notes may quote credentials)
+.workbuddy-ai/
+
+# Other AI tooling's workspace config
+.zcodeignore
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# Logs and scratch
+# ---------------------------------------------------------------------------
+*.log
+nohup.out
+*.tmp
+*.bak-*
+*.tar.gz

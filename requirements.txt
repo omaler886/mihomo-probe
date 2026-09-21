@@ -1,0 +1,17 @@
+# Runtime dependencies for mihomo-test.
+#
+# Deliberately tiny: everything else the service uses is Python standard
+# library. The app's only third-party import is YAML -- it parses upstream
+# subscription payloads, writes the kernel config, and emits the ClashMeta
+# export, all of which are YAML documents.
+#
+# There is no test-only dependency. tests/test_logic.py is hermetic stdlib
+# (unittest + sqlite3), and tests/test_live.py uses urllib and the same PyYAML.
+#
+# Install:
+#     pip install -r requirements.txt
+#
+# The Docker image installs exactly this file (see Dockerfile), and install.sh
+# runs `pip install -r requirements.txt` inside the container before testing, so
+# the declared list is the single source of truth rather than a comment.
+PyYAML==6.0.3

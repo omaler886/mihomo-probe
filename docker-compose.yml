@@ -1,0 +1,96 @@
+# Portable deployment: `docker compose up -d` brings up the whole stack.
+#
+#   mihomo-test      the app (web UI, test engine, scheduler, Sub-Store client)
+#   mihomo-probe     the mihomo kernel the tests actually run through
+#   cloudflared-probe  publishes the dashboard / export endpoints
+#
+# All state lives in ./data and ./core (bind-mounted), so migrating to another
+# VPS is: copy the project directory, then `docker compose up -d`.
+#
+# Everything uses host networking:
+#   * mihomo-probe needs it for IPv6 -- Docker bridges here have no IPv6 route,
+#     and an IPv6-only node fails every test through a bridge (verified 0/6 on a
+#     bridge vs 6/6 with host networking).
+#   * the app and cloudflared talk to each other and to the kernel over the
+#     host loopback, so no port publishing is needed anywhere.
+#
+# Paths: the project directory is mounted at the same path inside the app
+# container as it lives on the host (default /srv/mihomo-test). The app asks
+# the host daemon to bind-mount ./core for the kernel's own `mihomo -t` check,
+# and a container-only path would not resolve there. If you keep the project
+# somewhere else on the host, set MIHOMO_TEST_HOST_ROOT to that host path.
+
+services:
+  mihomo-probe:
+    image: metacubex/mihomo:latest
+    container_name: mihomo-probe
+    restart: unless-stopped
+    command: ["-d", "/root/.config/mihomo", "-f", "/root/.config/mihomo/config.yaml"]
+    volumes:
+      - ./core:/root/.config/mihomo
+    # Host networking is required, not a convenience: the Docker bridge has no
+    # IPv6, and the pre-existing healthcheck-v6 bridge only hands out a ULA
+    # with no NAT66 route, so an IPv6-only node fails every test through a
+    # bridge no matter how many times it is retried. Verified: 0/6 alive on a
+    # bridge, 6/6 alive with host networking.
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 1024
+    mem_limit: 384m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mihomo-test:
+    build: .
+    image: mihomo-test:local
+    container_name: mihomo-test
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - mihomo-probe
+    environment:
+      # Where the app finds its own files inside the container.
+      MIHOMO_TEST_ROOT: /srv/mihomo-test
+      # Where that same directory lives on the HOST (for docker bind-mounts).
+      MIHOMO_TEST_HOST_ROOT: ${MIHOMO_TEST_HOST_ROOT:-/srv/mihomo-test}
+      # Upstream Sub-Store to pull source subscriptions from. On this box it is
+      # the local instance; point it at any reachable backend to go remote.
+      # A backend URL may embed a secret path -- put yours in .env, never here.
+      SUBSTORE_BACKEND: ${SUBSTORE_BACKEND:-http://127.0.0.1:3000}
+      MIHOMO_TEST_TOKEN: ${MIHOMO_TEST_TOKEN:-}
+      MIHOMO_TEST_CORE_CONTAINER: ${MIHOMO_TEST_CORE_CONTAINER:-mihomo-probe}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # state (sqlite, config.json, exports, secrets) and the generated kernel
+      # config survive redeploys and travel with the project directory
+      - ./data:/srv/mihomo-test/data
+      - ./core:/srv/mihomo-test/core
+      # the app restarts the kernel container and runs its config check
+      - /var/run/docker.sock:/var/run/docker.sock
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  cloudflared-probe:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared-probe
+    restart: unless-stopped
+    network_mode: host
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

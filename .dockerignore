@@ -1,0 +1,14 @@
+# State and generated files must not leak into the build context or the image:
+# they are bind-mounted at runtime, and they carry credentials.
+data/
+core/
+.git/
+.tmpcheck/
+__pycache__/
+**/__pycache__/
+*.log
+nohup.out
+.env
+.local/
+.pi/
+.workbuddy-ai/
