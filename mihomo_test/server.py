@@ -11,6 +11,7 @@ from . import config as cfgmod
 from . import db
 from . import engine
 from . import notifier
+from . import substore_bridge
 from . import ui
 from .store import Client, StoreError
 
@@ -57,6 +58,16 @@ SECURITY_HEADERS = {
 # hostile page managed to make.
 CORS_ALLOW_HEADERS = "X-Auth-Token, Content-Type, Authorization"
 CORS_ALLOW_METHODS = "GET, POST, OPTIONS"
+
+
+def _publish_scoped(path):
+    """Paths a publish token may read: exports (prefix) + the probe node snapshot.
+
+    `/api/export/` is prefix-matched because the key may contain any legal
+    character; `/api/probe/nodes` is matched exactly, so a trailing path such
+    as `/api/probe/nodes/anything` cannot slip into the read-only scope.
+    """
+    return path.startswith("/api/export/") or path == "/api/probe/nodes"
 
 
 def cors_origin(cfg, handler):
@@ -126,10 +137,12 @@ def auth_ok(handler, cfg, path=None):
 
     The export endpoints additionally accept the read-only `publish.token`:
     those URLs are handed to Sub-Store and rendered into the page, so they must
-    not carry the admin credential.
+    not carry the admin credential. The probe node snapshot
+    (`GET /api/probe/nodes`) shares that publish scope: it is the metadata-only
+    readout Sub-Store consumes alongside the exports (ARCHITECTURE §5).
     """
     accepted = [str(cfg.get("auth", {}).get("token") or "")]
-    if path and path.startswith("/api/export/"):
+    if path and _publish_scoped(path):
         accepted.append(str(cfg.get("publish", {}).get("token") or ""))
     presented = _presented_tokens(handler)
     return any(_matches(c, t) for t in accepted for c in presented)
@@ -361,6 +374,28 @@ class Handler(BaseHTTPRequestHandler):
                 for node in nodes:
                     node["trend"] = trends.get(node["source"], {}).get(node["fingerprint"], [])
                 return self._send(200, {"nodes": nodes})
+            if path == "/api/probe/nodes":
+                # Read-only ledger snapshot for the official Sub-Store Script
+                # Operator (substore_bridge/probe_filter.script.js). The field
+                # whitelist and the response envelope live in
+                # substore_bridge.py so this endpoint and its tests cannot
+                # drift apart -- and no config value is read here at all.
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                source = (query.get("source", [""])[0] or "").strip() or None
+                status = (query.get("status", [""])[0] or "").strip() or None
+                if status is not None and status not in substore_bridge.PROBE_NODE_STATUSES:
+                    # Edge rejection, the `/api/run` mode whitelist style: an
+                    # unknown status would otherwise come back as an empty
+                    # 200 and read as "no such nodes" instead of a typo.
+                    return self._send(400, {"error":
+                        "status 必须是 "
+                        f"{'/'.join(substore_bridge.PROBE_NODE_STATUSES)}"
+                        f" 之一，收到 {status!r}"})
+                # An unknown `source` is not an error: for a read-only publish
+                # surface an empty answer is the correct answer, and it keeps
+                # the semantics of cfg["sources"] off this endpoint.
+                return self._send(200, substore_bridge.probe_nodes_snapshot(
+                    db.list_nodes(source=source, status=status)))
             if path == "/api/logs":
                 return self._send(200, {"events": db.recent_events(200)})
             if path == "/api/rounds":

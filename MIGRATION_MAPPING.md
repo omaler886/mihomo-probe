@@ -207,7 +207,7 @@
   "target_module": "mihomo_test/server.py（新增 GET /api/probe/nodes）+ mihomo_test/substore_bridge.py（payload 纯函数）",
   "compatibility": "鉴权沿用现有模型：publish.token 或 auth.token 皆可（与 /api/export 同一作用域）；只读；响应不含任何凭据/token 字段；新增路由不影响现有路由",
   "tests": ["test_hardening 风格：无 token 401 / publish token 200 / auth token 200 / 响应形状 / 不含敏感字段"],
-  "risk": "账本行数大时响应体大（加 ?source= 过滤与 count 上限）",
+  "risk": "账本行数大时响应体大（?source=/status 过滤；不做 count 截断——截断制造静默差异，且 nodes 表行数有界）",
   "owner": "backend-impl → tests"
 }
 ```
@@ -219,7 +219,7 @@
   "official_equivalent": "官方 Script Operator（processors/index.js ScriptOperator；签名 operator(proxies, targetPlatform, context)，$arguments 传参）",
   "decision": "extension",
   "target_module": "substore_bridge/probe_filter.script.js（独立脚本，粘贴进 Sub-Store 订阅 process 使用）",
-  "compatibility": "不 fork 官方核心；$arguments 约定：probe_url / probe_token / mode(filter|annotate|both) / missing(keep|drop)；节点匹配按 name 优先、(server,port) 兜底；probe API 不可达时按 missing 策略失败开放（默认 keep 不误杀）",
+  "compatibility": "不 fork 官方核心；$arguments 约定：probe_url / probe_token / mode(filter|annotate|both) / missing(keep|drop)；节点匹配按 name 优先、server 兜底（nodes 表无 port 列；同 host 多记录状态互相矛盾时按无记录处理，防误杀）；probe API 不可达时按 missing 策略失败开放（默认 keep 不误杀）",
   "tests": ["node --check 语法门禁", "Node 24 行为 harness：mock fetch + 官方 operator 签名调用，断言 filter/annotate/missing 三路径"],
   "risk": "官方脚本沙箱/ProxyUtils 能力差异（脚本只用 $server/$arguments/fetch 最小面，降低耦合）",
   "owner": "backend-impl → tests"

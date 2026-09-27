@@ -141,3 +141,62 @@ positional arguments:
 2. **模块定位**：test_logic（338，测活决策/导出/订阅逻辑）、test_hardening（88，鉴权/token/指纹/并发/静态资源/CORS）、test_alerts_lanes（21，告警/车道/看门狗）、test_ipmap（31，ipmap 离线逻辑）四者密闭（经 `_isolation.py` 隔离数据目录），迁移后应原样保留为门禁；test_live（7 个分组）依赖 vps 真实部署，不进本机门禁，迁移后在部署环境单独跑。
 3. **已知平台差异（非 flaky）**：Windows 上仅 2 个预期跳过——test_live 模块守卫、RoundLockTest 的 flock POSIX-only skipIf。无任何观察到的 flaky 用例：全量与分模块两次口径结果一致，hardening 模块虽含大量真实 HTTP server/线程（88 个用例 24 秒，为最慢模块）也稳定通过。
 4. **迁移后注意**：(a) 门禁若改跑 Linux 容器，RoundLockTest 会开始执行，属预期新增，勿记为回归；(b) `_isolation.py` 的隔离守卫与 test_live 的部署检测守卫是两道安全栏，移植测试时必须一并带走；(c) pytest 8.3.4 可完整收集 478 个用例，可作辅助跑法，但基线口径以 unittest discover 为准。
+
+## 十、批次 B3：substore_bridge 实现后（2026-09-28）
+
+### 10.1 范围与环境
+
+- 本节由第二轮 tests 子 Agent 追加：为 backend-impl 实现的 N-01~N-03（`mihomo_test/substore_bridge.py` 新增、`mihomo_test/server.py` 增 `GET /api/probe/nodes` 与 `_publish_scoped` 作用域谓词、`substore_bridge/probe_filter.script.js` 新增）做独立契约测试。本轮**只新增** `tests/test_substore_bridge.py` 与本节，未改任何实现文件（`git status --short` 核对：实现文件仍是 backend-impl 的既有改动集，测试新增仅 `?? tests/test_substore_bridge.py`）。
+- 环境与基线批次完全一致：Python 3.12.10、win32 10.0.26200 x64 + Git Bash、运行时依赖仍仅 PyYAML 6.0.3；本机另有 Node **v24.18.0**（`node --version`）。所有测试经 `_isolation.isolate()/restore()` 隔离，HTTP 全部打 `127.0.0.1` 回环，JS 用例的 fetch 由 harness 内 `globalThis.fetch` 替换应答，**无任何外网依赖**。
+
+### 10.2 新模块用例数与构成
+
+`tests/test_substore_bridge.py` 共 **52** 个用例（`python -m unittest tests.test_substore_bridge -v` 计数核对）：
+
+| 类 | 用例数 | 覆盖 |
+|---|---|---|
+| ProbeNodesPayloadTest | 9 | N-03 投影：9 字段精确集合（不多不少）、`last_delay_ms→delay_ms`、None 容忍、consec_fail None→0、fingerprint/last_reason/first_seen/last_seen/last_ok/total_ok/total_fail/ip_alive/ip_total 及 uuid/password/token 类敌意键不泄漏、空行列表/None、真实 `db.list_nodes` 行投影、NULL category→direct、原始行 display 回退 |
+| ProbeNodesSnapshotTest | 6 | N-03 envelope：恰四键 ok/generated_at/count/nodes、count 与 nodes 一致、generated_at 为 UTC 无时区后缀（正则 `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$`）且来自 `db.now()`（patch 验证）、显式 generated_at 透传、空账本 count:0 |
+| ProbeNodesEndpointTest | 16 | N-01 回环起服（沿用 test_hardening `_LiveServer` 模式）：无 token 401、publish token 200（query 与 X-Auth-Token 头两传法）、auth token 200、publish 作用域未被放大（/api/status 与 /api/config 仍 401）、/api/export 老行为未回退、source/status 过滤、未知 source 空 200、五个合法 status 全 200、status=bogus 400（错误信息列出白名单）、安全头+Content-Type、尾随路径 `/api/probe/nodes/extra`（含尾斜杠）publish token 仍 401、POST→404、响应体无 token/指纹/凭据字段、空账本 200 count:0 |
+| ProbeFilterScriptTest | 21 | N-02 Node 子进程 harness：1 个 `node --check` 语法门禁 + 20 个行为用例（mock fetch 驱动官方签名 `operator(proxies,"ClashMeta",{source:"test"})`） |
+
+JS 行为用例覆盖：filter 仅删 dead（默认 mode/missing）、missing=drop 删无记录、未知 mode/missing 回退 filter/keep、HTTP 500 / 401 / 非 JSON / `ok:false` envelope / 空账本均按 missing fail-open、annotate 追加 ` [HK]`（小写归一大写）与 ` ·dead`、country 非 null 且非两字母不加缀、annotate 幂等（二次调用不叠加、旧尾缀剥后重加）、both 先删后改且无 `·dead` 残留、`[CC] ` 前缀名经 server 兜底命中（host 归一化：大小写+尾点）、同 host 多记录状态一致→命中、矛盾→按无记录、无 server 节点按无记录、空订阅+缺 probe_url 仍抛错、空订阅+合法配置不 fetch、fetch 抛错 fail-open、token 只在 `X-Auth-Token` 头且不进 URL。
+
+harness 以临时文件方式在 setUp 生成（`probe_filter_harness.mjs`，tempfile.mkdtemp）、addCleanup 删除；**仓库无 .mjs 残留**（`ls tests/ | grep -i mjs` → 空；`ls substore_bridge/` → 仅 `probe_filter.script.js`）。Node 缺失时 `skipTest("node is not installed")`——本机 Node 24 为真跑。
+
+### 10.3 运行结果（真实输出摘录）
+
+新模块单独运行：
+
+```
+$ python -m unittest tests.test_substore_bridge -v 2>&1 | tail -3
+Ran 52 tests in 10.724s
+
+OK
+```
+
+全量回归（对比基线 479/477/2）：
+
+```
+$ python -m unittest discover -s tests -v 2>&1 | tail -6
+...
+Ran 531 tests in 38.327s
+
+OK (skipped=2)
+```
+
+- **531 = 基线 479 + 新增 52**；通过 529、失败 0、错误 0、跳过 2。两个跳过与基线完全相同（原文核对）：`test_live (unittest.loader.ModuleSkipped.test_live) ... skipped 'no live deployment at \\srv\\mihomo-test; ...'` 与 `test_second_round_is_refused_while_one_holds_the_lock ... skipped 'flock is POSIX-only'`。既有 479 个用例无一回退。
+- **JS 门禁**：`node --check substore_bridge/probe_filter.script.js` → 退出码 0（无语法错误输出）；语法门禁同时作为 unittest 用例（test_the_script_passes_the_node_syntax_check）在套件内执行，OK。
+
+### 10.4 四处契约裁量的独立核对结论
+
+逐条对照 ARCHITECTURE §3/§4 原文与实现现状，四条均**符合架构意图，按现状断言并接受**：
+
+1. **rows 的 category 为 NULL 时归一为 "direct" —— 接受。** 依据：§3.4 将 `category` 类型钉为 string（示例值 `"direct"`），而 `db.py list_nodes` 的注释明示全仓消费者都以 `n.category || "direct"` 读该列（迁移新增列、仅轮次盖章）；NULL 直传会给发布面制造第四种节点类别。测试按现状断言（`test_a_null_category_reads_as_direct`：NULL→"direct" 且显式 "relay" 不被覆盖；`test_the_body_carries_no_credentials` 端到端复核）。
+2. **rows 的 name 为 None 时回退 display —— 接受。** 依据：§3.4 的映射语义即 "`display→name`"——payload 的 name 唯一语义就是 display 名。对 `list_nodes` 行（SQL 已 `display AS name`）零差异：name 为 None 时 display 本身为 NULL，回退后仍为 None；该回退只让未经别名的 nodes 原始行也可投影（`test_a_raw_row_falls_back_to_display_for_name`）。
+3. **JS 空入站早退置于 probe_url 校验之后 —— 接受。** 依据：§4.4 将 probe_url 缺失钉为**配置级错误 fail-loud**（理由：本仓吃过「静默死亡管线」的亏，FEATURE_INVENTORY 移植事实 2）——若早退在校验之前，空订阅会静默吞掉配置手误，与 fail-loud 矛盾；§4.5「空入站数组直接原样返回」在 probe_url 合法时依然成立（`test_a_missing_probe_url_throws_even_on_an_empty_subscription` + `test_an_empty_subscription_short_circuits_without_fetching` 双向锁定）。
+4. **status 过滤白名单来自 PROBE_NODE_STATUSES、非法值 400 而非空结果 —— 接受。** 依据：§3.3 明文「不在白名单内 → **400**（沿用 /api/run mode 白名单的边缘拒绝风格）」，§3.5 的错误形状（中文 400、枚举五值）与实现一致；白名单常量取自 `substore_bridge.PROBE_NODE_STATUSES`（= policy.py 五常量），端点与测试共用单一事实来源，无漂移（`test_all_five_statuses_are_accepted` + `test_an_unknown_status_is_refused_400`，后者还断言错误信息列出全部五个合法值）。
+
+### 10.5 缺陷清单
+
+**无。** 52 个用例首跑即全绿，未发现实现与 ARCHITECTURE §3/§4 的任何偏差；全量回归 531 用例 OK (skipped=2)，退出码 0。
