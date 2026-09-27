@@ -64,6 +64,24 @@ def normalize_sources(sources):
 
     An explicitly supplied key is validated strictly so the user gets a clear
     error; an absent one is derived leniently from the resource name.
+
+    `export` defaults to true and is the only field that lets a source be
+    tested without being published. It exists for sources worth *watching* --
+    a flaky free subscription that occasionally yields one working node -- which
+    should still be measured and shown on the dashboard, but must not hand that
+    single node to every client. `enabled=False` cannot express this: it stops
+    the testing too, and demotes the ledger to `unknown`.
+
+    `relay` defaults to false and marks a source whose nodes are used as a
+    *transit hop* rather than as an exit. It only feeds the dashboard's
+    per-category statistics; it deliberately does not change what gets tested or
+    published, so switching it can never silently drop a source's export.
+
+    This function rebuilds each entry from a whitelist, so any key not named
+    here is silently dropped on every `load()`/`update()`. That is the reason
+    `relay` must be written out explicitly rather than left to survive by
+    accident -- a field this function forgets is a field the panel saves
+    successfully and then loses on the next boot.
     """
     if not isinstance(sources, list):
         return []
@@ -88,8 +106,91 @@ def normalize_sources(sources):
             "name": name,
             "label": str(entry.get("label") or name),
             "enabled": entry.get("enabled") is not False,
+            "export": entry.get("export") is not False,
+            # `is True` rather than truthiness: a hand-edited "yes"/1 should read
+            # as "not marked" instead of silently classifying a whole source as
+            # transit and skewing every per-category number on the dashboard.
+            "relay": entry.get("relay") is True,
+            # Two independent measurement switches, both defaulting to on.
+            #
+            # They only change anything for a node carrying `dialer-proxy`:
+            # a plain node is measured the same way either way (there is no
+            # dialer to keep or strip), so leaving both on does not double the
+            # round. A chained node is measured direct when `direct` is on
+            # (dialer stripped -- it is then judged as its own server, which is
+            # what "direct" means) and once per front when `chain` is on.
+            #
+            # `is not False` rather than truthiness, matching `enabled`/`export`:
+            # a config written before this field existed reads as "on", so the
+            # upgrade cannot silently stop measuring one of the two ways.
+            "direct": entry.get("direct") is not False,
+            "chain": entry.get("chain") is not False,
         })
     return out
+
+
+# The front pool accepts pasted text as well as a Sub-Store resource, and that
+# text goes straight into config.json. A cap keeps a stray paste (or a config
+# written by something other than the panel) from turning into a multi-megabyte
+# JSON blob that every `load()` then parses on the request path.
+MAX_FRONT_TEXT = 262144
+# Same reasoning for the pick list: it is names, not data.
+MAX_FRONT_PICK = 500
+
+
+def normalize_chain(block):
+    """Repair the `chain` block: front_source, pasted text, and the pick list.
+
+    Mirrors `normalize_sources`: an absent or malformed block becomes the
+    disabled default rather than raising, because this runs on every load and a
+    hand-edited config.json should not be able to stop the service from booting.
+
+    Three ways to name the front pool, and they compose rather than exclude each
+    other, because the pool is capped by `max_fronts` and the operator's intent
+    is "use these, in this order":
+
+    * `front_source` -- a Sub-Store resource, optionally narrowed by
+    * `front_pick`   -- the display names to keep from it (empty means "all"),
+    * `front_text`   -- share links or a base64 subscription body, pasted.
+
+    `front_pick` is deduplicated with order preserved: `collect_fronts` walks it
+    against the resource's own order, but a duplicate in the list would make the
+    panel report a different count than the pool actually holds.
+    """
+    out = dict(block) if isinstance(block, dict) else {}
+    ref = out.get("front_source")
+    ref = dict(ref) if isinstance(ref, dict) else {}
+    if ref.get("kind") not in SOURCE_KINDS:
+        ref["kind"] = "sub"
+    ref["name"] = str(ref.get("name") or "").strip()
+    out["front_source"] = ref
+    out["enabled"] = out.get("enabled") is True
+
+    text = out.get("front_text")
+    out["front_text"] = (text if isinstance(text, str) else "")[:MAX_FRONT_TEXT]
+
+    picked, seen = [], set()
+    raw_pick = out.get("front_pick")
+    for item in (raw_pick if isinstance(raw_pick, list) else []):
+        name = str(item or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        picked.append(name)
+        if len(picked) >= MAX_FRONT_PICK:
+            break
+    out["front_pick"] = picked
+    return out
+
+
+def front_source_name(block):
+    """The Sub-Store resource named as the front pool; '' when unset."""
+    return str(((block or {}).get("front_source") or {}).get("name") or "").strip()
+
+
+def front_text(block):
+    """The pasted front list, stripped; '' when unset."""
+    return str((block or {}).get("front_text") or "").strip()
 
 
 DEFAULTS = {
@@ -162,6 +263,30 @@ DEFAULTS = {
         "max_nodes": 0,
         "timeout_s": 15,
     },
+    # 链式代理测活。
+    #
+    # 上游订阅里带 `dialer-proxy` 的节点只有经前置才可能可用，当直连测会得到
+    # 假活（内核确实拨得通那个地址，只是客户端不会那样拨）。开启后这类节点不再
+    # 被当直连测：先测前置，再经「活着的前置」测链式；前置全死则该节点判失败，
+    # 原因记为 `front_dead`，而不是一个它根本没拨过的 `timeout`。
+    #
+    # 前置池来自一个 Sub-Store 资源而不是写死的 URI：前置换 IP / 换域名 / 换
+    # 协议时跟着 Sub-Store 自动更新，配置里不用动。实测这个前置必须带
+    # `xhttp-opts.x-padding-*` 才拨得通（剥掉就 504），而 Sub-Store 渲染的
+    # ClashMeta 会完整带上，所以直接引用即可。ECH 可以剥（实测剥了照样通），
+    # 于是 `verify.strip_ech` 不需要为它开特例。
+    "chain": {
+        "enabled": False,
+        "front_source": {"kind": "sub", "name": ""},
+        # 从前置来源里挑出来的节点名；空 = 该来源全部节点。
+        "front_pick": [],
+        # 手动粘贴的前置：分享链接（`vless://…` 每行一条）或 base64 订阅内容。
+        # 交给 Sub-Store 解析（见 engine.manual_fronts），本服务不自己写解析器。
+        "front_text": "",
+        # 前置池上限。链式节点的测试量是「节点数 × 前置数 × 地址数」，前置池
+        # 是乘数里最容易被无意放大的那个（一个 CF 前置订阅能轻松列出几十条）。
+        "max_fronts": 8,
+    },
     "policy": {
         "drop_after_consecutive_fails": 3,
         "suspect_floor_ratio": 0.5,
@@ -174,6 +299,13 @@ DEFAULTS = {
         "prefix": "probe",
         "hostname": os.environ.get("MIHOMO_TEST_HOSTNAME", "probe.example.com"),
         "add_region_tag": True,
+        # Read-only credential for the export endpoints, kept separate from
+        # `auth.token` on purpose. The export URL is pasted into Sub-Store and
+        # rendered into the dashboard, so it leaks by design -- and until this
+        # existed it leaked the *admin* token, which on this deployment is also
+        # the ability to drive the host's docker daemon. Generated on first
+        # load when empty; see `load()`.
+        "token": "",
     },
     "watchdog": {"round_timeout_minutes": 20},
     "alert": {
@@ -184,6 +316,15 @@ DEFAULTS = {
         "alive_floor": 0,
     },
     "auth": {"token": os.environ.get("MIHOMO_TEST_TOKEN", "")},
+    # 允许跨域调用本 API 的前端来源（也就是部署在 CDN 上那份静态前端）。
+    #
+    # 默认空数组 = 只有同源页面能用。这不是"保守"，是唯一安全的默认：同源部署
+    # 根本不需要 CORS，而一个默认放行的白名单等于把面板连同它的令牌接口交给
+    # 任何一个网站。要用 CDN 前端就显式填上那个来源。
+    #
+    # 比对是**精确匹配 origin**（含协议与端口，忽略结尾斜杠），不做通配 ——
+    # 通配子域意味着任何一个 `evil.example.com` 都能读到带令牌的响应。
+    "server": {"cors_origins": []},
     "ui": {"title": "mihomo 测活中心"},
 }
 
@@ -211,6 +352,18 @@ def _deep_merge(base, override):
 # read by code and absent from DEFAULTS; that is the normal shape of a
 # deployment-specific override.
 DEAD_KEYS = ("core.probe_group", "core.config_path")
+
+# Paths a config patch may not touch, whatever it says.
+#
+# `core.container` is the one that matters: the app holds a mounted
+# /var/run/docker.sock and passes this value straight to `docker restart` /
+# `docker start` / `docker logs` (see core.Core). Leaving it writable through
+# POST /api/config turns any token leak into "stop an arbitrary container on
+# the host", which is a different order of problem from "someone can read my
+# node list". Deployments set it with MIHOMO_TEST_CORE_CONTAINER instead --
+# that is read into DEFAULTS, so it still works, it just is not remotely
+# editable any more.
+IMMUTABLE_PATHS = ("core.container",)
 
 # Keys discarded by the most recent load(), for the round to report.
 _last_dropped = []
@@ -258,15 +411,41 @@ def prune_dead(stored):
     return kept, dropped
 
 
+def _ensure_tokens(cfg):
+    """Guarantee a usable admin token and a read-only publish token.
+
+    Called on *every* load, not just on the file-absent path. The original
+    version generated a token only when config.json did not exist, so a file
+    that existed but could not be parsed (`except (OSError, ValueError):
+    stored = {}`) fell through to DEFAULTS with `auth.token` empty -- and
+    `server.auth_ok` treats an empty token as "no auth configured" and lets
+    everything through. On this deployment that is an unauthenticated public
+    dashboard (the tunnel is the only ingress) that also hands out
+    `/api/export/*.yaml`, i.e. every live node's credentials, and accepts
+    POST /api/config. A truncated file after a full disk or an interrupted
+    write is enough to get there.
+
+    Returns True when something was generated, so the caller can persist it.
+    """
+    changed = False
+    for path in ("auth.token", "publish.token"):
+        current = str(_get_path(cfg, path) or "").strip()
+        if len(current) >= MIN_TOKEN_LEN:
+            continue
+        _set_path(cfg, path, secrets.token_hex(16))
+        changed = True
+    return changed
+
+
 def load():
     """Read config.json merged over defaults; write it back when absent."""
     DATA.mkdir(parents=True, exist_ok=True)
     with _lock:
         if not CONFIG_PATH.exists():
             cfg = copy.deepcopy(DEFAULTS)
-            if not cfg["auth"]["token"]:
-                cfg["auth"]["token"] = secrets.token_hex(16)
             cfg["sources"] = normalize_sources(cfg["sources"])
+            cfg["chain"] = normalize_chain(cfg.get("chain"))
+            _ensure_tokens(cfg)
             _write(cfg)
             return cfg
         try:
@@ -279,7 +458,11 @@ def load():
         # Defensive: a hand-edited or older file may hold keys that would be
         # unsafe as file names.
         cfg["sources"] = normalize_sources(cfg.get("sources"))
-        if dropped:
+        cfg["chain"] = normalize_chain(cfg.get("chain"))
+        # Persist when the file was pruned *or* when a token had to be minted:
+        # a token that only lives in this process would change on every
+        # restart, breaking every URL that was handed out.
+        if dropped or _ensure_tokens(cfg):
             # Persist the pruned form so the dead keys stop being rewritten by
             # every later save; the file converges on the schema.
             try:
@@ -304,12 +487,21 @@ def save(cfg):
 
 
 def reject_self_reference(sources, prefix):
-    """Raise when a source would consume this system's own published output."""
+    """Raise when a source would consume this system's own published output.
+
+    Only an *enabled* entry is a problem. Checking every entry regardless made
+    the check unsatisfiable in the one case it matters: a config that lists
+    `collection/<prefix>` with the box unticked was rejected on every save, so
+    the operator could not tick it back off -- the only way out of the state
+    the error message tells them to get out of. A disabled entry is inert:
+    `engine.export_keys` and the round both walk `enabled` sources only.
+    """
     prefix = str(prefix or "").strip()
     if not prefix:
         return
     for entry in sources or []:
         if (entry.get("kind") == "collection"
+                and entry.get("enabled") is True
                 and str(entry.get("name") or "").strip() == prefix):
             raise ValueError(
                 f"数据源 {entry.get('key')} 指向本系统自己的输出集合 {prefix}，"
@@ -328,9 +520,21 @@ NUMERIC_BOUNDS = {
     "test.timeout_ms_retry": (100, 60000),
     "test.max_attempts": (1, 10),
     "policy.drop_after_consecutive_fails": (1, 20),
+    # Multiplies every chained node's test count, so an extreme value here is a
+    # round that never finishes rather than a wrong answer.
+    "chain.max_fronts": (1, 64),
+    # These two were absent, and `notifier.send` does `int(cooldown_minutes)`
+    # without a guard: a non-numeric value raised inside `_maybe_alert`, which
+    # runs *after* the round has already been recorded and published, so the
+    # exception travelled up to `run_round`'s handler and stamped a successful
+    # round as "aborted".
+    "alert.cooldown_minutes": (1, 10080),
+    "alert.alive_floor": (0, 100000),
 }
 
-# `auth_ok` passes on a falsy token, so an empty one turns every auth check off.
+# `auth_ok` now *denies* on a falsy token (it used to pass, which turned an
+# empty value into "auth disabled"), so this is a second line of defence: a
+# token short enough to guess is no better than none.
 MIN_TOKEN_LEN = 16
 
 
@@ -354,11 +558,12 @@ def _set_path(cfg, path, value):
 def validate_patch(patch):
     """Return (clean_patch, notes) for a config patch coming from the UI.
 
-    Only the keys in DEAD_KEYS are dropped, plus out-of-range numbers clamped
-    and a too-short `auth.token` refused. This deliberately does *not* enforce
-    "must be in DEFAULTS": a deployment may legitimately carry keys the code
-    reads but DEFAULTS never declared (`core.mixed_port` is one), and rejecting
-    those would break a working install. See the DEAD_KEYS comment.
+    Only the keys in DEAD_KEYS are dropped, plus IMMUTABLE_PATHS, plus
+    out-of-range numbers clamped and too-short tokens refused. This
+    deliberately does *not* enforce "must be in DEFAULTS": a deployment may
+    legitimately carry keys the code reads but DEFAULTS never declared
+    (`core.mixed_port` is one), and rejecting those would break a working
+    install. See the DEAD_KEYS comment.
 
     Out-of-range numbers are clamped rather than rejected: an extreme value is
     usually a typo, and failing the whole save would throw away the user's other
@@ -368,6 +573,15 @@ def validate_patch(patch):
     notes = []
     if dropped:
         notes.append("忽略已废弃配置项: " + ", ".join(sorted(dropped)))
+    for path in IMMUTABLE_PATHS:
+        head, _, leaf = path.partition(".")
+        section = clean.get(head)
+        if isinstance(section, dict) and leaf in section:
+            section.pop(leaf)
+            if not section:
+                del clean[head]
+            notes.append(f"忽略不可远程修改的配置项: {path}"
+                         "（改用环境变量 MIHOMO_TEST_CORE_CONTAINER）")
     for path, (low, high) in NUMERIC_BOUNDS.items():
         value = _get_path(clean, path)
         if value is None:
@@ -382,11 +596,32 @@ def validate_patch(patch):
         if clamped != number:
             _set_path(clean, path, clamped)
             notes.append(f"{path} 超出 [{low}, {high}]，已夹取为 {clamped}")
-    if _get_path(clean, "auth.token") is not None \
-            and len(str(_get_path(clean, "auth.token") or "")) < MIN_TOKEN_LEN:
-        del clean["auth"]["token"]
-        notes.append(f"auth.token 过短（<{MIN_TOKEN_LEN}）已忽略："
-                     "空 token 会关闭全部鉴权")
+    # An empty target list is not a valid setting: `engine.test_one` raises
+    # ValueError on it, so every scheduled round afterwards would die in the
+    # worker pool and be recorded as an exception, with nothing in the panel
+    # saying why. Refuse the value instead of accepting a config that cannot run.
+    targets = _get_path(clean, "test.targets")
+    if targets is not None and not [t for t in targets if str(t).strip()]:
+        _set_path(clean, "test.targets", list(DEFAULTS["test"]["targets"]))
+        notes.append("test.targets 不能为空，已还原为默认测试目标")
+    # `chain.front_text` is refused rather than truncated when it is absurdly
+    # long. Truncating a base64 body yields something that still looks like a
+    # subscription and parses into garbage nodes, so the failure would surface
+    # as "the front pool is empty" with nothing pointing at the paste.
+    text = _get_path(clean, "chain.front_text")
+    if isinstance(text, str) and len(text) > MAX_FRONT_TEXT:
+        clean["chain"].pop("front_text", None)
+        if not clean["chain"]:
+            del clean["chain"]
+        notes.append(f"chain.front_text 超过 {MAX_FRONT_TEXT} 字符，已忽略（原值保留）")
+    for path in ("auth.token", "publish.token"):
+        value = _get_path(clean, path)
+        if value is None:
+            continue
+        if len(str(value or "").strip()) < MIN_TOKEN_LEN:
+            del clean[path.split(".")[0]][path.split(".")[1]]
+            notes.append(f"{path} 过短（<{MIN_TOKEN_LEN}）已忽略："
+                         "空 token 会关闭全部鉴权")
     return clean, notes
 
 
@@ -397,6 +632,8 @@ def update(patch):
         if "sources" in (patch or {}):
             cfg["sources"] = normalize_sources(cfg.get("sources"))
             reject_self_reference(cfg["sources"], cfg.get("publish", {}).get("prefix"))
+        if "chain" in (patch or {}):
+            cfg["chain"] = normalize_chain(cfg.get("chain"))
         return save(cfg)
 
 

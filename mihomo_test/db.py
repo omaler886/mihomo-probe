@@ -40,6 +40,10 @@ CREATE TABLE IF NOT EXISTS nodes (
   last_reason TEXT,
   ip_alive INTEGER,
   ip_total INTEGER,
+  -- direct / relay / chain. Kept on the node row so the dashboard can group a
+  -- source's own nodes by kind, and re-stamped every round so re-marking a
+  -- source as a relay moves its nodes instead of leaving them in the old bucket.
+  category TEXT,
   PRIMARY KEY (source, fingerprint)
 );
 CREATE TABLE IF NOT EXISTS rounds (
@@ -54,7 +58,8 @@ CREATE TABLE IF NOT EXISTS rounds (
   restored INTEGER DEFAULT 0,
   suspect INTEGER DEFAULT 0,
   note TEXT,
-  duration_s REAL
+  duration_s REAL,
+  mode TEXT
 );
 CREATE TABLE IF NOT EXISTS results (
   round_id INTEGER NOT NULL,
@@ -66,10 +71,25 @@ CREATE TABLE IF NOT EXISTS results (
   reason TEXT,
   country TEXT,
   attempts INTEGER,
-  detail TEXT
+  detail TEXT,
+  -- The per-round copy of the node's category. `nodes.category` only holds the
+  -- latest value, so the round-over-round history needed to answer "did the
+  -- chain pool get worse this week" has to live here, alongside the verdict it
+  -- belongs to.
+  category TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_results_round ON results(round_id);
 CREATE INDEX IF NOT EXISTS idx_results_node ON results(source, fingerprint);
+-- `recent_trends` filters on source and orders by round_id. Without a
+-- (source, round_id) index that is a full scan plus a sort of the whole table,
+-- on every /api/nodes poll (the dashboard polls every 5 seconds) -- and the
+-- table has no retention of its own.
+CREATE INDEX IF NOT EXISTS idx_results_source_round ON results(source, round_id DESC);
+CREATE INDEX IF NOT EXISTS idx_nodes_source ON nodes(source);
+-- The per-category breakdown groups one round's rows by category, so the index
+-- has to lead with round_id: `idx_results_source_round` cannot serve it.
+CREATE INDEX IF NOT EXISTS idx_results_round_category ON results(round_id, category);
+CREATE INDEX IF NOT EXISTS idx_rounds_finished ON rounds(finished_at, id DESC);
 CREATE TABLE IF NOT EXISTS ip_geo (
   ip TEXT PRIMARY KEY,
   country TEXT,
@@ -119,8 +139,24 @@ def connect():
     with _lock:
         if _conn is None:
             DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+            # `timeout` and WAL are not tuning, they are correctness. The app
+            # and the CLI are separate processes and `run_round` says so
+            # explicitly: while a CLI round writes results, the service is still
+            # writing events through its own connection. With the default
+            # rollback journal and a 5s busy timeout that is
+            # "OperationalError: database is locked" -- and `db.log` is called
+            # from failure paths, so losing that write loses the only record of
+            # the original problem. WAL lets readers and one writer coexist.
+            _conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
             _conn.row_factory = sqlite3.Row
+            try:
+                _conn.execute("PRAGMA journal_mode=WAL")
+                _conn.execute("PRAGMA busy_timeout=30000")
+                _conn.execute("PRAGMA synchronous=NORMAL")
+            except sqlite3.Error:
+                # An older build or a filesystem that refuses WAL still works,
+                # just with the old contention behaviour.
+                pass
             # Migrate before creating indexes: an index on a column added by
             # migration cannot be built against the older table.
             _migrate(_conn)
@@ -145,11 +181,13 @@ def _backup(path):
 
 
 def _migrate(conn):
-    """Drop bookkeeping written before nodes were keyed by fingerprint."""
+    """In-place column additions, then the one drop-everything migration."""
     tables = {row[0] for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     if "nodes" not in tables:
         return
+    _add_round_mode(conn, tables)
+    _add_category_columns(conn, tables)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(nodes)")}
     if "fingerprint" in columns:
         # in-place addition for nodes written before per-IP verdicts existed
@@ -165,6 +203,51 @@ def _migrate(conn):
         for table in ("results", "nodes"):
             if table in tables:
                 conn.execute(f"DROP TABLE {table}")
+
+
+def _add_category_columns(conn, tables):
+    """Add `category` to `nodes` and `results` on a pre-category database.
+
+    Existing rows are back-filled to `direct` rather than left NULL. A NULL
+    would not be a harmless "unknown": the per-category breakdown groups on this
+    column, so a NULL bucket shows up on the dashboard as a fourth category with
+    no name next to it. `direct` is the honest default -- before this feature
+    existed, a node with a `dialer-proxy` was tested direct, which is exactly
+    what the column now records.
+
+    Called before the fingerprint branch and independent of it, for the same
+    reason `_add_round_mode` is: the rounds table and both of these columns have
+    to exist whether or not the drop-everything rebuild runs.
+    """
+    for table in ("nodes", "results"):
+        if table not in tables:
+            continue
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if "category" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN category TEXT")
+            conn.execute(f"UPDATE {table} SET category='direct' WHERE category IS NULL")
+            conn.commit()
+    if "results" in tables:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_results_round_category "
+                     "ON results(round_id, category)")
+        conn.commit()
+
+
+def _add_round_mode(conn, tables):
+    """Add `rounds.mode` to a database written before manual round modes existed.
+
+    Purely additive, and deliberately independent of the fingerprint check
+    below: the rounds table predates nodes-as-fingerprints and is never
+    dropped, so the column has to be added on both branches. `ALTER TABLE ADD
+    COLUMN` cannot fail on a database that already has it -- it raises
+    OperationalError -- so the PRAGMA check is what makes this idempotent.
+    """
+    if "rounds" not in tables:
+        return
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(rounds)")}
+    if "mode" not in cols:
+        conn.execute("ALTER TABLE rounds ADD COLUMN mode TEXT")
+        conn.commit()
 
 
 def execute(sql, params=()):
@@ -193,8 +276,11 @@ def log(level, message):
     )
 
 
-def start_round(trigger):
-    cur = execute("INSERT INTO rounds(started_at, trigger) VALUES(?,?)", (now(), trigger))
+def start_round(trigger, mode=None):
+    """Open a round row. `mode` mirrors what the engine ran: None (scheduler),
+    "direct" (直连测活) or "chain" (链式测活)."""
+    cur = execute("INSERT INTO rounds(started_at, trigger, mode) VALUES(?,?,?)",
+                  (now(), trigger, mode))
     return cur.lastrowid
 
 
@@ -205,12 +291,18 @@ def finish_round(round_id, **fields):
 
 
 def record_result(round_id, source, fingerprint, display, verdict, delay_ms,
-                  reason, country, attempts, detail):
+                  reason, country, attempts, detail, category=None):
+    """Append one node's verdict for this round.
+
+    `category` is optional so the pre-category call shapes keep working; a NULL
+    here is grouped under `direct` by `stats_by_category` rather than surfacing
+    as an unnamed fourth bucket.
+    """
     execute(
         "INSERT INTO results(round_id, source, fingerprint, display, verdict, delay_ms,"
-        " reason, country, attempts, detail) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        " reason, country, attempts, detail, category) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         (round_id, source, fingerprint, display, verdict, delay_ms, reason, country,
-         attempts, detail),
+         attempts, detail, category),
     )
 
 
@@ -240,27 +332,57 @@ def upsert_node(source, fingerprint, display=None, **fields):
 
 
 def delete_nodes_not_in(source, keep_fingerprints):
-    """Drop bookkeeping for nodes that vanished upstream."""
+    """Drop bookkeeping for nodes that vanished upstream.
+
+    Deleting the complement cannot be chunked, so the keep-list is inverted in
+    Python and the rows are removed in chunks -- same reason as `ip_geo_get`:
+    this list is every node the round tested, which is well past 999.
+    """
     if not keep_fingerprints:
         cur = execute("DELETE FROM nodes WHERE source=?", (source,))
         return cur.rowcount
-    placeholders = ",".join("?" for _ in keep_fingerprints)
-    cur = execute(
-        f"DELETE FROM nodes WHERE source=? AND fingerprint NOT IN ({placeholders})",
-        (source, *keep_fingerprints),
-    )
-    return cur.rowcount
+    keep = set(keep_fingerprints)
+    victims = [row["fingerprint"] for row in
+               query("SELECT fingerprint FROM nodes WHERE source=?", (source,))
+               if row["fingerprint"] not in keep]
+    removed = 0
+    for chunk in _chunked(victims):
+        placeholders = ",".join("?" for _ in chunk)
+        removed += execute(
+            f"DELETE FROM nodes WHERE source=? AND fingerprint IN ({placeholders})",
+            (source, *chunk),
+        ).rowcount
+    return removed
+
+
+# SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999 (32766 on 3.32+), and a
+# round hands `ip_geo_get` every candidate address of every source. At 300
+# nodes resolving to 2-4 addresses each that is 600-1200 placeholders, so on an
+# older build the query raised "too many SQL variables" -- inside
+# `classify_and_expand`, i.e. the whole round failed, for a reason that looks
+# nothing like its cause.
+SQL_VAR_CHUNK = 400
+
+
+def _chunked(items, size=SQL_VAR_CHUNK):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
 
 
 def ip_geo_get(ips):
     """Return {ip: countryCode} for the cached subset of ips."""
-    ips = [i for i in ips if i]
+    ips = [i for i in dict.fromkeys(i for i in ips if i)]
     if not ips:
         return {}
-    placeholders = ",".join("?" for _ in ips)
-    return {row["ip"]: row["country"]
+    out = {}
+    for chunk in _chunked(ips):
+        placeholders = ",".join("?" for _ in chunk)
+        out.update({
+            row["ip"]: row["country"]
             for row in query(f"SELECT ip, country FROM ip_geo WHERE ip IN ({placeholders})",
-                             tuple(ips))}
+                             tuple(chunk))
+        })
+    return out
 
 
 def ip_geo_put(rows):
@@ -348,9 +470,14 @@ def demote_disabled_sources(enabled_keys):
 
 
 def list_nodes(source=None, status=None):
+    # `category` has to be selected explicitly: every consumer reads it as
+    # `n.category || "direct"`, so omitting it here does not blank the column --
+    # it silently relabels every 中转 and 链式 node as 直连 in the table, the
+    # filter and the badge, while `/api/stats` (which queries the column
+    # directly) keeps reporting the correct split.
     sql = ("SELECT source, fingerprint, display AS name, proto, server, country,"
            " status, consec_fail, last_delay_ms, last_reason, last_ok, total_ok,"
-           " total_fail, first_seen, last_seen, ip_alive, ip_total FROM nodes")
+           " total_fail, first_seen, last_seen, ip_alive, ip_total, category FROM nodes")
     where, params = [], []
     if source:
         where.append("source=?")
@@ -379,6 +506,59 @@ def recent_trends(source, limit_per_node=12):
     return trends
 
 
+def recent_trends_all(limit_per_node=12, per_source_rows=8000):
+    """Return {source: {fingerprint: [verdict, ...]}} in one pass.
+
+    `/api/nodes` used to call `recent_trends` once per distinct source and then
+    loop over every node for each of those calls -- O(sources x nodes) Python
+    work, on a payload the dashboard re-fetches every 5 seconds. The per-source
+    row cap is preserved by taking the newest `per_source_rows` rounds' worth
+    for each source with a window function instead of a global LIMIT.
+    """
+    rows = query(
+        "SELECT source, fingerprint, verdict FROM ("
+        "  SELECT source, fingerprint, verdict,"
+        "         ROW_NUMBER() OVER (PARTITION BY source ORDER BY round_id DESC) AS rn"
+        "  FROM results"
+        ") WHERE rn <= ?",
+        (per_source_rows,),
+    )
+    out = {}
+    for row in rows:
+        bucket = out.setdefault(row["source"], {}).setdefault(row["fingerprint"], [])
+        if len(bucket) < limit_per_node:
+            bucket.append(row["verdict"])
+    return out
+
+
+# How many completed rounds of per-node history to keep. `results` has one row
+# per node per round, so at 2000 nodes and a 30-minute interval it grows by
+# roughly 3M rows a month with nothing pruning it -- in a container capped at
+# 256MB. `events` was already trimmed; this is the table that actually grows.
+KEEP_RESULT_ROUNDS = 500
+
+
+def trim_results(cfg=None, keep_rounds=KEEP_RESULT_ROUNDS):
+    """Delete `results` rows older than the newest `keep_rounds` rounds.
+
+    Returns the number of rows removed. Rounds themselves and the `nodes`
+    ledger are never touched: those are small and carry the convergence state.
+    """
+    row = one("SELECT MIN(id) AS cutoff FROM ("
+              "  SELECT id FROM rounds ORDER BY id DESC LIMIT ?)", (int(keep_rounds),))
+    cutoff = (row or {}).get("cutoff")
+    if not cutoff:
+        return 0
+    cur = execute("DELETE FROM results WHERE round_id < ?", (cutoff,))
+    return cur.rowcount
+
+
+def open_rounds():
+    """Rounds that were started and never closed, oldest first."""
+    return query("SELECT id, started_at, trigger FROM rounds "
+                 "WHERE finished_at IS NULL ORDER BY id")
+
+
 def last_rounds(limit=20):
     return query("SELECT * FROM rounds ORDER BY id DESC LIMIT ?", (limit,))
 
@@ -402,3 +582,150 @@ def stats():
         " FROM nodes"
     )
     return {k: (v or 0) for k, v in (row or {}).items()}
+
+
+# The two units a per-category total can be counted in, and they are not the
+# same number. Measured live: 348 nodes in the ledger against 504 dialled rows
+# in one round, because a node resolving to two addresses is one ledger row and
+# two test rows, and a chained node is one ledger row and one row per front.
+#
+# Reporting only one of them is what makes the dashboard look broken: the node
+# table (ledger) and the round summary (rows) would show different totals for
+# the same category, and neither would be wrong. Both are returned, labelled.
+CATEGORY_BUCKETS = ("direct", "relay", "chain")
+
+
+def stats_by_category(round_id=None):
+    """Per-category counts in both units, for the dashboard.
+
+    `nodes` answers "how many 直连节点 do I have"; `tested` answers "how much
+    work did 直连 cost this round". A node whose `category` is NULL -- written
+    before this column existed, or by a caller that did not pass one -- is
+    grouped under `direct`, which is what those nodes were in fact tested as.
+
+    `round_id` defaults to the most recent round that has results, not to
+    `last_round()`: a round in flight has a `rounds` row but no `results` yet,
+    and defaulting to it would blank the panel for the minute a round runs.
+
+    Delay statistics come only from `alive` rows, since a failed verdict stores
+    the delay of the attempt that failed, which is a timeout constant rather
+    than a measurement.
+    """
+    if round_id is None:
+        row = one("SELECT MAX(round_id) AS rid FROM results")
+        round_id = (row or {}).get("rid")
+
+    out = {
+        cat: {
+            "category": cat,
+            "nodes": {"total": 0, "alive": 0, "dead": 0, "pending": 0,
+                      "unknown": 0, "excluded": 0},
+            # Every key the populated path can set has to exist here too. The
+            # dashboard reads `tested.skipped` unconditionally when it builds a
+            # category card, and a missing key renders as "undefined" -- or
+            # throws, if it lands in arithmetic. An empty category is the
+            # *normal* state for relay/chain until a relay source is configured,
+            # so this is the shape the panel sees first.
+            "tested": {"total": 0, "ok": 0, "fail": 0, "skipped": 0},
+            "delay_ms": {"median": None, "avg": None, "min": None, "max": None},
+            "reasons": [],
+            "top_countries": [],
+        }
+        for cat in CATEGORY_BUCKETS
+    }
+
+    for row in query(
+        "SELECT COALESCE(category, 'direct') AS cat,"
+        " COUNT(*) AS total,"
+        " SUM(status='alive') AS alive,"
+        " SUM(status='dead') AS dead,"
+        " SUM(status='pending') AS pending,"
+        " SUM(status='unknown') AS unknown,"
+        " SUM(status='excluded') AS excluded"
+        " FROM nodes GROUP BY cat"
+    ):
+        bucket = out.get(row["cat"])
+        if bucket is None:
+            continue
+        bucket["nodes"] = {k: (row[k] or 0) for k in
+                           ("total", "alive", "dead", "pending", "unknown", "excluded")}
+
+    if round_id is None:
+        return {"round_id": None, "categories": out}
+    results = query(
+        "SELECT COALESCE(category, 'direct') AS cat,"
+        " COUNT(*) AS total,"
+        " SUM(verdict='ok') AS ok,"
+        " SUM(verdict='fail') AS fail,"
+        " SUM(verdict='excluded') AS skipped,"
+        " AVG(CASE WHEN verdict='ok' AND delay_ms IS NOT NULL THEN delay_ms END) AS avg_ms,"
+        " MIN(CASE WHEN verdict='ok' AND delay_ms IS NOT NULL THEN delay_ms END) AS min_ms,"
+        " MAX(CASE WHEN verdict='ok' AND delay_ms IS NOT NULL THEN delay_ms END) AS max_ms"
+        " FROM results WHERE round_id=? GROUP BY cat",
+        (round_id,),
+    )
+    for row in results:
+        bucket = out.get(row["cat"])
+        if bucket is None:
+            continue
+        bucket["tested"] = {
+            "total": row["total"] or 0,
+            "ok": row["ok"] or 0,
+            "fail": row["fail"] or 0,
+            # `excluded` is neither a pass nor a failure: the node was never
+            # dialled. Counted separately so ok+fail+skipped adds up to total.
+            "skipped": row["skipped"] or 0,
+        }
+        if row["avg_ms"] is not None:
+            bucket["delay_ms"] = {
+                "avg": round(float(row["avg_ms"]), 1),
+                "min": row["min_ms"],
+                "max": row["max_ms"],
+                "median": _median_delay(round_id, row["cat"]),
+            }
+
+    for row in query(
+        "SELECT COALESCE(category, 'direct') AS cat, COALESCE(reason, 'ok') AS reason,"
+        " COUNT(*) AS n FROM results WHERE round_id=?"
+        " AND verdict<>'ok' GROUP BY cat, reason ORDER BY n DESC",
+        (round_id,),
+    ):
+        bucket = out.get(row["cat"])
+        if bucket is not None and len(bucket["reasons"]) < 6:
+            bucket["reasons"].append({"reason": row["reason"], "count": row["n"]})
+
+    for row in query(
+        "SELECT COALESCE(category, 'direct') AS cat, COALESCE(country, '—') AS country,"
+        " COUNT(*) AS n FROM results WHERE round_id=? AND verdict='ok'"
+        " GROUP BY cat, country ORDER BY n DESC",
+        (round_id,),
+    ):
+        bucket = out.get(row["cat"])
+        if bucket is not None and len(bucket["top_countries"]) < 6:
+            bucket["top_countries"].append({"country": row["country"], "count": row["n"]})
+
+    return {"round_id": round_id, "categories": out}
+
+
+def _median_delay(round_id, category):
+    """Median of one category's successful delays this round.
+
+    Computed in SQL with an offset rather than by pulling every delay into
+    Python: a category can hold several hundred rows and this runs on the
+    dashboard's poll.
+    """
+    row = one(
+        "SELECT COUNT(*) AS n FROM results WHERE round_id=?"
+        " AND COALESCE(category,'direct')=? AND verdict='ok' AND delay_ms IS NOT NULL",
+        (round_id, category),
+    )
+    count = (row or {}).get("n") or 0
+    if not count:
+        return None
+    row = one(
+        "SELECT delay_ms FROM results WHERE round_id=?"
+        " AND COALESCE(category,'direct')=? AND verdict='ok' AND delay_ms IS NOT NULL"
+        " ORDER BY delay_ms LIMIT 1 OFFSET ?",
+        (round_id, category, count // 2),
+    )
+    return (row or {}).get("delay_ms")

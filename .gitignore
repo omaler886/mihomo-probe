@@ -18,6 +18,15 @@ core/
 .pi/
 .tmpcheck/
 
+# CDN build output and its tooling cache. `dist/` is reproducible from
+# `mihomo_test/web/` via `tools/build_web.py` -- committing it would create a
+# second copy of the front end that silently goes stale, and `.wrangler/` is
+# just wrangler's local cache (it also records the project name, which is
+# deployment-specific).
+# ---------------------------------------------------------------------------
+dist/
+.wrangler/
+
 # Workspace / assistant metadata (project notes may quote credentials)
 .workbuddy-ai/
 
@@ -45,3 +54,15 @@ nohup.out
 *.tmp
 *.bak-*
 *.tar.gz
+
+# ---------------------------------------------------------------------------
+# Session diagnostics that embed live credentials or subscription URLs.
+# SECURITY_REVIEW.md S-04~S-07/S-10: dom snapshots carry the real publish
+# token, .tmp_diag/ holds raw subscriptions and node configs, reports/ holds
+# ipmap output with orig_proxy credentials. Never commit any of these.
+# ---------------------------------------------------------------------------
+.tmp_diag/
+reports/
+dom_*.html
+console_*.txt
+chain-alive-*.md

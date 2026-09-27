@@ -89,20 +89,30 @@ def send(cfg, key, title, body, level="warn", log=None):
 
     Returns a list of per-channel result strings; an empty list means every
     channel is unconfigured, which is not an error.
+
+    The cooldown is recorded only after at least one channel accepted the
+    message. Recording it first meant a delivery failure -- Telegram down, a
+    webhook timeout, a mistyped token -- still consumed the window, and the
+    next `cooldown_minutes` (240 by default) of that alert were skipped with an
+    `info` line saying "冷却期". That converts a transient delivery problem into
+    four hours of silence about a real condition.
     """
     cfg_alert = cfg.get("alert", {})
     if not cfg_alert.get("enabled", False):
         return []
     level = level if level in LEVELS else "warn"
-    cooldown = max(1, int(cfg_alert.get("cooldown_minutes", 240)))
+    try:
+        cooldown = max(1, int(cfg_alert.get("cooldown_minutes", 240)))
+    except (TypeError, ValueError):
+        # `validate_patch` clamps this now, but a hand-edited config.json or a
+        # cfg built by a caller can still carry junk, and this used to raise.
+        cooldown = 240
 
     state = _state()
     if not _cooldown_ok(state, key, cooldown):
         if log:
             log("info", f"告警 {key} 处于冷却期，跳过发送")
         return []
-    state[key] = time.time()
-    _save(state)
 
     # Labelled UTC and actually UTC: the container runs TZ=Asia/Shanghai, so a
     # bare strftime here used to print local time under a "UTC" label and put
@@ -112,17 +122,37 @@ def send(cfg, key, title, body, level="warn", log=None):
     payload = {"key": key, "level": level, "title": title, "body": body,
                "source": "mihomo-test", "ts": int(time.time())}
 
-    results = []
+    results, delivered = [], False
     if (cfg_alert.get("telegram") or {}).get("enabled"):
         ok, detail = telegram_send(cfg_alert, text)
+        delivered = delivered or ok
         results.append(f"telegram: {'已发送' if ok else detail}")
     if (cfg_alert.get("webhook") or {}).get("enabled"):
         ok, detail = webhook_send(cfg_alert, payload)
+        delivered = delivered or ok
         results.append(f"webhook: {'已发送' if ok else detail}")
 
+    if delivered:
+        try:
+            state[key] = time.time()
+            _save(state)
+        except OSError as exc:
+            if log:
+                log("warn", f"告警冷却状态写入失败（{exc}）：下次同类告警可能重复发送")
     if log:
-        log(level if level != "error" else "error", f"告警[{key}] {title}"
-            + (f"（{'; '.join(results)}）" if results else "（未配置任何通道）"))
+        # A total delivery failure is logged as an error, not as the alert's own
+        # level. It used to be recorded as "in cooldown, skipped" at info level
+        # even though nothing had ever been sent, so a broken channel looked
+        # exactly like a healthy one being rate-limited.
+        note = ""
+        if results and not delivered:
+            note = "（全部通道投递失败，未进入冷却期，下次仍会尝试）"
+        elif not results:
+            note = "（未配置任何通道）"
+        elif delivered:
+            note = f"（{'; '.join(results)}）"
+        level_out = "error" if (results and not delivered) else level
+        log(level_out, f"告警[{key}] {title}{note}")
     return results
 
 

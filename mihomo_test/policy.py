@@ -89,10 +89,3 @@ def round_is_suspect(alive_now, alive_prev, policy):
     floor = int(policy.get("suspect_floor_absolute", 3))
     return alive_now < max(floor, alive_prev * ratio)
 
-
-def summarize(records):
-    """Count statuses for the UI."""
-    counts = {ALIVE: 0, PENDING: 0, DEAD: 0, UNKNOWN: 0, EXCLUDED: 0}
-    for record in records:
-        counts[record.get("status") or UNKNOWN] = counts.get(record.get("status") or UNKNOWN, 0) + 1
-    return counts

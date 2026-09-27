@@ -55,7 +55,10 @@ cd /srv/mihomo-test && docker compose up -d --build
 
 - 应用容器挂载了 `/var/run/docker.sock`（重启内核容器、跑内核自己的配置校验）。
   这等于给它宿主机 root 级别的能力。本部署本来就是 root 在跑，实际安全面没有变大，
-  但你应该知道这一点。
+  但你应该知道这一点。代码侧做了三件事把这个能力圈起来：`core.container` 不接受
+  远程修改（见「面板」一节）、导出端点用独立的只读 token、空 token 一律拒绝而不是
+  关闭鉴权。真正的收紧是换 `docker-socket-proxy` 只放行 `container:start/stop/restart/logs`，
+  还没做。
 - 不挂 socket 也能跑：内核重启、配置校验这两项自愈能力会退化，其余全部正常
   （代码里做了优雅降级，`docker` 不可用时跳过校验并记日志）。
 
@@ -240,12 +243,20 @@ Cloudflare 前置节点不稳定——同一节点带 `ech-opts` 实测 4 次里
   当前实例上能列出 33 个资源。
 - **搜索 / 类型筛选 / 只看已启用**：资源多时用来快速定位。
 - **勾选 / 取消**：勾上即启用，取消即停用；改动立刻保存，下一轮生效。
+- **直连 / 链式**：两个互相独立的测量开关，只对带 `dialer-proxy` 的节点有区别。
+  「链式」开 → 链式节点经前置池测（每个前置一条变体，任一前置通即算活）；「直连」开 →
+  额外把它当作自己的服务器测一遍（剥掉 dialer）。两个都开就两种都测，账本各占一行、
+  分类统计分别计入。普通节点没有 dialer 可剥，两种方式等价，只测一次。两个都关会回落到
+  直连 —— 本轮没测到的节点会被账本清理、导出被截断，要真正停测请取消「启用」。
 - **key**：决定导出文件名和 URL（`/api/export/<key>.yaml`、`exports/<key>.yaml`）。
   勾选时按名称自动生成，可手改；重名会自动加 `-2` 后缀。
 - **＋ 手动添加**：列表里没有的资源（例如刚在别处建好还没刷新）可以按名称直接填。
   非法 key 会被拒绝并给出原因，不会静默改名。
 - **同步 Sub-Store 联动**：为每个已启用来源建一条远程订阅 `probe-<key>` 指向本服务的
   导出端点，并维护聚合集合 `probe`；来源被取消勾选时，对应的远程订阅会被移除。
+  只有关联到联动的字段（启用/导出/key/名称/显示名）变化才会触发这次同步——只翻
+  直连/链式/中转这类纯测量开关的保存不会去碰 Sub-Store，省掉每次点击一整套
+  后端往返。
 
 key 的校验是硬性的：`/ \ : * ? " < > |` 和以点开头的写法会被拒绝并提示原因。
 key 同时是文件名，所以这一步也是路径穿越的防线（`read_export` / `export_meta` 会再校验一次）。
@@ -261,7 +272,94 @@ key 同时是文件名，所以这一步也是路径穿越的防线（`read_expo
 
 ---
 
+## 链式代理（前置 → 落地）
+
+一条链路 = 一个**前置** + 一个**落地**。落地节点的 proxy 上带 `dialer-proxy: <前置名>`，
+内核于是先从前置出去、再由前置连落地。面板的「链式代理」区块管理它们，不用改配置文件。
+
+- **＋ 快捷添加**：填一个前置，再填若干落地（每行一个），一次加一批。
+- **前置/落地两种填法**：既可以从已知节点里挑（输入框带 `datalist`，输关键字筛选），
+  也可以直接粘贴分享链接。两者可以混用——一条链路的前置是节点、落地是粘贴的链接也合法。
+- **启停 / 删除**：单条链路可停用（不删记录，不参与下一轮）；删掉最后一条时整个
+  `chains` 来源一并移除，避免在 Sub-Store 里留下一个必然 500 的空订阅。
+
+支持粘贴的协议：`vless` `vmess` `trojan` `ss` `hysteria2`(含 `hy2`) `tuic` `socks`/`socks5`。
+不支持的协议或残缺的链接会**明确报错**，不会被半解析成一个必然测不通的节点——
+那种失败和「落地节点本身是死的」在面板上长得一模一样。
+
+几个设计点，都不是随手写的：
+
+- **链路是一个普通数据源**（`kind: "chain"`，key 默认 `chains`），不是另一套存储。
+  于是轮次、账本、导出文件、Sub-Store 联动、导出清理全都按原路走，没有特殊分支；
+  特殊的只是它的成员从配置里内联产生，而不是去 Sub-Store 拉。
+- **两端在添加时就解析成完整的 proxy dict**，存的不是「节点名引用」。存名字的话，
+  上游一改名或来源一停用，链路会**静默变成直连落地节点**——这正是这个功能要防的事。
+- **链路指纹把前置折进去**。同一个落地节点挂两个不同前置是两个不同出口；
+  共用一个账本行会让一个前置的失败抵消另一个前置的成功。
+- **导出的 YAML 里带上未打标签的前置副本**。`dialer-proxy` 按名字找前置，
+  而导出会给节点打上测出来的国别标签（`[JP] CF前置`），标签每轮都可能在变，
+  所以自己的那份不带标签的副本是唯一稳定的名字。前置因此可能出现两次，这是故意的：
+  多一行的代价 vs. 少了前置导致整条链路直连。
+- **前置不可用不会毁掉整轮**。如果内核拒绝了配置、而报错指向的不是任何一个被测节点
+  （几乎总是前置），这一轮会丢掉全部链路继续跑，而不是让几百个节点跟着一起失败。
+- **`ech=` 里的 DoH 地址保留为 `_dns`**：mihomo 没有「配置列表 URL」这个字段，
+  但实测能用的那份 dict 就是这么写的。它是嵌套键，所以**会**参与指纹计算——
+  同一个前置换个 DoH 地址会被当成新出口，代价是重新验证一次，方向是保守的。
+
+### 导出与联动
+
+链路来源和普通来源一样发布：`exports/chains.yaml` → `/api/export/chains.yaml` →
+Sub-Store 远程订阅 `probe-chains`。客户端拉这个文件就同时拿到链路和它需要的前置。
+
+---
+
+## IP 回显探测(ipmap)
+
+测活回答「节点活不活」;ipmap 回答「节点到底是谁」:经每个节点真实请求一个
+IP 回显端点,回显正文就是该节点的**实测出口**。v4 回显端点(仅 A 记录)和
+v6 回显端点(仅 AAAA)分开测,得到落地机两个协议族的地址,再用 Cloudflare
+trace 的 `loc=`/`colo=` 交叉印证国别。出口与节点写明的 `server` 一致 → 直落;
+不一致 → 入口是中转,落地机才是配置里没写明的那台。这份映射可以填回
+Sub-Store,让每个节点名自己带着实测出口。
+
+```bash
+# 在 vps 上跑(宿主机或应用容器内均可):
+cd /srv/mihomo-test
+python3 -m mihomo_test ipmap \
+    --url 'https://<订阅地址>' --family v6 \
+    --key demo-v6 --push-sub ipmap-demo-v6
+```
+
+- **节点来源三选一**:`--url`(裸 Clash YAML 或其 base64;分享链接文本不
+  支持——链接解析交给 Sub-Store,录入后用 `--source` 引用)、`--file`、
+  `--source <Sub-Store资源名>`(`--source-kind collection` 选组合订阅)。
+- **`--family v4|v6|all`** 按 `server` 的字面量族过滤(域名节点只在 `all`
+  下保留);`--limit N` 只测前 N 个;`--lanes` 并发车道数(默认 4)。
+- **产出**:`data/ipmap/<key>.json`(逐节点全字段)与 `<key>.md`(映射表);
+  控制台同步打印。`--push-sub <名字>` 把节点改名成
+  `原名 · [国别] 出口v6 出口v4` 后 upsert 成 Sub-Store 本地订阅。
+- **与测活轮次完全隔离**:复用车道机制(select 组 + `IN-NAME` 钉住的
+  loopback 入站),但用独立容器 `mihomo-ipmap`、独立 API 端口 19191、独立
+  车道端口段 19300 起、内核目录 `data/ipmap-core/`。跑再久也不会动
+  `mihomo-probe` 的配置;跑完自动移除容器(`--keep-core` 可保留排查)。
+- 内核目录放在 `data/` 下是刻意的:compose 只把 `./data`、`./core` bind 进
+  应用容器,放自建目录的话容器内执行时 docker bind-mount 的宿主路径是空的。
+- v6 节点要求宿主机有 IPv6 出口(vps 有;compose 注释记录了为什么必须
+  host 网络——bridge 没有 v6 路由,v6-only 节点会全军覆没)。
+- 回显端点按 UA 门禁的订阅站同理:`--url` 拉取用 clash 系 UA 优先、浏览器
+  UA 兜底(sub.example.com 用浏览器 UA 是 403)。
+- 实测样例(2026-09-27,demo 订阅的 12 个 v6 节点,23 秒):12/12 全部
+  直落,出口 v6 与写明入口一致,出口 v4 各不相同且与节点名声称的落地国别
+  一致;`reports/ipmap-demo-v6.md` 是留档副本。
+
+离线单测在 `tests/test_ipmap.py`(30 个,无网络无 docker:族过滤、回显解析、
+标注、报告、来源解析;起真内核经真节点 curl 的部分由实战覆盖)。
+
+---
+
 ## 与 Sub-Store 联动
+
+两种方式，**推荐第一种**。
 
 两种方式，**推荐第一种**。
 
@@ -308,21 +406,99 @@ sudo python3 -m mihomo_test push
 「500 + `SUBSCRIPTION_NOT_FOUND`」和「500 + 未捕获 TypeError」都识别为「不存在」，
 不会再把改名当成失败。
 
+导出文件只在发布开启（`publish.enabled`，默认开）时由每一轮写出；发布一关，
+面板上的「推送 Sub-Store」和 `POST /api/push` 会直接拒绝并说明原因，而不是把
+停用前留在磁盘上的旧快照当成新结果推过去——那种推送会返回成功，然后在
+Sub-Store 里留下一份再也不会更新的订阅。
+
 ---
 
 ## Web 面板
 
 `https://probe.example.com/?token=<TOKEN>`
 
+前端是**纯静态文件**（`mihomo_test/web/`：`index.html` / `app.css` / `app.js` /
+`theme.js`），后端只提供 `/api/*`。同源部署时后端顺手把这几个文件发出去；也可以把前端
+单独部署到 CDN，让后端只当 API —— 见下面「前后端分离」。
+
+主题跟随系统（`prefers-color-scheme`），header 右上角按钮可手动切浅色 / 深色并记忆。
+
 - 状态卡：节点总数 / 存活 / 观察中 / 已死 / 本轮存活 / 上轮耗时
+- 手动测活：**直连测活**（忽略每来源的直连/链式开关，全部按直连测，前置池本轮不测）和
+  **链式测活**（按每来源开关测；链式未配置时直接拒绝并提示去设置里开启，而不是
+  悄悄跑一轮等同直连的轮次）
 - 订阅输出：可直接复制的导出链接（已带 token）
 - 节点表：源、名称、协议、**实测出口国家**、延迟、连续失败数、状态、近 12 轮趋势、最近失败原因
 - 设置：间隔、并发、超时、尝试次数、判死阈值、护栏比例、测试目标、出口验证开关、
   排除国家、数据源 JSON
 - 日志：最近 200 条事件
 
-Token 存在 `data/config.json` 的 `auth.token`，同一个值用于面板和导出端点。
-`/healthz` 不需要鉴权，其余全部需要。
+Token 存在 `data/config.json`，**分成两个**：
+
+| 键 | 用途 | 传给谁 |
+|---|---|---|
+| `auth.token` | 管理凭据：面板、`/api/*`、改配置 | 只留在浏览器地址栏 |
+| `publish.token` | 只读凭据：**只能**读 `/api/export/*.yaml` | 贴进 Sub-Store / 任何客户端 |
+
+两者都由 `config.load()` 在缺失时自动生成（首次启动、或配置文件损坏被重建时都会补），
+不用手填。导出链接里带的是 `publish.token`，所以一份订阅链接泄露不会连带交出改配置的
+权限——而改配置的权限在本部署上还能指挥宿主机的 docker daemon。
+
+为兼容起见，`/api/export/*` 同时接受 `auth.token`，早先已经贴出去的订阅链接不会失效；
+下次在面板上按「同步联动」或改一次数据源，链接会自动换成 `publish.token`。
+
+`/healthz` 不需要鉴权，其余全部需要。传法三选一：`?token=`、`X-Auth-Token:`、
+`Authorization: Bearer`。**空 token 一律拒绝**（不再视为"关闭鉴权"）。
+
+响应统一带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、
+`Referrer-Policy: no-referrer` 和一条 CSP。CSP 是 `script-src 'self'`（**没有**
+`'unsafe-inline'`）—— bootstrap 块是 `<script type="application/json">`，对浏览器是数据
+不是代码，不受 `script-src` 约束，面板里也没有任何内联 `onclick=`。
+`style-src` 仍保留 `'unsafe-inline'`：`style="…"` 属性无法执行，而面板要在行内写宽度和
+分类配色，收紧它只会逼出一堆一次性 class 而没有安全收益。
+`/api/status` 返回的 `config` 里 `auth.token` 已打码为 `***`。
+
+静态资源（`/app.css`、`/app.js`、`/theme.js`）**免鉴权**，其余全部需要。这不是缺口：
+它们就是 CDN 上那几份公开文件，不含任何秘密，而浏览器加载 `<link>` / `<script src>`
+时不会带自定义头 —— 给它们加鉴权只会让面板加载出样式和脚本之前就 401。
+**只有白名单里的三个文件名会被服务**（不是目录静态服务），`/index.html`、`/_headers`
+之类一律落到鉴权分支。
+
+### 前后端分离（前端可部署到 CDN）
+
+前端不再由 Python 拼字符串生成，而是 `mihomo_test/web/` 下的真实静态文件，所以它可以
+独立托管：
+
+```bash
+python tools/build_web.py --api-base https://probe.example.com   # → dist/
+python tools/deploy_pages.py --name <项目名>                          # → Cloudflare Pages
+python tools/verify_cdn.py https://<项目名>.pages.dev --api-base https://probe.example.com
+```
+
+两种模式跑的是**同一份文件**，差别只有 `index.html` 里的一个 bootstrap 块：
+
+| 模式 | `apiBase` | 令牌从哪来 |
+|---|---|---|
+| 同源（默认） | `""` | 服务端渲染进 bootstrap |
+| CDN | 后端 origin | 地址栏 `?token=` / `#token=`，或本机 localStorage |
+
+CDN 模式下浏览器要**跨域**调 `/api/*`，所以：
+
+1. 把前端 origin 填进 `server.cors_origins`（面板「设置」里也有这一项），否则浏览器会
+   拦掉响应 —— 而且是拦在 JS 之前，看起来像「接口挂了」。默认是空数组：同源部署不需要
+   CORS，而默认放行等于把面板交给任何一个网站。
+2. `OPTIONS` 预检**免鉴权**：预检不带自定义头，根本没法出示令牌，要求它就等于每个跨域
+   调用在发出之前就失败。
+3. 白名单是**精确匹配 origin**，不做通配 —— 通配子域意味着任何一个
+   `evil.<你的域>` 都能读到带令牌的响应。
+
+⚠️ **CDN 产物里绝不带令牌**（`build_web.py` 会检查并在缺失时拒绝构建）。`dist/` 是公开
+的，放令牌等于发布凭据。令牌改由页面从地址栏取一次、存 localStorage，取到之后立刻用
+`history.replaceState` 把它从地址栏抹掉（否则它会进浏览历史、Referer 和书签）。
+
+`core.container`（内核容器名）**不接受远程修改**——它会被直接交给 `docker restart`，
+而应用挂着 `docker.sock`，所以这是个能停任意容器的原语。要改就改 `.env` 里的
+`MIHOMO_TEST_CORE_CONTAINER` 再重启。
 
 ---
 
@@ -343,14 +519,28 @@ Token 存在 `data/config.json` 的 `auth.token`，同一个值用于面板和�
 │   ├── core.secret         # 内核 API secret
 │   └── tunnel.token        # Cloudflare Tunnel token
 ├── mihomo_test/            # 服务代码
+│   └── web/                # 静态前端（前后端分离的产物，可直接推 CDN）
+│       ├── index.html      # 外壳 + bootstrap 块（无内联脚本）
+│       ├── app.css         # 样式（浅色/深色由 <html data-theme> 切换）
+│       ├── app.js          # 面板逻辑
+│       └── theme.js        # 绘制前同步决定主题，避免深色模式闪一下浅色
 ├── tests/                  # 测试（见下节）
-│   ├── test_logic.py       # 147 个离线单元测试，无需部署
-│   ├── test_alerts_lanes.py# 告警与车道的离线用例
+│   ├── test_logic.py       # 336 个离线单元测试，无需部署
+│   ├── test_alerts_lanes.py# 21 个：告警、车道、看门狗
+│   ├── test_hardening.py   # 77 个：鉴权、token、指纹口径、并发、记账、静态资源与 CORS
+│   ├── _isolation.py       # 把上面三个模块的数据目录重定向到临时目录
 │   └── test_live.py        # 对着真实部署跑的实战测试
 ├── tools/                  # 诊断 / 数据修复脚本
 ├── setup_tunnel.py         # 建 Tunnel + DNS（用 acme.sh 里的 CF 凭据）
 └── link_substore.py        # 写 Sub-Store 联动对象
 ```
+
+`tests/_isolation.py` 不是可选的：`config.DATA` 就是 `$MIHOMO_TEST_ROOT/data`，而在
+宿主机上那正是运行中服务的状态目录（回归测试通常在应用容器里跑，那里
+`MIHOMO_TEST_ROOT=/srv/mihomo-test`）。加它之前，一次 `unittest discover` 会在生产
+`data/` 里留下 `round.state.json`、`state.db`，甚至被 `POST /api/config` 重写的
+`config.json`——而那个残留的 `config.json` 又会让 `test_live` 误判"存在真实部署"，
+于是离线跑测试开始对着线上发请求。
 
 **依赖** —— 唯一的第三方包是 PyYAML（解析上游订阅、生成内核配置、输出导出文件三处都要
 YAML），其余全是标准库。清单在 `requirements.txt`，Dockerfile 用

@@ -23,6 +23,10 @@ COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /srv/mihomo-test
 COPY mihomo_test ./mihomo_test
 COPY tests ./tests
+# tools/ 不在请求路径上,但 tests/test_hardening.CdnBuildGuardTest 用
+# importlib 加载 tools/build_web.py 来验证构建产物——漏了它,容器内的
+# unittest discover 会对着一套根本不存在的脚本报 7 个错。
+COPY tools ./tools
 
 ENV MIHOMO_TEST_ROOT=/srv/mihomo-test \
     MIHOMO_TEST_HOST_ROOT=/srv/mihomo-test \

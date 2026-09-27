@@ -1,12 +1,16 @@
 """Unit tests for the pieces that decide what is dead and what gets published."""
 import calendar
+import collections
 import os
 import json
+import re
 import shutil
 import sys
+import threading
 import time
 import unittest
 import unittest.mock
+import urllib.request
 from pathlib import Path
 import tempfile
 
@@ -16,8 +20,37 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mihomo_test import config as cfgmod
 from mihomo_test import core as coremod
-from mihomo_test import engine, policy
-from mihomo_test.store import Client
+from mihomo_test import db, engine, notifier, policy, server
+from mihomo_test.store import Client, NotFound, StoreError
+
+try:
+    import _isolation
+except ImportError:  # imported as a package: python -m unittest tests.test_logic
+    from tests import _isolation
+
+
+def setUpModule():
+    _isolation.isolate()
+
+
+def tearDownModule():
+    _isolation.restore()
+
+
+
+
+def _drop_temp_db(path):
+    """Delete a ``NamedTemporaryFile(delete=False)`` ledger plus any migration
+    backup ``db.connect()`` left beside it.
+
+    ``connect()`` copies the ledger to ``<name>.bak-<stamp>`` before rebuilding a
+    legacy schema, so unlinking only the ``.db`` leaves the copy behind -- 133 of
+    them had accumulated in the system temp dir.
+    """
+    path = Path(path)
+    path.unlink(missing_ok=True)
+    for bak in path.parent.glob(path.name + ".bak-*"):
+        bak.unlink(missing_ok=True)
 
 _nolog = lambda *a, **k: None
 
@@ -400,7 +433,7 @@ class ExportTest(unittest.TestCase):
             "B": {"name": "CH BRN Buyvm IPv6", "type": "mieru", "server": "s", "port": 1,
                   "username": "u", "password": "p"},
         }
-        out = engine._export_proxies(["A", "B"], proxies, {}, self.cfg())
+        out, _ = engine._export_proxies(["A", "B"], proxies, {}, self.cfg(), "k")
         self.assertEqual(len(out), 1)
 
     def test_genuinely_different_nodes_are_both_published(self):
@@ -408,23 +441,512 @@ class ExportTest(unittest.TestCase):
             "A": {"name": "A", "type": "mieru", "server": "s", "port": 1, "username": "u"},
             "B": {"name": "B", "type": "mieru", "server": "s", "port": 2, "username": "u"},
         }
-        out = engine._export_proxies(["A", "B"], proxies, {}, self.cfg())
+        out, _ = engine._export_proxies(["A", "B"], proxies, {}, self.cfg(), "k")
         self.assertEqual(len(out), 2)
+
+    def test_one_nodes_two_measured_forms_are_published_once(self):
+        """With both switches on, a chained node is tested twice.
+
+        The two variants share a display name but differ in `dialer-proxy`, a
+        connection field, so the fingerprint pass cannot collapse them -- and
+        the client would receive two nodes called the same thing. The export
+        speaks for the source's configured form, so the chained variant wins
+        and the direct one stays a panel-only measurement.
+        """
+        proxies = {
+            "HK-01": {"name": "HK-01", "type": "vless", "server": "s", "port": 1,
+                      "uuid": "u", "dialer-proxy": "cdn"},
+            "HK-01 #2": {"name": "HK-01", "type": "vless", "server": "s", "port": 1,
+                         "uuid": "u"},
+            "cdn": {"name": "cdn", "type": "vless", "server": "f", "port": 1,
+                    "uuid": "f"},
+        }
+        out, _ = engine._export_proxies(["HK-01", "HK-01 #2", "cdn"], proxies,
+                                        {}, self.cfg(), "k")
+        self.assertEqual(sorted(p["name"] for p in out), ["HK-01", "cdn"])
+        chained = next(p for p in out if p["name"] == "HK-01")
+        self.assertEqual(chained.get("dialer-proxy"), "cdn")
+
+    def test_a_direct_only_node_keeps_its_export(self):
+        """The collapse must not eat a node that is only measured direct.
+
+        A source with `chain` off publishes the stripped form -- there is no
+        chained variant to prefer, so the direct one has to survive.
+        """
+        proxies = {"HK-01": {"name": "HK-01", "type": "vless", "server": "s",
+                             "port": 1, "uuid": "u"}}
+        out, _ = engine._export_proxies(["HK-01"], proxies, {}, self.cfg(), "k")
+        self.assertEqual([p["name"] for p in out], ["HK-01"])
+        self.assertNotIn("dialer-proxy", out[0])
 
     def test_region_tag_is_prepended_from_the_verified_exit(self):
         proxies = {"A": {"name": "node", "type": "vless", "server": "s", "port": 1}}
-        out = engine._export_proxies(["A"], proxies, {"A": {"country": "JP"}}, self.cfg(tag=True))
+        out, _ = engine._export_proxies(["A"], proxies, {"A": {"country": "JP"}}, self.cfg(tag=True), "k")
         self.assertEqual(out[0]["name"], "[JP] node")
 
     def test_region_tag_is_not_applied_twice(self):
         proxies = {"A": {"name": "[JP] node", "type": "vless", "server": "s", "port": 1}}
-        out = engine._export_proxies(["A"], proxies, {"A": {"country": "JP"}}, self.cfg(tag=True))
+        out, _ = engine._export_proxies(["A"], proxies, {"A": {"country": "JP"}}, self.cfg(tag=True), "k")
         self.assertEqual(out[0]["name"], "[JP] node")
 
     def test_verified_exit_overrides_a_stale_tag(self):
         proxies = {"A": {"name": "[SG] node", "type": "vless", "server": "s", "port": 1}}
-        out = engine._export_proxies(["A"], proxies, {"A": {"country": "JP"}}, self.cfg(tag=True))
+        out, _ = engine._export_proxies(["A"], proxies, {"A": {"country": "JP"}}, self.cfg(tag=True), "k")
         self.assertEqual(out[0]["name"], "[JP] node")
+
+
+class YamlScalarQuotingTest(unittest.TestCase):
+    """A string that *looks* like a number must be quoted on the way out.
+
+    The export is read by the client's kernel, which uses Go's `yaml.v3` and
+    therefore the YAML 1.1 core schema. PyYAML, which writes the file, uses
+    the 1.2 schema: it sees `123456e2` as plain text, emits it bare, and the
+    client's kernel then reads it as the float 473277000.
+
+    Measured against the live kernel (mihomo v1.19.29), changing only this
+    one field of an otherwise valid node:
+
+        short-id: 123456e2     -> exit 1  "invalid REALITY short ID"
+        short-id: '123456e2'   -> exit 0
+        short-id: deadbeef00     -> exit 0
+
+    Across all 426 exported nodes exactly this one value tripped it. The probe
+    never saw the fault because its own kernel config is written as inline
+    JSON -- `{"short-id": "123456e2"}` is quoted there -- so only the export
+    path, which is YAML, could break.
+    """
+
+    def test_a_scientific_lookalike_is_quoted(self):
+        text = yaml.dump({"short-id": "123456e2"}, Dumper=engine._ExportDumper, allow_unicode=True)
+        self.assertEqual(text, "short-id: '123456e2'\n")
+        self.assertIsInstance(yaml.safe_load(text)["short-id"], str)
+
+    def test_other_yaml_11_shapes_are_quoted_too(self):
+        for value in ["0x1f", "0755", "true", "no", "off", "~", "null", "1:30"]:
+            text = yaml.dump({"v": value}, Dumper=engine._ExportDumper, allow_unicode=True)
+            loaded = yaml.safe_load(text)["v"]
+            self.assertEqual(loaded, value, f"{value!r} round-tripped as {loaded!r}")
+
+    def test_ordinary_values_are_left_bare(self):
+        """A domain, uuid or server address must not sprout quotes.
+
+        Values PyYAML itself must quote for structural reasons -- a leading
+        `[`, an embedded `: ` -- are out of scope here; that behaviour predates
+        this dumper and is correct.
+        """
+        for value in ["dlcdnets.asus.com", "00000000-0000-4000-8000-000000000004",
+                      "deadbeef00", "xtls-rprx-vision", "198.51.100.72",
+                      "2001:db8:85a3:0:0:8a2e:370:7334", "cdn前置"]:
+            text = yaml.dump({"v": value}, Dumper=engine._ExportDumper, allow_unicode=True)
+            self.assertEqual(text, f"v: {value}\n", f"{value!r} was quoted")
+            self.assertEqual(yaml.safe_load(text)["v"], value)
+
+    def test_a_display_name_with_a_leading_bracket_survives(self):
+        """`[TW] ...` is quoted by PyYAML either way; the value must round-trip."""
+        text = yaml.dump({"v": "[TW] US-05 · VLESS"}, Dumper=engine._ExportDumper,
+                         allow_unicode=True)
+        self.assertEqual(yaml.safe_load(text)["v"], "[TW] US-05 · VLESS")
+
+    def test_non_strings_keep_their_native_form(self):
+        text = yaml.dump({"port": 443, "udp": True, "ratio": 1.5},
+                         Dumper=engine._ExportDumper, sort_keys=False, allow_unicode=True)
+        self.assertEqual(text, "port: 443\nudp: true\nratio: 1.5\n")
+
+    def test_a_written_export_survives_round_trip_with_types_intact(self):
+        proxies = {"A": {"name": "A", "type": "vless", "server": "s", "port": 443,
+                         "reality-opts": {"public-key": "k", "short-id": "123456e2"}}}
+        payload = {"proxies": engine._export_proxies(
+            ["A"], proxies, {}, {"publish": {"add_region_tag": False}}, "k")[0]}
+        text = yaml.dump(payload, Dumper=engine._ExportDumper, sort_keys=False, allow_unicode=True)
+        doc = yaml.safe_load(text)
+        sid = doc["proxies"][0]["reality-opts"]["short-id"]
+        self.assertEqual(sid, "123456e2")
+        self.assertIsInstance(sid, str)
+
+
+class DerivedDialerGroupTest(unittest.TestCase):
+    """An export must be loadable by a client, not just by this probe.
+
+    The regression these cover was found by feeding a real export to the real
+    kernel, which refused the whole file:
+
+        proxy [[GB] GB-09 · SS] dialer-proxy [cdn] not found
+        configuration file test failed
+
+    `cdn` is the *upstream* author's own dialer name and exists in no export,
+    so every chained node was unusable at import time even though the round
+    had tested it correctly.
+    """
+
+    def cfg(self, front="CM-CF", kind="sub", cap=1, sources=None):
+        return {
+            "publish": {"add_region_tag": False},
+            "chain": {"enabled": True, "max_fronts": cap,
+                      "front_source": {"kind": kind, "name": front}},
+            "sources": sources if sources is not None else [
+                {"key": "k", "kind": "collection", "enabled": True}],
+        }
+
+    def proxies(self, dialer="cdn"):
+        return {"A": {"name": "node-a", "type": "ss", "server": "1.1.1.1", "port": 443,
+                      engine.DIALER_FIELD: dialer}}
+
+    def test_dialer_is_rewritten_to_the_front_source_name(self):
+        # The group has to be named after the *front* source, because that is
+        # where the front's proxies are published -- a name invented here would
+        # not match the front export's own group.
+        out, groups = engine._export_proxies(["A"], self.proxies(), {}, self.cfg(), "k")
+        self.assertEqual(out[0][engine.DIALER_FIELD], "CM-CF")
+        self.assertEqual([g["name"] for g in groups], ["CM-CF"])
+
+    def test_same_rewrite_for_a_multi_front_round(self):
+        # max_fronts only changes how many fronts a round dials; it does not
+        # change which group a client must resolve, so the name is the same.
+        out, groups = engine._export_proxies(["A"], self.proxies(), {}, self.cfg(cap=8), "k")
+        self.assertEqual(out[0][engine.DIALER_FIELD], "CM-CF")
+        self.assertEqual([g["name"] for g in groups], ["CM-CF"])
+
+    def test_second_source_over_the_same_pool_resolves_to_the_same_group(self):
+        # Two chained sources fed by one front pool must agree on the group
+        # name, otherwise importing both produces two unrelated groups.
+        cfg = self.cfg(cap=3, sources=[
+            {"key": "k", "kind": "collection", "enabled": True},
+            {"key": "k2", "kind": "collection", "enabled": True}])
+        a, ga = engine._export_proxies(["A"], self.proxies(), {}, cfg, "k")
+        b, gb = engine._export_proxies(["A"], self.proxies(dialer="cdn"), {}, cfg, "k2")
+        self.assertEqual(ga[0]["name"], gb[0]["name"])
+        self.assertEqual(a[0][engine.DIALER_FIELD], b[0][engine.DIALER_FIELD])
+
+    def test_derived_group_lists_the_exported_node_names(self):
+        out, groups = engine._export_proxies(["A"], self.proxies(), {}, self.cfg(), "k")
+        self.assertEqual(groups[0]["type"], "select")
+        self.assertEqual(groups[0]["proxies"], [p["name"] for p in out])
+
+    def test_export_without_chained_nodes_is_untouched(self):
+        plain = {"A": {"name": "n", "type": "ss", "server": "s", "port": 1}}
+        out, groups = engine._export_proxies(["A"], plain, {}, self.cfg(), "k")
+        self.assertEqual(groups, [])
+        self.assertNotIn(engine.DIALER_FIELD, out[0])
+
+    def test_chaining_switched_off_leaves_the_upstream_value_alone(self):
+        # With no chain block there is no pool to name, and inventing one would
+        # claim a topology the operator has not configured.
+        cfg = self.cfg()
+        cfg["chain"] = None
+        out, groups = engine._export_proxies(["A"], self.proxies(), {}, cfg, "k")
+        self.assertEqual(groups, [])
+        self.assertEqual(out[0][engine.DIALER_FIELD], "cdn")
+
+    def test_a_node_named_like_the_front_source_is_not_shadowed(self):
+        # mihomo keys proxies by name, so rewriting into a name a node already
+        # uses would point the dialer at the node itself.
+        clash = {"A": {"name": "CM-CF", "type": "ss", "server": "s", "port": 1,
+                       engine.DIALER_FIELD: "cdn"}}
+        out, groups = engine._export_proxies(["A"], clash, {}, self.cfg(), "k")
+        self.assertEqual(groups, [])
+        self.assertEqual(out[0][engine.DIALER_FIELD], "cdn")
+
+    def test_a_dialer_naming_a_published_proxy_is_left_alone(self):
+        # Self-consistent upstream: the client can already resolve it, and the
+        # author's own topology may be meaningful, so nothing is rewritten and
+        # no group is invented.
+        proxies = {
+            "A": {"name": "front-node", "type": "ss", "server": "f", "port": 1},
+            "B": {"name": "node-b", "type": "ss", "server": "s", "port": 2,
+                  engine.DIALER_FIELD: "front-node"},
+        }
+        out, groups = engine._export_proxies(["A", "B"], proxies, {}, self.cfg(), "k")
+        b = next(p for p in out if p["name"] == "node-b")
+        self.assertEqual(b[engine.DIALER_FIELD], "front-node")
+        self.assertEqual(groups, [])
+
+    def test_only_the_unresolvable_dialer_is_rewritten(self):
+        # Mixed input: one node's dialer resolves locally, one does not.
+        proxies = {
+            "A": {"name": "front-node", "type": "ss", "server": "f", "port": 1},
+            "B": {"name": "node-b", "type": "ss", "server": "s", "port": 2,
+                  engine.DIALER_FIELD: "front-node"},
+            "C": {"name": "node-c", "type": "ss", "server": "s", "port": 3,
+                  engine.DIALER_FIELD: "dangling"},
+        }
+        out, groups = engine._export_proxies(["A", "B", "C"], proxies, {}, self.cfg(), "k")
+        by = {p["name"]: p for p in out}
+        self.assertEqual(by["node-b"][engine.DIALER_FIELD], "front-node")
+        self.assertEqual(by["node-c"][engine.DIALER_FIELD], "CM-CF")
+        self.assertEqual([g["name"] for g in groups], ["CM-CF"])
+
+    def test_written_export_carries_the_group_so_the_kernel_can_resolve_it(self):
+        # End-to-end within the module: whatever `_write_export` writes is what
+        # the client loads, so the rewrite has to survive serialisation.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            original = engine.EXPORT_DIR
+            engine.EXPORT_DIR = Path(d)
+            try:
+                path = engine._write_export(self.cfg(), "k", ["A"], self.proxies(), {})
+            finally:
+                engine.EXPORT_DIR = original
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["proxies"][0][engine.DIALER_FIELD], "CM-CF")
+        self.assertEqual(data["proxy-groups"][0]["name"], "CM-CF")
+        names = {p["name"] for p in data["proxies"]}
+        self.assertTrue(set(data["proxy-groups"][0]["proxies"]) <= names)
+
+
+class RoundModeTest(unittest.TestCase):
+    """`engine.round_uses_chains` decides whether a manual round dials chains.
+
+    The dashboard's 直连测活 button must not touch the front pool; 链式测活 and
+    the scheduler must chain as configured. The split is at the front-dialling
+    step only -- both modes still test every source, so the ledger prune and the
+    export write see a complete round. (A round that skipped nodes would let
+    `_prune_removed_nodes` delete their rows and `_publish_sources` truncate
+    their exports.)
+    """
+
+    def _cfg(self, chain_enabled, front=""):
+        return {
+            "sources": [{"key": "air", "kind": "collection", "enabled": True}],
+            "chain": {"enabled": chain_enabled,
+                      "front_source": {"kind": "sub", "name": front}},
+        }
+
+    def test_direct_mode_never_chains(self):
+        self.assertFalse(engine.round_uses_chains(self._cfg(True, "cf"), "direct"))
+        self.assertFalse(engine.round_uses_chains(self._cfg(False, "cf"), "direct"))
+
+    def test_chain_mode_chains_when_configured(self):
+        self.assertTrue(engine.round_uses_chains(self._cfg(True, "cf"), "chain"))
+
+    def test_scheduler_default_chains_when_configured(self):
+        self.assertTrue(engine.round_uses_chains(self._cfg(True, "cf"), None))
+
+    def test_no_chain_when_disabled(self):
+        self.assertFalse(engine.round_uses_chains(self._cfg(False, "cf"), None))
+
+    def test_no_chain_when_front_source_is_unconfigured(self):
+        # `chain_block` returns None for "enabled but no front source", so the
+        # round must not chain -- otherwise every chained node fails front_dead
+        # because of a missing config field, which reads as a network problem.
+        self.assertFalse(engine.round_uses_chains(self._cfg(True, ""), None))
+
+    def test_direct_overrides_a_valid_chain_config(self):
+        cfg = self._cfg(True, "cf")
+        self.assertFalse(engine.round_uses_chains(cfg, "direct"))
+        self.assertTrue(engine.round_uses_chains(cfg, None))
+
+
+class RunInBackgroundModeTest(unittest.TestCase):
+    """The dashboard's two launch buttons reach `engine.run_round` with `mode`."""
+
+    def test_mode_is_forwarded_to_run_round(self):
+        from mihomo_test import server
+
+        captured = {}
+        real_run = engine.run_round
+
+        def fake_run(cfg, trigger="manual", only_source=None, mode=None, log=_nolog):
+            captured["mode"] = mode
+            captured["trigger"] = trigger
+            return {"ok": True}
+
+        with unittest.mock.patch.object(engine, "run_round", fake_run):
+            t = server.run_in_background({"sources": []}, trigger="manual", mode="chain")
+            t.join(timeout=5)
+        self.assertEqual(captured.get("mode"), "chain")
+        self.assertEqual(captured.get("trigger"), "manual")
+
+    def test_busy_round_is_refused(self):
+        from mihomo_test import server
+
+        if not server.BUSY.acquire(blocking=False):
+            self.skipTest("BUSY already held by another test")
+        try:
+            with self.assertRaises(engine.Busy):
+                server.run_in_background({"sources": []}, mode="direct")
+        finally:
+            server.BUSY.release()
+
+
+class RoundModePersistenceTest(unittest.TestCase):
+    """The mode of a round is recorded, not just logged.
+
+    The dashboard header names the running mode, which it can only do if the
+    mode survives the round: `rounds.mode` for history, `round.state.json` and
+    `engine.current_mode()` for "what is running right now".
+    """
+
+    def test_start_round_stores_the_mode(self):
+        from mihomo_test import db
+
+        rid = db.start_round("manual", "chain")
+        row = db.one("SELECT mode FROM rounds WHERE id=?", (rid,))
+        self.assertEqual(row["mode"], "chain")
+
+    def test_start_round_stores_null_for_a_scheduler_round(self):
+        """mode=None is a full chain-aware round, not a missing value.
+
+        SQL NULL rather than the string "None": the UI distinguishes the two
+        ("自动调度" vs a named mode), so a caller that forgot the argument must
+        not look like a deliberate scheduler round.
+        """
+        from mihomo_test import db
+
+        rid = db.start_round("schedule")
+        row = db.one("SELECT mode FROM rounds WHERE id=?", (rid,))
+        self.assertIsNone(row["mode"])
+
+    def test_rounds_table_has_a_mode_column_after_migration(self):
+        """An existing database gains the column in place, not by rebuild.
+
+        `rounds` is never dropped by `_migrate` (only nodes/results are), so an
+        additive ALTER is the only way an upgrade keeps its round history.
+        """
+        from mihomo_test import db
+
+        db.connect()  # runs _migrate
+        cols = {r[1] for r in db.connect().execute("PRAGMA table_info(rounds)")}
+        self.assertIn("mode", cols)
+
+    def test_write_state_persists_the_mode(self):
+        """`round.state.json` carries the mode, for an operator reading it."""
+        from mihomo_test import engine
+
+        engine._write_state("delay-test", 4242, "direct")
+        try:
+            state = json.loads(engine.ROUND_STATE.read_text(encoding="utf-8"))
+        finally:
+            engine.ROUND_STATE.unlink(missing_ok=True)
+        self.assertEqual(state["mode"], "direct")
+        self.assertEqual(state["phase"], "delay-test")
+        self.assertEqual(state["round_id"], 4242)
+
+    def test_current_mode_is_cleared_with_the_round(self):
+        from mihomo_test import engine
+
+        engine._set_current_round(7, "chain")
+        self.assertEqual(engine.current_mode(), "chain")
+        engine._set_current_round(None)
+        self.assertIsNone(engine.current_mode())
+
+    def test_status_payload_reports_busy_mode_only_while_busy(self):
+        """An idle dashboard must not show a mode pill.
+
+        `current_mode()` is cleared with the round, but `busy` is the field the
+        UI gates on, so both have to agree -- a stale mode with busy false
+        would leave the header naming a round that already finished.
+        """
+        from mihomo_test import server
+
+        cfg = {"sources": [], "auth": {}, "publish": {}}
+        engine._set_current_round(7, "direct")
+        try:
+            if server.BUSY.locked():
+                self.skipTest("BUSY already held by another test")
+            # busy false -> no mode shown, whatever the engine remembers
+            self.assertIsNone(server.status_payload(cfg)["busy_mode"])
+            server.BUSY.acquire(blocking=False)
+            try:
+                self.assertEqual(server.status_payload(cfg)["busy_mode"], "direct")
+            finally:
+                server.BUSY.release()
+        finally:
+            engine._set_current_round(None)
+
+
+class RoundTeardownScopeTest(unittest.TestCase):
+    """`_reconcile_ledger` must not read a name that no longer exists.
+
+    Round 225 on vps recorded `aborted: NameError: name 'chain_on' is not
+    defined` with ok=0, after the nodes had been tested but before the exports
+    were written -- so the round published nothing and the panel went on
+    showing the previous round's numbers. A stale reference left by a rename
+    compiles fine and only fires at the very end of a round.
+
+    These call the real function with the ledger writes stubbed, so a future
+    rename is caught by running the code rather than by matching source text.
+    """
+
+    def _cfg(self, chain):
+        return {
+            "sources": [{"key": "src-on", "kind": "collection", "name": "on",
+                         "enabled": True}],
+            "chain": chain,
+        }
+
+    def _run(self, cfg, fronts, chain_configured):
+        seen = {"prune": None, "demote": None}
+        with unittest.mock.patch.object(
+                db, "delete_sources_not_in",
+                side_effect=lambda k: seen.__setitem__("prune", list(k)) or 0), \
+             unittest.mock.patch.object(
+                db, "demote_disabled_sources",
+                side_effect=lambda k: seen.__setitem__("demote", list(k)) or 0):
+            keep = engine._reconcile_ledger(
+                cfg, [s for s in cfg["sources"] if s.get("enabled")],
+                fronts, chain_configured, _nolog)
+        return keep, seen
+
+    def test_direct_round_keeps_the_pool_when_chaining_is_configured(self):
+        """The exact shape that broke: no fronts collected, chaining on."""
+        cfg = self._cfg({"enabled": True,
+                         "front_source": {"kind": "sub", "name": "CM-CF"},
+                         "max_fronts": 1})
+        keep, seen = self._run(cfg, fronts=[], chain_configured=True)
+        self.assertTrue(keep)
+        self.assertIn(engine.FRONT_SOURCE_KEY, seen["prune"])
+        self.assertIn(engine.FRONT_SOURCE_KEY, seen["demote"])
+
+    def test_pool_is_preserved_even_without_fronts(self):
+        """`fronts` empty but configured -> still keep.
+
+        Keying this off `fronts` alone would delete the pool on every direct
+        round, so a later chain round would start from no history.
+        """
+        cfg = self._cfg({"enabled": True,
+                         "front_source": {"kind": "sub", "name": "CM-CF"},
+                         "max_fronts": 1})
+        keep, seen = self._run(cfg, fronts=[], chain_configured=True)
+        self.assertTrue(keep, "front pool dropped although chaining is configured")
+        self.assertIn(engine.FRONT_SOURCE_KEY, seen["prune"])
+
+    def test_pool_is_dropped_when_chaining_is_off(self):
+        """The mirror case: nothing collected and nothing configured.
+
+        Keeping the key here would preserve rows for a front pool that no
+        longer exists, which is how a deleted source lingers as `unknown`.
+        """
+        cfg = self._cfg(None)
+        keep, seen = self._run(cfg, fronts=[], chain_configured=False)
+        self.assertFalse(keep)
+        self.assertNotIn(engine.FRONT_SOURCE_KEY, seen["prune"])
+        self.assertEqual(seen["prune"], ["src-on"])
+
+    def test_collected_fronts_keep_the_pool_even_if_flag_is_false(self):
+        """`fronts` non-empty is on its own enough. Covers the case where the
+        config was reloaded mid-round and the flag disagrees."""
+        cfg = self._cfg(None)
+        keep, seen = self._run(cfg, fronts=[{"proxy": {"name": "__FRONT0__"}}],
+                               chain_configured=False)
+        self.assertTrue(keep)
+        self.assertIn(engine.FRONT_SOURCE_KEY, seen["prune"])
+
+    def test_run_round_calls_the_reconciler_at_teardown(self):
+        """`_run_round` must still route through `_reconcile_ledger`.
+
+        The NameError happened because this call was inline. Asserting the call
+        site (rather than the source text) keeps the routing honest without
+        matching strings, and it fails if a future edit inlines it again and
+        brings a stale name along.
+        """
+        with unittest.mock.patch.object(engine, "_reconcile_ledger") as spy:
+            spy.return_value = True
+            with unittest.mock.patch.object(engine, "collect_entries",
+                                            return_value=([], [])):
+                engine._run_round({"substore": {"backend": "http://127.0.0.1:1"},
+                                   "sources": [], "chain": None},
+                                  "test", None, _nolog, mode="direct")
+        spy.assert_not_called()  # no sources -> returns before teardown
 
 
 class RoundLockTest(unittest.TestCase):
@@ -644,6 +1166,235 @@ class DisabledSourceTest(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class MutedSourceTest(unittest.TestCase):
+    """A source can be tested and listed without being published.
+
+    The case that motivated this: a free subscription that yields one working
+    node out of seven, intermittently. Disabling it would stop measuring it and
+    demote its ledger, but publishing it hands a single flaky node to every
+    client. `export: false` is the third state -- watch it, do not ship it.
+    """
+
+    def cfg(self, **over):
+        source = {"key": "flaky", "kind": "sub", "name": "flaky",
+                  "enabled": True, "export": False}
+        source.update(over)
+        return {"sources": [source], "publish": {"enabled": True}}
+
+    # --- config layer ---
+
+    def test_export_defaults_to_true(self):
+        out = cfgmod.normalize_sources([{"name": "air"}])
+        self.assertTrue(out[0]["export"])
+
+    def test_explicit_false_survives_normalisation(self):
+        out = cfgmod.normalize_sources([{"name": "air", "export": False}])
+        self.assertFalse(out[0]["export"])
+
+    def test_enabled_and_export_are_independent(self):
+        out = cfgmod.normalize_sources([{"name": "a", "enabled": True, "export": False},
+                                        {"name": "b", "enabled": False, "export": True}])
+        self.assertEqual([(s["enabled"], s["export"]) for s in out],
+                         [(True, False), (False, True)])
+
+    # --- engine.export_keys ---
+
+    def test_export_keys_skips_muted_and_disabled(self):
+        cfg = {"sources": [
+            {"key": "on", "enabled": True, "export": True},
+            {"key": "muted", "enabled": True, "export": False},
+            {"key": "off", "enabled": False, "export": True},
+        ]}
+        self.assertEqual(engine.export_keys(cfg), ["on"])
+
+    def test_export_keys_treats_a_missing_flag_as_publishing(self):
+        cfg = {"sources": [{"key": "legacy", "enabled": True}]}
+        self.assertEqual(engine.export_keys(cfg), ["legacy"])
+
+    # --- cleanup ---
+
+    def test_cleanup_removes_the_file_of_a_muted_source(self):
+        """Without this the last file written before muting lingers forever."""
+        tmp = Path(tempfile.mkdtemp())
+        old = engine.EXPORT_DIR
+        engine.EXPORT_DIR = tmp
+        try:
+            (tmp / "flaky.yaml").write_text("proxies: []\n", encoding="utf-8")
+            (tmp / "flaky.meta.json").write_text('{"count": 3}', encoding="utf-8")
+            removed = engine.cleanup_exports(self.cfg())
+            self.assertEqual(removed, ["flaky"])
+            self.assertFalse((tmp / "flaky.yaml").exists())
+            self.assertFalse((tmp / "flaky.meta.json").exists())
+        finally:
+            engine.EXPORT_DIR = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_cleanup_keeps_the_file_of_an_exporting_source(self):
+        tmp = Path(tempfile.mkdtemp())
+        old = engine.EXPORT_DIR
+        engine.EXPORT_DIR = tmp
+        try:
+            (tmp / "flaky.yaml").write_text("proxies: []\n", encoding="utf-8")
+            self.assertEqual(engine.cleanup_exports(self.cfg(export=True)), [])
+            self.assertTrue((tmp / "flaky.yaml").exists())
+        finally:
+            engine.EXPORT_DIR = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # --- publish ---
+
+    def test_publish_writes_no_file_for_a_muted_source(self):
+        tmp = Path(tempfile.mkdtemp())
+        old = engine.EXPORT_DIR
+        engine.EXPORT_DIR = tmp
+        try:
+            cfg = self.cfg()
+            sources = cfg["sources"]
+            wrote = engine._publish_sources(
+                cfg, None, sources,
+                {"flaky": [{"name": "n", "type": "vless", "server": "s", "port": 1}]},
+                {"n": {"name": "n", "type": "vless", "server": "s", "port": 1}}, {}, lambda *a: None)
+            self.assertTrue(wrote)
+            self.assertFalse((tmp / "flaky.yaml").exists())
+        finally:
+            engine.EXPORT_DIR = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_publish_still_writes_the_file_when_export_is_on(self):
+        tmp = Path(tempfile.mkdtemp())
+        old = engine.EXPORT_DIR
+        engine.EXPORT_DIR = tmp
+        try:
+            cfg = self.cfg(export=True)
+            proxy = {"name": "n", "type": "vless", "server": "s", "port": 1}
+            engine._publish_sources(cfg, None, cfg["sources"], {"flaky": ["n"]},
+                                    {"n": proxy}, {}, lambda *a: None)
+            self.assertTrue((tmp / "flaky.yaml").exists())
+        finally:
+            engine.EXPORT_DIR = old
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # --- push ---
+
+    def test_publish_keys_excludes_a_muted_source(self):
+        self.assertEqual(engine.publish_keys(self.cfg()), [])
+
+    def test_publish_keys_includes_an_exporting_source(self):
+        self.assertEqual(engine.publish_keys(self.cfg(export=True)), ["flaky"])
+
+    def test_link_substore_skips_a_muted_source(self):
+        """Sub-Store answers 500 for a sub that resolves to zero nodes.
+
+        Reading the store is fine -- `link_substore` lists existing subs to
+        prune the ones it created for sources that are no longer selected. What
+        must not happen is an upsert for a muted source.
+        """
+        class Spy:
+            def __init__(self):
+                self.upserts, self.deletes = [], []
+
+            def get_json(self, path):
+                return []
+
+            def upsert(self, kind, name, payload):
+                self.upserts.append((kind, name))
+                return "created"
+
+            def _request(self, method, path, body=None):
+                self.deletes.append((method, path))
+                return {}
+
+        spy = Spy()
+        linked = engine.link_substore(
+            {"sources": [{"key": "flaky", "kind": "sub", "name": "flaky",
+                          "label": "flaky", "enabled": True, "export": False}],
+             "publish": {"prefix": "probe", "hostname": "probe.example.com"}},
+            spy)
+        self.assertEqual(spy.upserts, [])
+        # It still reports that nothing was linked -- accurately, since a muted
+        # source contributes no member to the bundle. The wording matters: this
+        # used to say 「暂无存活节点」 for every empty outcome, so a source the
+        # operator had deliberately muted read as a source that was failing, and
+        # the note sent them to look at the node table instead of the 导出 box.
+        self.assertEqual(len(linked), 1)
+        self.assertIn('没有启用且开启导出的来源', linked[0])
+
+
+class TwinSourceKeyingTest(unittest.TestCase):
+    """Two sources may share a kind and name; the dashboard must not conflate them.
+
+    `链式聚合` is a collection named `air`, and the plain `air` entry it was
+    derived from is also a collection named `air`. The panel keys configured
+    sources by `kind|name`, matching Sub-Store's resource list, so a naive
+    last-one-wins map let the *disabled* twin shadow the live one: the row
+    rendered the wrong key, pointed its export link at the wrong file, and
+    showed the disabled source as enabled.
+
+    The fix is the precedence rule in `configuredMap`, asserted here against the
+    served JavaScript because that is where the bug lived -- the Python side had
+    no opinion about it.
+
+    The script used to be a `<script>` block inside `ui.py`; it is now a real
+    static asset (`mihomo_test/web/app.js`) so the same file can be deployed to a
+    CDN. The assertions below are unchanged -- they were always about the JS.
+    """
+
+    UI = (Path(__file__).resolve().parent.parent
+          / "mihomo_test" / "web" / "app.js")
+
+    def _source(self):
+        return self.UI.read_text(encoding="utf-8")
+
+    def test_configured_map_prefers_the_enabled_twin(self):
+        src = self._source()
+        start = src.index("function configuredMap()")
+        end = src.index("function renderSources()")
+        body = src[start:end]
+        self.assertIn("!cur.enabled && s.enabled", body,
+                      "configuredMap must let an enabled entry take the slot "
+                      "from a disabled twin sharing its kind|name")
+        # A blind assignment is exactly the bug; it must not be the whole logic.
+        self.assertNotIn("forEach(s => map[s.kind + \"|\" + s.name] = s)", body)
+
+    def test_configured_map_still_falls_back_to_the_first_entry(self):
+        src = self._source()
+        start = src.index("function configuredMap()")
+        end = src.index("function renderSources()")
+        body = src[start:end]
+        self.assertIn("if (!cur ||", body,
+                      "an unconfigured key must still take the first entry, "
+                      "otherwise a disabled source alone would vanish")
+
+    def test_both_twins_reach_the_dom(self):
+        """The main loop walks Sub-Store's list; the twin must land in `missing`.
+
+        One `collection|air` in the available list means that loop can only
+        produce one row, and `configuredMap` gives it to the enabled twin. The
+        other source must still get a row or it becomes unmanageable from the
+        panel -- which is exactly how `air` came to look like dead weight rather
+        than a deliberate entry.
+
+        The old test was `!RESOURCES.some(kind && name)`, which is false for a
+        shadowed twin (it *is* in the list), so the row vanished silently.
+        """
+        src = self._source()
+        start = src.index("const rendered = new Set(")
+        body = src[start:start + 700]
+        self.assertIn("!rendered.has(s.key)", body,
+                      "membership must be decided by what the loop actually "
+                      "consumed, not by whether the kind|name exists upstream")
+
+    def test_shadowed_twin_is_labelled_accurately(self):
+        """It is in the list; only its row was taken. Say so."""
+        src = self._source()
+        # 锚到 missing.forEach 开头而不是固定窗口:shadowed 标签是回调的头
+        # 两条语句,中间隔着一整段主循环注释,固定长度窗口被挤出过一次。
+        start = src.index("missing.forEach(s => {")
+        body = src[start:start + 600]
+        self.assertIn("与同名的启用来源共用资源", body)
+        self.assertIn("const shadowed = RESOURCES.some(", body)
+
+
 class DomainViewCacheTest(unittest.TestCase):
     """The DNS-view cache gates entry classification, so its TTL must bite."""
 
@@ -706,7 +1457,7 @@ class MigrationTest(unittest.TestCase):
             if dbmod._conn is not None:
                 dbmod._conn.close()
             dbmod.DB_PATH, dbmod._conn = old_path, old_conn
-            os.unlink(handle.name)
+            _drop_temp_db(handle.name)
 
     def test_duplicate_names_are_tracked_separately(self):
         import tempfile
@@ -730,7 +1481,7 @@ class MigrationTest(unittest.TestCase):
             if dbmod._conn is not None:
                 dbmod._conn.close()
             dbmod.DB_PATH, dbmod._conn = old_path, old_conn
-            os.unlink(handle.name)
+            _drop_temp_db(handle.name)
 
     def test_rebuild_backs_the_ledger_up_first(self):
         """The rebuild drops tables; the streaks it destroys are unrecoverable."""
@@ -774,6 +1525,7 @@ class MigrationTest(unittest.TestCase):
             dbmod.DB_PATH, dbmod._conn = old_path, old_conn
             shutil.rmtree(workdir, ignore_errors=True)
 
+
     def test_current_schema_needs_no_backup(self):
         """A DB already keyed by fingerprint is upgraded in place, not dropped."""
         import tempfile
@@ -800,6 +1552,162 @@ class MigrationTest(unittest.TestCase):
                 dbmod._conn.close()
             dbmod.DB_PATH, dbmod._conn = old_path, old_conn
             shutil.rmtree(workdir, ignore_errors=True)
+
+
+
+
+class CategoryStatsTest(unittest.TestCase):
+    """`stats_by_category` feeds the dashboard's 分类统计 panel.
+
+    The panel builds each of its three cards from the same code path, so all
+    three buckets must expose an identical key set. An empty bucket is the
+    *normal* state on a fresh install -- relay stays empty until a relay source
+    is configured and chain only fills once a chain block exists -- so the empty
+    shape is the one the panel meets first. A missing key there does not fail
+    loudly: it renders "undefined", or poisons arithmetic with NaN.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        from mihomo_test import db as dbmod
+
+        self.dbmod = dbmod
+        self.tmp = Path(tempfile.mkdtemp(prefix="cat-stats-"))
+        self._saved = (dbmod.DB_PATH, dbmod._conn)
+        dbmod.DB_PATH = self.tmp / "state.db"
+        dbmod._conn = None
+
+    def tearDown(self):
+        if self.dbmod._conn is not None:
+            self.dbmod._conn.close()
+        self.dbmod.DB_PATH, self.dbmod._conn = self._saved
+        # `mkdtemp` is called with a prefix but no `dir=`, so this lands in the
+        # system temp dir, not the `_isolation` root -- nothing else will ever
+        # remove it. Unremoved, every run leaks one directory per test method:
+        # 30 of them had accumulated in the container's /tmp.
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _record(self, db, round_id, source, fp, display, verdict, delay_ms=None,
+                category=None, reason=None, country=None):
+        """`record_result` takes ten positional args; name the boring ones once."""
+        db.record_result(round_id, source, fp, display, verdict, delay_ms,
+                         reason, country, 1, None, category)
+
+    def test_empty_buckets_expose_the_full_key_set(self):
+        db = self.dbmod
+        out = db.stats_by_category()
+        self.assertEqual(set(out["categories"]), {"direct", "relay", "chain"})
+        expected_nodes = {"total", "alive", "dead", "pending", "unknown", "excluded"}
+        expected_tested = {"total", "ok", "fail", "skipped"}
+        expected_delay = {"median", "avg", "min", "max"}
+        for cat, bucket in out["categories"].items():
+            self.assertEqual(set(bucket["nodes"]), expected_nodes, cat)
+            self.assertEqual(set(bucket["tested"]), expected_tested, cat)
+            self.assertEqual(set(bucket["delay_ms"]), expected_delay, cat)
+            self.assertEqual(bucket["reasons"], [], cat)
+            self.assertEqual(bucket["top_countries"], [], cat)
+
+    def test_populated_bucket_keeps_the_same_key_set(self):
+        """A populated bucket must not *add* keys the empty one lacks."""
+        db = self.dbmod
+        db.upsert_node("air", "fp-a", "A", status="alive", category="direct")
+        self._record(db, 1, "air", "fp-a", "A", "ok", 120, "direct")
+
+        out = db.stats_by_category()
+        empty_shape = db.stats_by_category(round_id=999)["categories"]["relay"]
+        full = out["categories"]["direct"]
+        self.assertEqual(set(full["nodes"]), set(empty_shape["nodes"]))
+        self.assertEqual(set(full["tested"]), set(empty_shape["tested"]))
+        self.assertEqual(set(full["delay_ms"]), set(empty_shape["delay_ms"]))
+        self.assertEqual(full["tested"]["ok"], 1)
+        self.assertEqual(full["tested"]["skipped"], 0)
+
+    def test_verdict_split_sums_to_total(self):
+        """ok+fail+skipped == total, so the panel's stacked bar never overflows."""
+        db = self.dbmod
+        for i, verdict in enumerate(("ok", "ok", "fail", "excluded")):
+            db.upsert_node("air", f"fp-{i}", f"N{i}", category="chain")
+            self._record(db, 1, "air", f"fp-{i}", f"N{i}", verdict,
+                         100 if verdict == "ok" else None, "chain")
+        tested = db.stats_by_category()["categories"]["chain"]["tested"]
+        self.assertEqual(tested["total"], 4)
+        self.assertEqual(tested["ok"], 2)
+        self.assertEqual(tested["fail"], 1)
+        self.assertEqual(tested["skipped"], 1)
+        self.assertEqual(tested["ok"] + tested["fail"] + tested["skipped"], tested["total"])
+
+    def test_categories_are_kept_apart(self):
+        """The whole point: 直连 must not absorb 中转 or 链式."""
+        db = self.dbmod
+        for cat in ("direct", "relay", "chain"):
+            db.upsert_node(cat, f"fp-{cat}", cat, status="alive", category=cat)
+            self._record(db, 1, cat, f"fp-{cat}", cat, "ok", 50, cat)
+        cats = db.stats_by_category()["categories"]
+        for cat in ("direct", "relay", "chain"):
+            self.assertEqual(cats[cat]["nodes"]["total"], 1, cat)
+            self.assertEqual(cats[cat]["tested"]["total"], 1, cat)
+            self.assertEqual(cats[cat]["nodes"]["alive"], 1, cat)
+
+    def test_legacy_rows_without_category_read_as_direct(self):
+        """Pre-migration rows are NULL and were in fact tested as direct."""
+        db = self.dbmod
+        db.upsert_node("air", "fp-old", "Old", status="alive")  # no category
+        self._record(db, 1, "air", "fp-old", "Old", "ok", 80)   # no category
+        cats = db.stats_by_category()["categories"]
+        self.assertEqual(cats["direct"]["nodes"]["total"], 1)
+        self.assertEqual(cats["direct"]["tested"]["total"], 1)
+        self.assertEqual(cats["relay"]["nodes"]["total"], 0)
+
+    def test_delay_stats_ignore_failures(self):
+        """A failed attempt stores a timeout constant, not a measurement."""
+        db = self.dbmod
+        db.upsert_node("air", "fp-ok", "OK", status="alive", category="direct")
+        db.upsert_node("air", "fp-bad", "Bad", status="dead", category="direct")
+        self._record(db, 1, "air", "fp-ok", "OK", "ok", 100, "direct")
+        self._record(db, 1, "air", "fp-bad", "Bad", "fail", 9999, "direct")
+        delay = db.stats_by_category()["categories"]["direct"]["delay_ms"]
+        self.assertEqual(delay["max"], 100, "a failure's delay leaked into the stats")
+        self.assertEqual(delay["median"], 100)
+
+    def test_round_id_selects_that_round_only(self):
+        db = self.dbmod
+        db.upsert_node("air", "fp-a", "A", status="alive", category="direct")
+        self._record(db, 1, "air", "fp-a", "A", "ok", 100, "direct")
+        self._record(db, 2, "air", "fp-a", "A", "ok", 100, "direct")
+        self._record(db, 2, "air", "fp-a", "A", "fail", None, "direct")
+        self.assertEqual(db.stats_by_category(2)["categories"]["direct"]["tested"]["total"], 2)
+        self.assertEqual(db.stats_by_category(1)["categories"]["direct"]["tested"]["total"], 1)
+
+    def test_defaults_to_newest_round_with_results(self):
+        """A round in flight has a `rounds` row but no results; do not blank."""
+        db = self.dbmod
+        db.upsert_node("air", "fp-a", "A", status="alive", category="direct")
+        self._record(db, 1, "air", "fp-a", "A", "ok", 100, "direct")
+        db.start_round("test")  # in flight, no results yet
+        self.assertEqual(db.stats_by_category()["round_id"], 1)
+
+    def test_no_results_at_all_is_not_an_error(self):
+        out = self.dbmod.stats_by_category()
+        self.assertIsNone(out["round_id"])
+        self.assertEqual(len(out["categories"]), 3)
+
+    def test_list_nodes_exposes_the_category(self):
+        """The node table reads `n.category`, and a missing key is not loud.
+
+        `renderNodes` falls back to `direct` when the field is absent, so
+        dropping it from the SELECT does not blank anything -- it relabels every
+        中转 and 链式 node as 直连 in the table, the filter and the badge, while
+        `/api/stats` (a direct column query) keeps showing the correct split.
+        The two would disagree with no error anywhere.
+        """
+        db = self.dbmod
+        db.upsert_node("air", "fp-r", "R", status="alive", category="relay")
+        db.upsert_node("air", "fp-c", "C", status="alive", category="chain")
+        by_fp = {n["fingerprint"]: n for n in db.list_nodes()}
+        self.assertEqual(by_fp["fp-r"]["category"], "relay")
+        self.assertEqual(by_fp["fp-c"]["category"], "chain")
 
 
 class DeselectTest(unittest.TestCase):
@@ -829,7 +1737,7 @@ class DeselectTest(unittest.TestCase):
             if dbmod._conn is not None:
                 dbmod._conn.close()
             dbmod.DB_PATH, dbmod._conn = old_path, old_conn
-            os.unlink(path)
+            _drop_temp_db(path)
 
     def test_empty_key_list_never_wipes_the_table(self):
         dbmod, path = self._temp_db()
@@ -843,7 +1751,7 @@ class DeselectTest(unittest.TestCase):
             if dbmod._conn is not None:
                 dbmod._conn.close()
             dbmod.DB_PATH, dbmod._conn = old_path, old_conn
-            os.unlink(path)
+            _drop_temp_db(path)
 
     def test_disabled_but_configured_source_keeps_its_history(self):
         """Re-enabling a source should not start its convergence from scratch."""
@@ -860,7 +1768,7 @@ class DeselectTest(unittest.TestCase):
             if dbmod._conn is not None:
                 dbmod._conn.close()
             dbmod.DB_PATH, dbmod._conn = old_path, old_conn
-            os.unlink(path)
+            _drop_temp_db(path)
 
 
 class SourceKeyTest(unittest.TestCase):
@@ -918,6 +1826,69 @@ class NormalizeSourcesTest(unittest.TestCase):
     def test_unknown_kind_falls_back_to_collection(self):
         out = cfgmod.normalize_sources([{"name": "a", "kind": "file"}])
         self.assertEqual(out[0]["kind"], "collection")
+
+    def test_relay_defaults_to_false(self):
+        out = cfgmod.normalize_sources([{"name": "air"}])
+        self.assertFalse(out[0]["relay"])
+
+    def test_relay_true_survives_normalize(self):
+        out = cfgmod.normalize_sources([{"name": "air", "relay": True}])
+        self.assertTrue(out[0]["relay"])
+
+    def test_relay_requires_a_real_boolean(self):
+        # `is True` on purpose: a hand-edited "yes" or 1 must read as "not
+        # marked", because a truthy coercion here would classify an entire
+        # source as transit and silently skew every category number.
+        for value in ("yes", 1, "true", [], {}):
+            out = cfgmod.normalize_sources([{"name": "air", "relay": value}])
+            self.assertFalse(out[0]["relay"], f"relay={value!r} should not count as True")
+
+
+class SourceFieldPersistenceTest(unittest.TestCase):
+    """Source fields must survive a load/save round trip, not just normalize.
+
+    `normalize_sources` rebuilds each entry from a whitelist, so a field it
+    does not name is dropped on every load *and* every update. That failure is
+    invisible: the panel POSTs, the config saves, and the setting is gone by the
+    next boot -- with no test failing, because nothing asserted the field's
+    presence. These tests exist so adding a source field without whitelisting it
+    fails loudly instead.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="src-field-"))
+        self._saved = (cfgmod.DATA, cfgmod.CONFIG_PATH)
+        cfgmod.DATA = self.tmp
+        cfgmod.CONFIG_PATH = self.tmp / "config.json"
+
+    def tearDown(self):
+        cfgmod.DATA, cfgmod.CONFIG_PATH = self._saved
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_relay_survives_save_and_reload(self):
+        cfg = cfgmod.load()
+        cfg["sources"] = [{"key": "cdn", "kind": "sub", "name": "CM-CF",
+                           "label": "CDN", "enabled": True, "export": True,
+                           "relay": True}]
+        cfgmod.save(cfg)
+        again = cfgmod.load()
+        self.assertTrue(again["sources"][0]["relay"],
+                        "relay was dropped by the load() round trip")
+
+    def test_relay_survives_update_patch(self):
+        cfgmod.load()
+        cfgmod.update({"sources": [{"key": "cdn", "kind": "sub", "name": "CM-CF",
+                                    "label": "CDN", "enabled": True,
+                                    "export": True, "relay": True}]})
+        self.assertTrue(cfgmod.load()["sources"][0]["relay"],
+                        "relay was dropped by update()")
+
+    def test_relay_round_trips_through_validate_patch(self):
+        clean, notes = cfgmod.validate_patch(
+            {"sources": [{"key": "cdn", "kind": "sub", "name": "CM-CF",
+                          "relay": True}]})
+        self.assertTrue(clean["sources"][0]["relay"])
+        self.assertFalse(notes)
 
 
 class ExportPathTest(unittest.TestCase):
@@ -1141,22 +2112,142 @@ class LinkSubstoreTest(unittest.TestCase):
         self.assertTrue(any("聚合集合" in m for m in messages))
         self.assertFalse([u for u in store.upserts if u[0] == "collection"])
 
+    def test_a_failed_upsert_never_deletes_the_healthy_object(self):
+        """A 5xx is a retry, not a retirement.
+
+        The prune used to read `members` -- the writes that *succeeded* -- so a
+        single transient failure left the object out of the membership and the
+        prune then DELETEd a subscription that was perfectly healthy. The only
+        thing that may remove a link object is the source leaving the config.
+        """
+        class FlakyStore(self.FakeStore):
+            def __init__(self, subs, fail_for):
+                super().__init__(subs=subs)
+                self.fail_for = fail_for
+
+            def upsert(self, kind, name, payload):
+                if name == self.fail_for:
+                    raise StoreError("502 Bad Gateway")
+                return super().upsert(kind, name, payload)
+
+        store = FlakyStore(
+            subs=[{"name": "probe-air", "source": "remote",
+                   "url": f"https://{self.HOST}/api/export/air.yaml?token=tok"}],
+            fail_for="probe-air")
+        messages = engine.link_substore(
+            self.cfg([{"key": "air", "name": "air", "enabled": True}]),
+            store, log=_nolog)
+        self.assertEqual(store.deleted, [], "一次可恢复的失败删掉了健康订阅")
+        self.assertTrue(any("失败" in m for m in messages), messages)
+        # And the bundle still names it: the object exists, and the name and
+        # URL are deterministic, so it is exactly the right member.
+        collection = [p for k, _n, p in store.upserts if k == "collection"][0]
+        self.assertEqual(collection["subscriptions"], ["probe-air"])
+
+    def test_the_collection_is_emptied_as_its_members_are_pruned(self):
+        """A collection naming deleted subs is the HTTP 500 we exist to avoid.
+
+        With every source gone (disabled, muted, or nothing alive) `expected`
+        was empty, so the prune deleted every `prefix-*` remote sub -- while
+        the `members`-keyed branch refused to touch the collection precisely
+        because `members` was empty, leaving it pointing at what it had just
+        deleted underneath it.
+        """
+        store = self.FakeStore(subs=[
+            {"name": "probe-zero", "source": "remote",
+             "url": f"https://{self.HOST}/api/export/zero.yaml?token=tok"},
+            {"name": "probe-air-local", "source": "local", "url": ""}])
+        engine.link_substore(
+            self.cfg([{"key": "zero", "name": "zero", "enabled": True}]),
+            store, log=_nolog)
+        self.assertEqual(store.deleted, ["/api/sub/probe-zero"])
+        collection = [p for k, _n, p in store.upserts if k == "collection"][0]
+        self.assertEqual(collection["subscriptions"], [])
+
+    def test_link_signature_ignores_the_measurement_switches(self):
+        """`relay`/`direct`/`chain` never reach `link_substore`.
+
+        These are the toggles the sources table flips most often, and every
+        one of them used to pay for a full re-link whose outcome was
+        byte-identical: the sync reads key/kind/name/label/enabled/export and
+        the publish prefix/hostname, nothing else.
+        """
+        base = {"publish": {"prefix": "probe", "hostname": self.HOST},
+                "sources": [{"key": "air", "kind": "collection", "name": "air",
+                             "enabled": True, "export": True,
+                             "direct": True, "chain": True, "relay": False}]}
+        flipped = json.loads(json.dumps(base))
+        flipped["sources"][0].update(direct=False, chain=False, relay=True)
+        self.assertEqual(engine.link_signature(base), engine.link_signature(flipped))
+
+    def test_link_signature_moves_with_every_field_the_link_reads(self):
+        # One case per field `link_substore` actually reads: each must change
+        # the signature, or a save touching only that field would silently
+        # skip the sync and leave Sub-Store pointing at the old shape.
+        base = {"publish": {"prefix": "probe", "hostname": self.HOST},
+                "sources": [{"key": "air", "kind": "collection", "name": "air",
+                             "label": "air", "enabled": True, "export": True}]}
+        for field, value in (("key", "air2"), ("kind", "sub"), ("name", "air3"),
+                             ("label", "Air"), ("enabled", False), ("export", False)):
+            with self.subTest(field=field):
+                moved = json.loads(json.dumps(base))
+                moved["sources"][0][field] = value
+                self.assertNotEqual(engine.link_signature(base),
+                                    engine.link_signature(moved))
+        for path, value in ((("publish", "prefix"), "other"),
+                            (("publish", "hostname"), "elsewhere")):
+            with self.subTest(path=".".join(path)):
+                moved = json.loads(json.dumps(base))
+                node = moved
+                for part in path[:-1]:
+                    node = node[part]
+                node[path[-1]] = value
+                self.assertNotEqual(engine.link_signature(base),
+                                    engine.link_signature(moved))
+
+    def test_link_signature_is_order_insensitive_over_sources(self):
+        # The round and the panel both reorder sources; a sync skipped or
+        # duplicated because two lists differed only in order would be noise.
+        one = {"publish": {}, "sources": [
+            {"key": "a", "name": "a", "enabled": True},
+            {"key": "b", "name": "b", "enabled": False}]}
+        two = {"publish": {}, "sources": [
+            {"key": "b", "name": "b", "enabled": False},
+            {"key": "a", "name": "a", "enabled": True}]}
+        self.assertEqual(engine.link_signature(one), engine.link_signature(two))
+
 
 
 class DashboardScriptTest(unittest.TestCase):
-    """The dashboard is one big HTML string; a quoting slip makes it blank.
+    """The dashboard script has to parse; a quoting slip makes the page blank.
 
     This is not hypothetical: an unescaped quote in a message produced a page
     that rendered its static markup but ran no script at all, so every panel
     stayed empty. Only a real parse of the served script catches that.
+
+    The script used to be inlined in the Python page template and was pulled out
+    of `ui.render()`'s output by splitting on `<script>`. It is a static asset
+    now -- that is what lets the same front end be deployed to a CDN -- so it is
+    read directly, and one test below pins the property that made the split
+    possible: the served page must reference it rather than inline it, because
+    the CSP is `script-src 'self'` with no `'unsafe-inline'`.
     """
 
     def rendered_script(self):
         from mihomo_test import ui
 
-        page = ui.render("title", "token")
-        self.assertIn("<script>", page)
-        return page.split("<script>", 1)[1].split("</script>", 1)[0]
+        return ui.asset_text("app.js")
+
+    def test_the_served_page_loads_the_script_as_an_asset(self):
+        from mihomo_test import ui
+
+        page = ui.render("t", "k")
+        self.assertIn('src="app.js"', page)
+        # `<script>` with no attributes is what an inline block looks like, and
+        # the strict CSP would block one -- the panel would paint and then never
+        # run. The bootstrap is `type="application/json"`, so it is data.
+        self.assertNotIn("<script>", page)
+        self.assertNotIn("onclick=", page)
 
     def test_page_has_no_unbalanced_braces(self):
         script = self.rendered_script()
@@ -1164,12 +2255,36 @@ class DashboardScriptTest(unittest.TestCase):
             self.assertEqual(script.count(op), script.count(cl),
                              f"unbalanced {op}{cl} in the dashboard script")
 
+    def test_the_script_writes_no_inline_event_handlers(self):
+        """`script-src 'self'` blocks inline handlers, and it does so silently.
+
+        The shell is checked elsewhere, but the table rows are built as template
+        strings *inside* app.js -- and an `onclick="copyUrl(this)"` there is
+        exactly the regression that made the 复制 button dead on the live panel
+        (the browser refuses the handler and nothing else reports it). No
+        DOM-level offline script catches this: the CSP is enforced by the
+        browser, and the mock harness does not send one.
+        """
+        script = self.rendered_script()
+        # `\son…` and not `on…`: `data-on="…"` is a data attribute, not a
+        # handler, and a looser pattern flags it.
+        found = re.findall(r"""\son[a-z]+\s*=\s*["']""", script)
+        self.assertEqual(found, [], f"generated HTML contains inline handlers: {found}")
+
+    def test_the_shell_writes_no_inline_event_handlers(self):
+        from mihomo_test import ui
+
+        page = ui.render("t", "k")
+        found = re.findall(r"""\son[a-z]+\s*=\s*["']""", page)
+        self.assertEqual(found, [], f"shell contains inline handlers: {found}")
+
     def test_page_embeds_the_token_and_no_placeholder(self):
         from mihomo_test import ui
 
         page = ui.render("我的标题", "secret-token")
         self.assertIn("secret-token", page)
         self.assertIn("我的标题", page)
+        self.assertNotIn("__BOOTSTRAP__", page)
         self.assertNotIn("__TOKEN__", page)
         self.assertNotIn("__TITLE__", page)
 
@@ -1194,6 +2309,81 @@ class DashboardScriptTest(unittest.TestCase):
         self.assertIn("function badKey(", script)
         # the hint must never be inlined into a JS string literal
         self.assertNotIn('err.textContent = "key', script)
+
+    @unittest.skipIf(shutil.which("node") is None, "node is not installed")
+    def test_a_failed_save_restores_the_previous_sources(self):
+        """Optimistic writes must not outlive the request that justified them.
+
+        Six callers assign `CONFIG.sources` before awaiting `saveSources`, so a
+        save the server rejected (or a fetch that never resolved) left the
+        table showing an unsaved state -- and the old failure branch called
+        `loadSources()`, which repaints from that same optimistic array. The
+        rollback therefore has to happen inside `saveSources`, from a snapshot
+        taken before the request, and a *rejected* fetch has to reach it at
+        all: it carries no JSON `error` field, so it used to die unhandled.
+        """
+        import subprocess
+        import tempfile
+
+        script = self.rendered_script()
+        start = script.index("async function saveSources(")
+        fn = script[start:script.index("\n}\n", start) + len("\n}\n")]
+
+        harness = f'''
+"use strict";
+const fs = require("fs");
+let CONFIG = {{sources: [{{key: "old"}}]}};
+let SOURCES_LOADED = false;
+let apiMode = "reject";
+const notices = [];
+const paints = [];
+function api(path, opts){{
+  if (apiMode === "reject") return Promise.reject(new Error("server down"));
+  if (apiMode === "error")
+    return Promise.resolve({{json: () => Promise.resolve({{error: "配置无效"}})}});
+  return Promise.resolve({{json: () => Promise.resolve({{sources: [{{key: "new"}}]}})}});
+}}
+function showNotice(t, b, n, level){{ notices.push([level, t]); }}
+function renderSources(){{ paints.push("sources"); }}
+function renderStatusRefresh(){{ paints.push("status"); }}
+function loadSources(){{ return Promise.resolve(); }}
+
+{fn}
+
+async function main(){{
+  const incoming = [{{key: "new"}}];
+  // 1. the server is unreachable: fetch rejects, there is no JSON to inspect
+  let r = await saveSources(incoming);
+  if (!r || !r.error) throw new Error("a rejected fetch must come back as an error");
+  if (JSON.stringify(CONFIG.sources) !== '[{{"key":"old"}}]')
+    throw new Error("network failure left the optimistic state: "
+                    + JSON.stringify(CONFIG.sources));
+  if (!paints.includes("sources")) throw new Error("the rollback was never repainted");
+  // 2. the server refuses it
+  apiMode = "error";
+  r = await saveSources(incoming);
+  if (!r.error) throw new Error("expected the server's error to be returned");
+  if (JSON.stringify(CONFIG.sources) !== '[{{"key":"old"}}]')
+    throw new Error("a 400 left the optimistic state: " + JSON.stringify(CONFIG.sources));
+  // 3. it succeeds: the server's own view wins over what we sent
+  apiMode = "ok";
+  r = await saveSources(incoming);
+  if (r.error) throw new Error("unexpected error: " + r.error);
+  if (JSON.stringify(CONFIG.sources) !== '[{{"key":"new"}}]')
+    throw new Error("server state not adopted: " + JSON.stringify(CONFIG.sources));
+  if (!SOURCES_LOADED) throw new Error("a successful save must mark the sources loaded");
+}}
+main().then(() => console.log("OK"),
+            e => {{ console.error(String(e)); process.exit(1); }});
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "save.js")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(harness)
+            result = subprocess.run(["node", path], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0,
+                         "rollback harness failed: "
+                         + (result.stderr or result.stdout or "")[:800])
 
 
 class BuildConfigTest(unittest.TestCase):
@@ -1314,34 +2504,87 @@ class EntryClassificationTest(unittest.TestCase):
     """CN-entry nodes cannot be tested from here and must not count as dead."""
 
     def entry(self, server, source="s", name="n"):
-        return {"source": source, "name": name,
-                "proxy": {"name": name, "type": "vless", "server": server, "port": 1},
-                "index": 0, "fp": None}
+        proxy = {"name": name, "type": "vless", "server": server, "port": 1}
+        # A real fingerprint, computed the way `collect_entries` computes it.
+        # The old helper hardcoded `fp: None`, which meant these tests never
+        # exercised the identity the ledger actually keys on.
+        return {"source": source, "name": name, "proxy": proxy,
+                "index": 0, "fp": engine._orig_fp(proxy)}
 
-    def test_literal_ips_pass_through_unresolved(self):
-        hosts = engine.resolve_servers([self.entry("203.0.113.10"),
-                                        self.entry("2406:da18::1")])
-        self.assertEqual(hosts["203.0.113.10"], ["203.0.113.10"])
-        self.assertEqual(hosts["2406:da18::1"], ["2406:da18::1"])
+    def test_a_fallback_round_keeps_the_same_fingerprint_as_a_resolved_one(self):
+        """The fingerprint must not depend on whether DNS answered.
 
-    def test_hostnames_are_resolved_once_each(self):
-        calls = []
-        real = engine.socket.getaddrinfo
+        `classify_and_expand` has two paths: resolved domains become per-address
+        variants carrying `orig_fp`, and domains that resolve from neither
+        vantage pass through untouched. The passthrough entries used to carry no
+        `fp` at all, so `core.prepare` fell back to hashing the *transformed*
+        proxy -- stripped of `dialer-proxy`, optionally of `ech-opts`, with
+        `port` coerced to int. For a node with `port: "443"` or `ech-opts` that
+        is a different hash, and `_prune_removed_nodes` uses the fingerprints
+        seen this round as its keep-list, so every fallback round DELETED the
+        node's ledger row and reset `consec_fail` to zero. A node that should
+        converge to dead after three consecutive failures never got past one.
 
-        def spy(host, *args, **kwargs):
-            calls.append(host)
-            return real(host, *args, **kwargs)
+        Both paths must therefore produce the identical fingerprint for the
+        identical node.
+        """
+        proxy = {"name": "ech-node", "type": "vless", "server": "cf.example",
+                 "port": "443", "ech-opts": {"enable": True}, "uuid": "u"}
+        base = {"source": "s", "name": "ech-node", "proxy": proxy, "index": 0}
+        resolved_entry = dict(base, fp=engine._orig_fp(proxy))
 
-        with unittest.mock.patch.object(engine.socket, "getaddrinfo", spy):
-            engine.resolve_servers([self.entry("example.com"), self.entry("example.com")])
-        self.assertEqual(calls, ["example.com"])
+        with unittest.mock.patch.object(engine.dohmod, "resolve_views",
+                                        lambda name, v, t: {"cf.example": {"overseas": ["5.6.7.8"]}}), \
+                unittest.mock.patch.object(engine, "lookup_countries",
+                                           lambda ips, log: {"5.6.7.8": "US"}):
+            expanded, _ = engine.classify_and_expand([resolved_entry], self._cfg(), _nolog)
+        with unittest.mock.patch.object(engine.dohmod, "resolve_views",
+                                        lambda name, v, t: {"cf.example": {}}):
+            fallback, _ = engine.classify_and_expand([resolved_entry], self._cfg(), _nolog)
 
-    def test_unresolvable_host_yields_no_addresses(self):
-        with unittest.mock.patch.object(
-                engine.socket, "getaddrinfo",
-                unittest.mock.Mock(side_effect=engine.socket.gaierror(1, "nx"))):
-            hosts = engine.resolve_servers([self.entry("nope.invalid")])
-        self.assertEqual(hosts["nope.invalid"], [])
+        self.assertEqual(len(expanded), 1)
+        self.assertEqual(len(fallback), 1)
+        self.assertEqual(expanded[0]["fp"], fallback[0]["fp"],
+                         "the fallback path changed the node's ledger identity")
+
+        # And `core.prepare` must agree with both, including for an entry that
+        # arrives without an fp (a caller that builds entries by hand).
+        expected = engine._orig_fp(proxy)
+        for entries in (expanded, fallback):
+            _proxies, mapping, _dropped = coremod.prepare([dict(entries[0])])
+            self.assertEqual(mapping[0]["fp"], expected)
+            # ...and the same for an entry carrying no fp at all.
+            bare = {k: v for k, v in entries[0].items() if k != "fp"}
+            _proxies, mapping, _dropped = coremod.prepare([bare])
+            self.assertEqual(mapping[0]["fp"], expected)
+
+    def test_prepare_keeps_the_unstripped_proxy_for_the_export(self):
+        """A chained node must not lose `dialer-proxy` on a fallback round.
+
+        `orig_proxy` is what gets published. It used to fall back to the
+        already-stripped proxy, so a node exported from a fallback round was a
+        config that could not work.
+        """
+        proxy = {"name": "chained", "type": "vless", "server": "a.example",
+                 "port": 443, "dialer-proxy": "__front__"}
+        entry = {"source": "s", "name": "chained", "proxy": proxy, "index": 0,
+                 "fp": engine._orig_fp(proxy)}
+        _proxies, mapping, _dropped = coremod.prepare([entry])
+        self.assertEqual(mapping[0]["orig_proxy"]["dialer-proxy"], "__front__")
+        # ...while the kernel-facing proxy still has it stripped.
+        self.assertNotIn("dialer-proxy", _proxies[0])
+
+    def test_the_fallback_entry_keeps_a_usable_export_form(self):
+        proxy = {"name": "n", "type": "vless", "server": "cf.example",
+                 "port": 443, "dialer-proxy": "__front__"}
+        with unittest.mock.patch.object(engine.dohmod, "resolve_views",
+                                        lambda name, v, t: {"cf.example": {}}):
+            entries, _ = engine.classify_and_expand(
+                [{"source": "s", "name": "n", "proxy": proxy, "index": 0,
+                  "fp": engine._orig_fp(proxy)}], self._cfg(), _nolog)
+        _proxies, mapping, _dropped = coremod.prepare(entries)
+        self.assertEqual(mapping[0]["orig_proxy"]["server"], "cf.example")
+        self.assertEqual(mapping[0]["orig_proxy"]["dialer-proxy"], "__front__")
 
     def _cfg(self, **over):
         cfg = {"verify": {"entry_check": True, "exclude_entry_countries": ["CN"],
@@ -1630,11 +2873,1270 @@ class RoundBudgetTest(unittest.TestCase):
     """
 
     def test_an_expired_budget_raises_at_the_next_checkpoint(self):
-        with self.assertRaises(engine.RoundTimeout):
-            engine._checkpoint(time.monotonic() - 1, "publish", None)
+        # `_checkpoint` writes round.state.json before it checks the deadline.
+        # Unpatched, that landed in the deployment's real data/ directory when
+        # the suite ran on the host -- the tests must not touch live state.
+        with unittest.mock.patch.object(engine, "_write_state"):
+            with self.assertRaises(engine.RoundTimeout):
+                engine._checkpoint(time.monotonic() - 1, "publish", None)
 
     def test_a_live_budget_passes_the_checkpoint(self):
-        engine._checkpoint(time.monotonic() + 60, "publish", None)
+        with unittest.mock.patch.object(engine, "_write_state"):
+            engine._checkpoint(time.monotonic() + 60, "publish", None)
+
+
+class _FakeFrontStore:
+    """Stand-in for the Sub-Store client: one resource plus one manual sub."""
+
+    def __init__(self, proxies, error=None, manual=(), write_error=None):
+        self.proxies, self.error = proxies, error
+        self.write_error = write_error
+        self.manual = [dict(p) for p in manual]
+        self.calls, self.writes, self.deleted = [], [], []
+
+    def fetch_source(self, kind, name, target="ClashMeta"):
+        self.calls.append((kind, name))
+        if self.error:
+            raise StoreError(self.error)
+        return [dict(p) for p in self.proxies]
+
+    def fetch_sub_proxies(self, name, target="ClashMeta"):
+        # The manual pool is materialised as a local sub and read back, so the
+        # fake has to serve it from its own list: returning the resource here
+        # would make "pasted" and "from the resource" indistinguishable, and
+        # that distinction is the one these tests exist to pin.
+        self.calls.append(("sub", name))
+        if self.error:
+            raise StoreError(self.error)
+        return [dict(p) for p in self.manual]
+
+    def upsert(self, kind, name, payload):
+        self.writes.append((kind, name, payload))
+        if self.write_error:
+            raise self.write_error
+        return "created"
+
+    def delete(self, kind, name):
+        self.deleted.append((kind, name))
+        raise NotFound(f"sub {name}")
+
+
+def _front_proxy(name, server="front.example"):
+    """A front shaped like the real one: xhttp with the x-padding family."""
+    return {"name": name, "type": "vless", "server": server, "port": 443,
+            "uuid": "00000000-0000-4000-8000-000000000000", "network": "xhttp",
+            "xhttp-opts": {"path": "/", "mode": "stream-one",
+                           "x-padding-obfs-mode": True, "x-padding-key": "_000000",
+                           "x-padding-header": "abcdef",
+                           "x-padding-placement": "queryInHeader",
+                           "x-padding-method": "tokenish"}}
+
+
+class ChainTest(unittest.TestCase):
+    """Chain-proxy probing: fronts first, then chains through the live ones.
+
+    The rule these pin is that a chain's verdict has to be about the front as
+    much as the node. A node carrying `dialer-proxy` is not reachable by the
+    path a direct test measures, so testing it direct reports a false alive; and
+    when no front carries it the node fails with `front_dead` rather than the
+    `timeout` a dial nobody made would produce.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.old_data, self.old_export = cfgmod.DATA, engine.EXPORT_DIR
+        self.old_path, self.old_conn = engine.db.DB_PATH, engine.db._conn
+        cfgmod.DATA = self.tmp
+        engine.db.DB_PATH, engine.db._conn = self.tmp / "s.db", None
+        engine.EXPORT_DIR = self.tmp / "exports"
+        engine.db.connect()
+
+    def tearDown(self):
+        if engine.db._conn is not None:
+            engine.db._conn.close()
+        engine.db.DB_PATH, engine.db._conn = self.old_path, self.old_conn
+        cfgmod.DATA, engine.EXPORT_DIR = self.old_data, self.old_export
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _cfg(self, enabled=True, front_name="cm-xhttp", **chain):
+        block = {"enabled": enabled, "max_fronts": 8,
+                 "front_source": {"kind": "sub", "name": front_name}}
+        block.update(chain)
+        return {"policy": {"drop_after_consecutive_fails": 3,
+                           "suspect_floor_ratio": 0.5, "suspect_floor_absolute": 3},
+                "verify": {"exclude_countries": ["CN"]},
+                "publish": {"enabled": True},
+                "sources": [{"key": "air", "name": "air"}],
+                "chain": block}
+
+    @staticmethod
+    def _test_cfg():
+        return {"targets": ["http://probe/generate_204"], "expected_status": "204",
+                "timeout_ms": 100, "timeout_ms_retry": 100, "max_attempts": 1,
+                "retry_pause_s": 0}
+
+    @staticmethod
+    def _res(reason=None, delay_ms=100):
+        return {"reason": reason, "delay_ms": delay_ms, "attempts": 1, "detail": ""}
+
+    # ---------------------------------------------------------------- config
+
+    def test_chain_block_needs_both_the_switch_and_a_front_source(self):
+        self.assertIsNone(engine.chain_block(self._cfg(enabled=False)))
+        self.assertIsNone(engine.chain_block(self._cfg(front_name="")))
+        self.assertIsNotNone(engine.chain_block(self._cfg()))
+
+    def test_normalize_chain_repairs_a_hand_edited_block(self):
+        out = cfgmod.normalize_chain({"enabled": True, "front_source": {"kind": "nope", "name": " x "}})
+        self.assertEqual(out["front_source"], {"kind": "sub", "name": "x"})
+        self.assertIs(out["enabled"], True)
+        # absent / malformed input degrades to the disabled default instead of raising
+        self.assertFalse(cfgmod.normalize_chain(None)["enabled"])
+        self.assertEqual(cfgmod.normalize_chain("junk")["front_source"]["kind"], "sub")
+
+    def test_a_saved_patch_is_clamped_and_normalised(self):
+        clean, notes = cfgmod.validate_patch(
+            {"chain": {"enabled": True, "max_fronts": 999,
+                       "front_source": {"kind": "bogus", "name": " cm-xhttp "}}})
+        self.assertEqual(clean["chain"]["max_fronts"], 64)
+        self.assertTrue(any("chain.max_fronts" in n for n in notes))
+        old_path = cfgmod.CONFIG_PATH
+        cfgmod.CONFIG_PATH = self.tmp / "config.json"
+        try:
+            cfg = cfgmod.update({"chain": clean["chain"]})
+        finally:
+            cfgmod.CONFIG_PATH = old_path
+        self.assertEqual(cfg["chain"]["front_source"], {"kind": "sub", "name": "cm-xhttp"})
+        self.assertEqual(cfg["chain"]["max_fronts"], 64)
+
+    # ----------------------------------------------------------- front pool
+
+    def test_collect_fronts_uses_reserved_kernel_names(self):
+        store = _FakeFrontStore([_front_proxy("edgetunnel"),
+                                 _front_proxy("edgetunnel-RUD")])
+        fronts = engine.collect_fronts(self._cfg(), store, _nolog)
+        self.assertEqual([f["proxy"]["name"] for f in fronts],
+                         ["__FRONT0__", "__FRONT1__"])
+        self.assertEqual([f["name"] for f in fronts], ["edgetunnel", "edgetunnel-RUD"])
+        self.assertTrue(all(f["source"] == engine.FRONT_SOURCE_KEY for f in fronts))
+        self.assertTrue(all(f["no_expand"] for f in fronts))
+        self.assertTrue(all(f["role"] == "front" for f in fronts))
+        # The display name must not leak into the kernel name, or a chained
+        # variant could end up dialling through one of the user's own nodes.
+        self.assertNotIn("edgetunnel", fronts[0]["proxy"]["name"])
+
+    def test_collect_fronts_caps_the_pool(self):
+        store = _FakeFrontStore([_front_proxy(f"f{i}") for i in range(5)])
+        fronts = engine.collect_fronts(self._cfg(max_fronts=2), store, _nolog)
+        self.assertEqual(len(fronts), 2)
+
+    def test_collect_fronts_survives_a_broken_source(self):
+        store = _FakeFrontStore([], error="HTTP 500 boom")
+        self.assertEqual(engine.collect_fronts(self._cfg(), store, _nolog), [])
+
+    def test_collect_fronts_is_off_when_chaining_is_off(self):
+        store = _FakeFrontStore([_front_proxy("f")])
+        self.assertEqual(engine.collect_fronts(self._cfg(enabled=False), store, _nolog), [])
+        self.assertEqual(store.calls, [])
+
+    # -------------------------------------------------------------- expansion
+
+    def _node(self, name="N", fp="a" * 16, dialer="hk_b"):
+        proxy = {"name": name, "type": "vless", "server": "t.example", "port": 443,
+                 "uuid": "u"}
+        if dialer is not None:
+            proxy["dialer-proxy"] = dialer
+        return {"source": "air", "name": name, "index": 0, "fp": fp, "proxy": proxy}
+
+    def test_expand_chains_builds_one_variant_per_front(self):
+        out, chained = engine.expand_chains([self._node()], ["__FRONT0__", "__FRONT1__"])
+        self.assertEqual(chained, 1)
+        self.assertEqual(len(out), 2)
+        self.assertEqual({e["proxy"]["dialer-proxy"] for e in out},
+                         {"__FRONT0__", "__FRONT1__"})
+        self.assertTrue(all(e["role"] == "chain" for e in out))
+        self.assertEqual({e["front"] for e in out}, {"__FRONT0__", "__FRONT1__"})
+        # Identity is the node's, not the path's: one fingerprint for every
+        # variant, which is what makes "any front carried it" the verdict.
+        self.assertEqual({e["fp"] for e in out}, {"a" * 16})
+
+    def test_expand_chains_leaves_unchained_nodes_and_fronts_alone(self):
+        plain = self._node(dialer=None)
+        front = {"source": engine.FRONT_SOURCE_KEY, "name": "edgetunnel",
+                 "index": 0, "fp": "f" * 16, "role": "front", "no_expand": True,
+                 "proxy": {"name": "__FRONT0__", "type": "vless", "server": "f.example",
+                           "port": 443, "dialer-proxy": "something"}}
+        out, chained = engine.expand_chains([plain, front], ["__FRONT0__"])
+        self.assertEqual(chained, 0)
+        self.assertEqual(out, [plain, front])
+
+    # ------------------------------------------- per-source 直连/链式 switches
+
+    def test_measure_flags_without_a_policy_keeps_the_old_behaviour(self):
+        # `None` is "no per-source policy this round"; the pre-existing
+        # behaviour is chain-only, so a caller that never learned about these
+        # switches sees no change at all.
+        self.assertEqual(engine._measure_flags("air", None), (False, True))
+        self.assertEqual(engine._measure_flags("air", {}), (False, True))
+
+    def test_measure_flags_reads_the_source_switches(self):
+        flags = {"air": (False, True), "alphasub": (True, False)}
+        self.assertEqual(engine._measure_flags("air", flags), (False, True))
+        self.assertEqual(engine._measure_flags("alphasub", flags), (True, False))
+        # A source the caller did not mention keeps both ways on.
+        self.assertEqual(engine._measure_flags("other", flags), (True, True))
+
+    def test_measure_flags_never_leaves_a_source_unmeasured(self):
+        # Both off cannot mean "measure nothing": a node this round never
+        # measures is a node `_prune_removed_nodes` deletes from the ledger and
+        # `_publish_sources` truncates out of the export. Direct is the fallback.
+        self.assertEqual(engine._measure_flags("air", {"air": (False, False)}),
+                         (True, False))
+
+    def test_expand_chains_honours_a_direct_only_source(self):
+        out, chained = engine.expand_chains([self._node()], ["__FRONT0__"],
+                                            {"air": (True, False)})
+        self.assertEqual(chained, 0)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["role"], "direct")
+        self.assertEqual(out[0]["category"], engine.CAT_DIRECT)
+        self.assertNotIn("dialer-proxy", out[0]["proxy"])
+        # Single variant, so the fingerprint must stay as it was -- suffixing it
+        # would orphan every ledger row the source already has.
+        self.assertEqual(out[0]["fp"], "a" * 16)
+
+    def test_expand_chains_honours_a_chain_only_source(self):
+        out, chained = engine.expand_chains([self._node()], ["__FRONT0__"],
+                                            {"air": (False, True)})
+        self.assertEqual(chained, 1)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["role"], "chain")
+        self.assertEqual(out[0]["fp"], "a" * 16)
+
+    def test_expand_chains_splits_the_two_ways_onto_separate_rows(self):
+        out, chained = engine.expand_chains(
+            [self._node()], ["__FRONT0__", "__FRONT1__"], {"air": (True, True)})
+        self.assertEqual(chained, 1)
+        self.assertEqual(len(out), 3)              # 2 chain variants + 1 direct
+        direct = [e for e in out if e["role"] == "direct"]
+        self.assertEqual(len(direct), 1)
+        self.assertNotIn("dialer-proxy", direct[0]["proxy"])
+        # Different fingerprints on purpose: one ledger row each, instead of
+        # the two measurements overwriting one another. Both must be real
+        # fingerprints -- the ledger asserts 16 hex chars (tests/test_live.py's
+        # name-keyed-scheme detector), so the twin is keyed by the fingerprint
+        # of its dialer-stripped self, not by a decorated copy of the node's.
+        self.assertEqual(len(direct[0]["fp"]), 16)
+        self.assertTrue(all(c in "0123456789abcdef" for c in direct[0]["fp"]))
+        self.assertNotEqual(direct[0]["fp"], "a" * 16)
+        self.assertEqual({e["fp"] for e in out if e["role"] == "chain"}, {"a" * 16})
+
+    def test_expand_chains_does_not_double_a_plain_node(self):
+        # No dialer means the two ways are the same measurement, so a source
+        # with both switches on must still test it once.
+        out, chained = engine.expand_chains([self._node(dialer=None)], ["__FRONT0__"],
+                                            {"air": (True, True)})
+        self.assertEqual(chained, 0)
+        self.assertEqual(len(out), 1)
+
+    def test_the_direct_twin_does_not_share_the_nodes_own_fingerprint(self):
+        """Keying the twin by the stripped proxy would fold it into one row.
+
+        `_orig_fp` drops `dialer-proxy` (it is in core.DROP_FIELDS), so the
+        stripped proxy hashes to the *chained* node's own fingerprint. Two
+        variants sharing an fp is one ledger row, and since the direct variant
+        is appended last it would win -- the chained result would silently
+        disappear. The fp here has to be derived from the real one, not
+        recomputed on the stripped proxy.
+        """
+        node = self._node()
+        node["fp"] = engine._orig_fp(node["proxy"])
+        out, _ = engine.expand_chains([node], ["__FRONT0__"], {"air": (True, True)})
+        fps = [e["fp"] for e in out]
+        self.assertEqual(len(fps), len(set(fps)), f"变体共用指纹: {fps}")
+
+    def test_normalize_sources_defaults_both_switches_on(self):
+        out = cfgmod.normalize_sources([{"kind": "collection", "name": "air"}])
+        self.assertIs(out[0]["direct"], True)
+        self.assertIs(out[0]["chain"], True)
+
+    def test_normalize_sources_keeps_an_explicit_false(self):
+        out = cfgmod.normalize_sources(
+            [{"kind": "collection", "name": "air", "direct": False, "chain": True}])
+        self.assertIs(out[0]["direct"], False)
+        self.assertIs(out[0]["chain"], True)
+
+    def test_expand_chains_without_a_front_pool_changes_nothing(self):
+        entries = [self._node()]
+        out, chained = engine.expand_chains(entries, [])
+        self.assertEqual(out, entries)
+        self.assertEqual(chained, 0)
+
+    def test_a_round_with_chaining_off_still_falls_through_to_direct(self):
+        # The empty pool means three different things, and this one is not a
+        # failure: chaining is off (or this is a 直连测活 round), so measuring
+        # the nodes as their own servers is what the round already announced in
+        # its log. `fail_without_front` is the caller's way of saying which of
+        # the two shapes it is.
+        entries = [self._node()]
+        out, chained = engine.expand_chains(entries, [], {"air": (True, True)})
+        self.assertEqual(out, entries)
+        self.assertEqual(chained, 0)
+
+    def test_a_chain_round_with_no_pool_fails_its_nodes_instead_of_dialing_them(self):
+        """The pool never arrived: `front_dead`, never a direct measurement.
+
+        Stripping the dialer is what `core.prepare` does with a value no front
+        satisfies, and it is the exact hazard its docstring names: the round
+        would report the node alive on a path its owner never uses. So the
+        entry is emitted as a chain-role orphan with `front=None` -- present in
+        the config, never dialled, and routed into `chain_failed` by the phase
+        split.
+        """
+        out, chained = engine.expand_chains([self._node()], [], {"air": (True, True)},
+                                            fail_without_front=True)
+        self.assertEqual(chained, 1)
+        self.assertEqual({e["role"] for e in out}, {"chain", "direct"})
+        orphan = next(e for e in out if e["role"] == "chain")
+        self.assertIsNone(orphan["front"])
+        self.assertEqual(orphan["category"], engine.CAT_CHAIN)
+        # The ledger identity is the node's, unchanged, so `_record_chain_failures`
+        # lands on the same row the node already has and the streak advances.
+        self.assertEqual(orphan["fp"], "a" * 16)
+        # The direct half of a dual-switch source is still measured direct.
+        twin = next(e for e in out if e["role"] == "direct")
+        self.assertNotIn("dialer-proxy", twin["proxy"])
+        self.assertNotEqual(twin["fp"], orphan["fp"])
+
+    def test_the_direct_twins_key_is_stable_across_resolved_addresses(self):
+        """Two rounds, two address sets, one identity.
+
+        `classify_and_expand` runs first, so `proxy["server"]` here is a
+        resolved address and the old base (`_orig_fp(stripped)`) hashed it.
+        Address churn then changed the twin's fingerprint, `_prune_removed_nodes`
+        dropped the row it stopped seeing, and `consec_fail` reset to zero --
+        a node that should converge to dead after N failures never got past 1.
+        """
+        node = self._node()
+        node["fp"] = engine._orig_fp(node["proxy"])
+        twins = []
+        for ip in ("1.2.3.4", "5.6.7.8"):
+            expanded = {**node, "proxy": {**node["proxy"], "server": ip},
+                        "orig_proxy": node["proxy"], "test_ip": ip}
+            out, _ = engine.expand_chains([expanded], ["__FRONT0__"],
+                                          {"air": (True, True)})
+            twins.append(next(e for e in out if e["role"] == "direct"))
+        self.assertEqual(twins[0]["fp"], twins[1]["fp"])
+        self.assertNotEqual(twins[0]["fp"], node["fp"])
+        self.assertEqual(len(twins[0]["fp"]), 16)
+
+    def test_prepare_keeps_a_dialer_only_when_the_front_is_in_the_config(self):
+        entry = {"source": "air", "name": "N", "index": 0,
+                 "proxy": {"name": "N", "type": "vless", "server": "t.example",
+                           "port": 443, "dialer-proxy": "__FRONT0__"}}
+        proxies, _m, _d = coremod.prepare([entry], keep_dialer=["__FRONT0__"])
+        self.assertEqual(proxies[0]["dialer-proxy"], "__FRONT0__")
+        proxies, _m, _d = coremod.prepare([entry], keep_dialer=["__FRONT1__"])
+        self.assertNotIn("dialer-proxy", proxies[0])
+        # default stays as before: no chain support means no dialer
+        proxies, _m, _d = coremod.prepare([entry])
+        self.assertNotIn("dialer-proxy", proxies[0])
+
+    def test_the_kernel_sees_the_front_while_the_export_keeps_the_clients_name(self):
+        """`dialer-proxy: hk_b` is the client's group; `__FRONT0__` is ours."""
+        proxy = {"name": "N", "type": "vless", "server": "t.example", "port": 443,
+                 "dialer-proxy": "hk_b"}
+        entry = {"source": "air", "name": "N", "index": 0, "fp": "a" * 16,
+                 "proxy": proxy, "orig_proxy": proxy}
+        variant = {**entry, "proxy": {**proxy, "dialer-proxy": "__FRONT0__"},
+                   "role": "chain", "front": "__FRONT0__"}
+        proxies, mapping, _d = coremod.prepare([variant], keep_dialer=["__FRONT0__"])
+        self.assertEqual(proxies[0]["dialer-proxy"], "__FRONT0__")
+        self.assertEqual(mapping[0]["orig_proxy"]["dialer-proxy"], "hk_b")
+
+    def test_classify_and_expand_does_not_split_a_front_per_address(self):
+        cfg = self._cfg()
+        front = {"source": engine.FRONT_SOURCE_KEY, "no_expand": True,
+                 "fp": "f" * 16, "name": "edgetunnel",
+                 "proxy": {"name": "__FRONT0__", "server": "f.example"}}
+        node = {"source": "air", "index": 1, "fp": "a" * 16,
+                "proxy": {"name": "N", "server": "t.example"}}
+        with unittest.mock.patch.object(engine, "_resolve_candidates",
+                                        return_value=["1.2.3.4"]), \
+                unittest.mock.patch.object(engine, "lookup_countries",
+                                           return_value={"1.2.3.4": "US"}):
+            out, excluded = engine.classify_and_expand([front, node], cfg, _nolog)
+        self.assertEqual(excluded, [])
+        self.assertEqual([e for e in out if e.get("no_expand")], [front])
+        self.assertEqual([e["proxy"]["server"] for e in out if not e.get("no_expand")],
+                         ["1.2.3.4"])
+
+    # ------------------------------------------------------------- two phases
+
+    class _PhaseCore:
+        """Fake kernel: a proxy answers iff its name is in `alive`."""
+
+        def __init__(self, alive):
+            self.alive, self.seen = set(alive), []
+
+        def delay(self, name, url, timeout_ms, expected):
+            self.seen.append(name)
+            if name in self.alive:
+                return 30, None, ""
+            return None, "timeout", "Timeout"
+
+    def _mapping(self, *rows):
+        return [{"mihomo": n, "role": role, "front": front,
+                 "source": src, "fp": fp}
+                for n, role, front, src, fp in rows]
+
+    def test_chains_are_tested_only_through_live_fronts(self):
+        core = self._PhaseCore(alive={"__FRONT0__", "N"})
+        mapping = self._mapping(
+            ("__FRONT0__", "front", None, engine.FRONT_SOURCE_KEY, "f0"),
+            ("__FRONT1__", "front", None, engine.FRONT_SOURCE_KEY, "f1"),
+            ("N", "chain", "__FRONT0__", "air", "n"),
+            ("N #2", "chain", "__FRONT1__", "air", "n"),
+        )
+        results, failed, live = engine._test_phases(
+            core, mapping, self._test_cfg(), 4, None, True, _nolog)
+        self.assertEqual(live, 1)
+        self.assertIn("N", core.seen)
+        self.assertNotIn("N #2", core.seen)
+        # One live front was enough, so the node is not failed outright.
+        self.assertEqual(failed, [])
+        self.assertIsNone(results["N"]["reason"])
+
+    def test_a_node_with_no_live_front_is_failed_without_being_dialled(self):
+        core = self._PhaseCore(alive=set())
+        mapping = self._mapping(
+            ("__FRONT0__", "front", None, engine.FRONT_SOURCE_KEY, "f0"),
+            ("N", "chain", "__FRONT0__", "air", "n"),
+        )
+        results, failed, live = engine._test_phases(
+            core, mapping, self._test_cfg(), 4, None, True, _nolog)
+        self.assertEqual(live, 0)
+        self.assertEqual([m["mihomo"] for m in failed], ["N"])
+        self.assertNotIn("N", results)
+        self.assertNotIn("N", core.seen)
+
+    def test_the_failed_entries_are_deduplicated_per_node(self):
+        """One entry per node, not one per (front x address) variant."""
+        core = self._PhaseCore(alive=set())
+        mapping = self._mapping(
+            ("__FRONT0__", "front", None, engine.FRONT_SOURCE_KEY, "f0"),
+            ("__FRONT1__", "front", None, engine.FRONT_SOURCE_KEY, "f1"),
+            ("N", "chain", "__FRONT0__", "air", "n"),
+            ("N #2", "chain", "__FRONT1__", "air", "n"),
+        )
+        _r, failed, _live = engine._test_phases(
+            core, mapping, self._test_cfg(), 4, None, True, _nolog)
+        self.assertEqual(len(failed), 1)
+
+    def test_without_chains_it_is_a_single_pass(self):
+        core = self._PhaseCore(alive={"N"})
+        mapping = self._mapping(("N", None, None, "air", "n"))
+        results, failed, live = engine._test_phases(
+            core, mapping, self._test_cfg(), 4, None, False, _nolog)
+        self.assertEqual((failed, live), ([], 0))
+        self.assertIsNone(results["N"]["reason"])
+
+    # ----------------------------------------------------------- ledger/export
+
+    def _chain_entry(self, **over):
+        entry = {"source": "air", "fp": "a" * 16, "original": "N", "mihomo": "N",
+                 "proto": "vless", "server": "t.example", "role": "chain"}
+        entry.update(over)
+        return entry
+
+    def test_front_dead_failure_advances_the_streak_with_an_honest_reason(self):
+        round_id = engine.db.start_round("test")
+        _by_source, fps = engine._record_chain_failures(
+            self._cfg(), round_id, [self._chain_entry()], _nolog)
+        node = engine.db.get_node("air", "a" * 16)
+        self.assertEqual(node["consec_fail"], 1)
+        self.assertEqual(node["last_reason"], engine.FRONT_DEAD_REASON)
+        # A node that never passed stays `unknown`; the streak is what counts.
+        self.assertEqual(node["status"], policy.UNKNOWN)
+        row = engine.db.one("SELECT verdict, reason FROM results WHERE round_id=?",
+                            (round_id,))
+        self.assertEqual((row["verdict"], row["reason"]),
+                         ("fail", engine.FRONT_DEAD_REASON))
+        self.assertEqual(fps["air"], {"a" * 16})
+
+    def test_a_chain_failure_moves_a_previously_alive_node_to_pending(self):
+        """The verdict is a real failure: it must advance the state machine."""
+        entry = self._chain_entry()
+        engine.db.upsert_node("air", entry["fp"], "N", status=policy.ALIVE, consec_fail=0)
+        round_id = engine.db.start_round("test")
+        engine._record_chain_failures(self._cfg(), round_id, [entry], _nolog)
+        node = engine.db.get_node("air", entry["fp"])
+        self.assertEqual(node["status"], policy.PENDING)
+        self.assertEqual(node["consec_fail"], 1)
+
+    def test_a_chain_failure_reaches_dead_at_the_threshold(self):
+        entry = self._chain_entry()
+        engine.db.upsert_node("air", entry["fp"], "N", status=policy.PENDING, consec_fail=2)
+        round_id = engine.db.start_round("test")
+        engine._record_chain_failures(self._cfg(), round_id, [entry], _nolog)
+        node = engine.db.get_node("air", entry["fp"])
+        self.assertEqual(node["status"], policy.DEAD)
+        self.assertEqual(node["consec_fail"], 3)
+
+    def test_the_prune_keeps_a_chain_failure_but_would_drop_it_otherwise(self):
+        """The row was never dialled, so it is absent from `by_name`.
+
+        Without the fingerprints handed back by `_record_chain_failures`, the
+        prune sees a source whose only surviving node is the one it tested, and
+        deletes the chain-failed row -- resetting the streak it just advanced,
+        so a node whose front is permanently dead would never converge.
+        """
+        round_id = engine.db.start_round("test")
+        entry = self._chain_entry()
+        _by_source, fps = engine._record_chain_failures(self._cfg(), round_id, [entry], _nolog)
+        # A sibling that WAS dialled, so the source is in scope for the prune.
+        tested = {"source": "air", "fp": "b" * 16, "original": "M", "mihomo": "M",
+                  "test_ip": "m.example"}
+        empty = collections.defaultdict(set)
+        engine._prune_removed_nodes({"M": tested}, {}, empty, _nolog)
+        self.assertIsNone(engine.db.get_node("air", entry["fp"]))
+        engine._record_chain_failures(self._cfg(), round_id, [entry], _nolog)
+        engine._prune_removed_nodes({"M": tested}, {}, empty, _nolog, chain_failed=fps)
+        self.assertIsNotNone(engine.db.get_node("air", entry["fp"]))
+
+    def test_a_chain_that_works_through_one_front_is_alive(self):
+        cfg = self._cfg()
+        entry = self._chain_entry(role="chain")
+        by_name = {"N": entry, "N #2": entry}
+        results = {"N": self._res(), "N #2": self._res(reason="timeout", delay_ms=None)}
+        proxies = [
+            {"name": "N", "type": "vless", "server": "t.example", "port": 443,
+             "dialer-proxy": "__FRONT0__"},
+            {"name": "N #2", "type": "vless", "server": "t.example", "port": 443,
+             "dialer-proxy": "__FRONT1__"},
+        ]
+        round_id = engine.db.start_round("test")
+        summary = engine._apply_and_publish(cfg, round_id, None, by_name, proxies,
+                                            results, {}, cfg["sources"], _nolog)
+        self.assertEqual(summary["alive"], 1)
+        self.assertEqual(engine.db.get_node("air", "a" * 16)["status"], policy.ALIVE)
+
+    def test_a_chain_that_no_front_carries_is_dead(self):
+        cfg = self._cfg()
+        entry = self._chain_entry(role="chain")
+        by_name = {"N": entry, "N #2": entry}
+        results = {"N": self._res(reason="timeout", delay_ms=None),
+                   "N #2": self._res(reason="timeout", delay_ms=None)}
+        proxies = [
+            {"name": "N", "type": "vless", "server": "t.example", "port": 443,
+             "dialer-proxy": "__FRONT0__"},
+            {"name": "N #2", "type": "vless", "server": "t.example", "port": 443,
+             "dialer-proxy": "__FRONT1__"},
+        ]
+        round_id = engine.db.start_round("test")
+        summary = engine._apply_and_publish(cfg, round_id, None, by_name, proxies,
+                                            results, {}, cfg["sources"], _nolog)
+        self.assertEqual(summary["alive"], 0)
+        self.assertEqual(engine.db.get_node("air", "a" * 16)["consec_fail"], 1)
+
+    def test_a_front_is_counted_but_never_exported(self):
+        cfg = self._cfg()
+        entry = {"source": engine.FRONT_SOURCE_KEY, "fp": "f" * 16,
+                 "original": "edgetunnel", "mihomo": "__FRONT0__",
+                 "test_ip": "f.example", "role": "front"}
+        proxies = [{"name": "__FRONT0__", "type": "vless", "server": "f.example",
+                    "port": 443}]
+        round_id = engine.db.start_round("test")
+        summary = engine._apply_and_publish(
+            cfg, round_id, None, {"__FRONT0__": entry}, proxies,
+            {"__FRONT0__": self._res()}, {}, cfg["sources"], _nolog)
+        self.assertEqual(summary["alive"], 1)
+        self.assertEqual(summary["total"], 1)
+        self.assertFalse((self.tmp / "exports" / f"{engine.FRONT_SOURCE_KEY}.yaml").exists())
+
+
+class FrontPoolInputsTest(unittest.TestCase):
+    """The three ways to fill the front pool: resource, pick list, pasted text.
+
+    The pool is capped by `max_fronts` and the pasted entries come first, so
+    these pin the *composition* rule, not just each input on its own -- the
+    bug this feature could reintroduce is a second input silently overriding
+    the first, or the cap being applied per input instead of to the result.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.old_data, self.old_export = cfgmod.DATA, engine.EXPORT_DIR
+        self.old_path, self.old_conn = engine.db.DB_PATH, engine.db._conn
+        cfgmod.DATA = self.tmp
+        engine.db.DB_PATH, engine.db._conn = self.tmp / "s.db", None
+        engine.EXPORT_DIR = self.tmp / "exports"
+        engine.db.connect()
+        # The manual pool is materialised once per process and skipped when the
+        # text is unchanged, so a test that leaves the cache dirty makes the
+        # *next* test's upsert invisible. Reset both between cases.
+        self._synced, self._cleaned = dict(engine._MANUAL_FRONT_SYNCED), set(engine._MANUAL_FRONT_CLEANED)
+        engine._MANUAL_FRONT_SYNCED.clear()
+        engine._MANUAL_FRONT_CLEANED.clear()
+
+    def tearDown(self):
+        if engine.db._conn is not None:
+            engine.db._conn.close()
+        engine.db.DB_PATH, engine.db._conn = self.old_path, self.old_conn
+        cfgmod.DATA, engine.EXPORT_DIR = self.old_data, self.old_export
+        engine._MANUAL_FRONT_SYNCED.clear()
+        engine._MANUAL_FRONT_SYNCED.update(self._synced)
+        engine._MANUAL_FRONT_CLEANED.clear()
+        engine._MANUAL_FRONT_CLEANED.update(self._cleaned)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _cfg(self, enabled=True, front_name="cm-xhttp", **chain):
+        block = {"enabled": enabled, "max_fronts": 8,
+                 "front_source": {"kind": "sub", "name": front_name}}
+        block.update(chain)
+        return cfgmod.normalize_chain(block)
+
+    def _pool(self, proxies, manual=(), **chain):
+        cfg = {"publish": {"prefix": "probe"}, "chain": self._cfg(**chain)}
+        store = _FakeFrontStore(proxies, manual=manual)
+        return engine.collect_fronts(cfg, store, _nolog), store
+
+    # ------------------------------------------------------------- normalize
+
+    def test_normalize_keeps_pick_order_and_drops_duplicates(self):
+        out = cfgmod.normalize_chain({"front_pick": [" b ", "a", "b", "", None, "a"]})
+        self.assertEqual(out["front_pick"], ["b", "a"])
+        self.assertEqual(cfgmod.normalize_chain({"front_pick": "nope"})["front_pick"], [])
+        self.assertEqual(cfgmod.normalize_chain(None)["front_text"], "")
+
+    def test_normalize_truncates_a_runaway_paste(self):
+        out = cfgmod.normalize_chain({"front_text": "x" * (cfgmod.MAX_FRONT_TEXT + 10)})
+        self.assertEqual(len(out["front_text"]), cfgmod.MAX_FRONT_TEXT)
+
+    def test_an_oversized_paste_is_refused_not_truncated(self):
+        # Truncating a base64 body yields something that still parses, into
+        # garbage nodes -- so the failure would read as "the front pool is
+        # empty" with nothing pointing at the paste.
+        clean, notes = cfgmod.validate_patch(
+            {"chain": {"front_text": "x" * (cfgmod.MAX_FRONT_TEXT + 10)}})
+        self.assertNotIn("front_text", clean.get("chain", {}))
+        self.assertTrue(any("chain.front_text" in n for n in notes))
+
+    # ----------------------------------------------------------- chain_block
+
+    def test_pasted_text_alone_counts_as_a_configured_pool(self):
+        # Requiring `front_source` would make a manual-only pool read as
+        # "chaining is off" and silently turn 链式测活 into a direct round.
+        self.assertIsNotNone(engine.chain_block({"chain": self._cfg(front_name="", front_text="vless://x")}))
+        self.assertIsNone(engine.chain_block({"chain": self._cfg(front_name="", front_text="   ")}))
+        self.assertIsNone(engine.chain_block({"chain": self._cfg(enabled=False, front_text="vless://x")}))
+
+    # --------------------------------------------------------- manual_fronts
+
+    def test_pasted_text_is_written_once_and_reused(self):
+        cfg = {"publish": {"prefix": "probe"},
+               "chain": self._cfg(front_name="", front_text="vless://one")}
+        store = _FakeFrontStore([], manual=[{"name": "M", "type": "vless",
+                                            "server": "m.example"}])
+        self.assertEqual([f["name"] for f in engine.collect_fronts(cfg, store, _nolog)], ["M"])
+        self.assertEqual(len(store.writes), 1)
+        self.assertEqual(store.writes[0][1], "probe-front-manual")
+        self.assertEqual(store.writes[0][2]["content"], "vless://one")
+        # unchanged text -> no second write
+        engine.collect_fronts(cfg, store, _nolog)
+        self.assertEqual(len(store.writes), 1)
+        # changed text -> written again
+        cfg["chain"]["front_text"] = "vless://two"
+        engine.collect_fronts(cfg, store, _nolog)
+        self.assertEqual(len(store.writes), 2)
+        self.assertEqual(store.writes[1][2]["content"], "vless://two")
+
+    def test_a_failed_manual_write_does_not_take_the_resource_down(self):
+        cfg = {"publish": {"prefix": "probe"},
+               "chain": self._cfg(front_text="vless://one")}
+        store = _FakeFrontStore([{"name": "R", "type": "vless", "server": "r.example"}],
+                                manual=[{"name": "M", "type": "vless", "server": "m.example"}],
+                                write_error=StoreError("boom"))
+        # The manual half is unavailable, but the resource half still is: one
+        # broken input must not empty a pool the other input can fill. And a
+        # write that failed must not be remembered as done, or the next round
+        # would skip the retry and the pool would stay empty forever.
+        pool = engine.collect_fronts(cfg, store, _nolog)
+        self.assertEqual([f["name"] for f in pool], ["R"])
+        self.assertEqual(engine._MANUAL_FRONT_SYNCED, {})
+
+    def test_clearing_the_paste_removes_the_materialised_sub(self):
+        cfg = {"publish": {"prefix": "probe"},
+               "chain": self._cfg(front_name="", front_text="vless://one")}
+        store = _FakeFrontStore([], manual=[{"name": "M", "type": "vless",
+                                            "server": "m.example"}])
+        engine.collect_fronts(cfg, store, _nolog)
+        cfg["chain"]["front_text"] = ""
+        engine.collect_fronts(cfg, store, _nolog)
+        self.assertEqual(store.deleted, [("sub", "probe-front-manual")])
+
+    # --------------------------------------------------------- pool assembly
+
+    def test_pasted_fronts_come_first_and_are_capped_with_the_rest(self):
+        resource = [_front_proxy("R0"), _front_proxy("R1"), _front_proxy("R2")]
+        manual = [{"name": "M0", "type": "vless", "server": "m.example"}]
+        pool, _ = self._pool(resource, manual=manual, max_fronts=2,
+                             front_text="vless://one")
+        # The pasted list is the explicit, just-typed choice; the resource is
+        # the standing default. A cap of 2 therefore keeps the pasted one plus
+        # exactly one resource entry -- not two of either.
+        self.assertEqual([f["name"] for f in pool], ["M0", "R0"])
+
+    def test_pick_narrows_the_resource_instead_of_supplementing_it(self):
+        resource = [_front_proxy("R0"), _front_proxy("R1"), _front_proxy("R2")]
+        pool, _ = self._pool(resource, front_pick=["R2"])
+        self.assertEqual([f["name"] for f in pool], ["R2"])
+
+    def test_a_pick_list_without_a_source_is_ignored_not_fatal(self):
+        pool, _ = self._pool([], front_name="", front_pick=["R2"])
+        self.assertEqual(pool, [])
+
+    def test_every_front_keeps_the_reserved_kernel_name(self):
+        resource = [_front_proxy("R0")]
+        manual = [{"name": "M0", "type": "vless", "server": "m.example"}]
+        pool, _ = self._pool(resource, manual=manual, front_text="vless://one")
+        self.assertEqual([f["proxy"]["name"] for f in pool],
+                         [f"{engine.FRONT_NAME_PREFIX}0__", f"{engine.FRONT_NAME_PREFIX}1__"])
+        self.assertTrue(all(f["category"] == engine.CAT_RELAY for f in pool))
+
+
+class FrontPoolUiTest(unittest.TestCase):
+    """The front-pool inputs must reach the panel, not only the config schema.
+
+    A config key nothing renders is a switch the operator believes in and
+    cannot use, and the reverse is worse here: a picker whose selection is not
+    sent back leaves the pool reading as "all nodes" while the panel shows a
+    ticked subset.
+
+    The panel script moved out of `ui.py` into the static `web/app.js` so the
+    same front end can be deployed to a CDN. The assertions are about *what the
+    panel sends*, not about how it is indented, so they run against a
+    whitespace-collapsed copy -- pinning exact spacing made them fail on a pure
+    reformat, which says nothing about the behaviour they exist to protect.
+    """
+
+    UI = (Path(__file__).resolve().parent.parent
+          / "mihomo_test" / "web" / "app.js")
+
+    @staticmethod
+    def _squash(text):
+        return re.sub(r"\s+", "", text)
+
+    def _source(self):
+        return self._squash(self.UI.read_text(encoding="utf-8"))
+
+    def test_settings_render_both_new_inputs(self):
+        src = self._source()
+        for anchor in ('id="s-chain-text"', 'id="btn-front-pick"',
+                       'id="btn-front-pick-clear"', 'id="front-picker"',
+                       'id="front-pick-info"'):
+            self.assertIn(anchor, src)
+
+    def test_saving_sends_the_pick_list_and_the_paste(self):
+        src = self._source()
+        start = src.index("chain:(()=>{")
+        body = src[start:src.index("publish:{", start)]
+        # `front_pick` has to be sent even when empty: the config merge is per
+        # key, so omitting it would leave the previous list in place and make
+        # 清空名单 silently do nothing.
+        self.assertIn("front_pick:[...FRONT_PICK]", body)
+        self.assertIn('front_text:val("s-chain-text")', body)
+
+    def test_the_picker_reads_its_nodes_from_the_server(self):
+        src = self._source()
+        self.assertIn("/api/substore-nodes?", src)
+        # Seeded from the server config, so a rejected save cannot leave the
+        # panel claiming a selection that was never stored.
+        self.assertIn("newSet(((cfg.chain||{}).front_pick)||[])", src)
+
+
+class RejectedNodeTest(unittest.TestCase):
+    """A node the kernel refuses must not be published as alive.
+
+    Found live: one `gammasub` node carried `short-id: 123456e2`, which mihomo
+    rejects with "invalid REALITY short ID". `core.make_testable` pruned it and
+    logged the prune, but the pruning never reached the ledger -- so the node
+    kept the previous round's `alive`, was written to `gammasub.yaml`, and the
+    published file failed to load:
+
+        proxy 147: invalid REALITY short ID
+        configuration file test failed
+
+    Same shape as the dangling `dialer-proxy`: the round succeeded and the
+    export was unusable.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _cfg(self):
+        return {
+            "policy": {"drop_after_consecutive_fails": 3},
+            "publish": {"add_region_tag": False, "enabled": True},
+        }
+
+    def _entry(self, name, server="s.example"):
+        proxy = {"name": name, "type": "vless", "server": server, "port": 443, "uuid": "u"}
+        return {"source": "k", "name": name, "proxy": proxy,
+                "index": 0, "fp": engine._orig_fp(proxy)}
+
+    def test_a_rejected_node_is_failed_and_kept_out_of_the_export(self):
+        entry = self._entry("bad")
+        rejected = [entry]
+        alive_by_source = {"k": ["bad", "good"]}
+        # The publish-path guard is what this asserts: `alive_by_source` is the
+        # only thing `_write_export` reads, so a node failed in the ledger but
+        # still listed here would ship anyway.
+        names = {e["name"] for e in rejected}
+        trimmed = {k: [n for n in v if n not in names]
+                   for k, v in alive_by_source.items()}
+        self.assertEqual(trimmed["k"], ["good"])
+
+    def test_recording_a_rejection_advances_the_failure_streak(self):
+        entry = self._entry("bad")
+        cfg = self._cfg()
+        with unittest.mock.patch.object(engine, "db") as mock_db:
+            mock_db.get_node.return_value = {
+                "source": "k", "fingerprint": entry["fp"], "consec_fail": 0,
+                "status": "alive", "total_ok": 5, "total_fail": 0}
+            by_source, fps = engine._record_rejected_nodes(cfg, 1, [entry], _nolog)
+        self.assertEqual(sorted(fps["k"]), [entry["fp"]])
+        self.assertEqual(by_source["k"], [entry])
+        fields = mock_db.upsert_node.call_args.kwargs
+        self.assertEqual(fields["last_reason"], engine.REJECTED_REASON)
+        self.assertEqual(fields["consec_fail"], 1)
+
+    def test_rejected_fingerprints_count_as_seen_so_the_prune_spares_them(self):
+        # These entries are absent from `by_name` (nothing was dialled), so
+        # without being passed here the prune would delete the very streak the
+        # rejection just advanced.
+        entry = self._entry("bad")
+        with unittest.mock.patch.object(engine, "db") as mock_db:
+            mock_db.delete_nodes_not_in.return_value = 0
+            engine._prune_removed_nodes({}, {}, {}, _nolog,
+                                        rejected={"k": {entry["fp"]}})
+        mock_db.delete_nodes_not_in.assert_called_once_with("k", [entry["fp"]])
+
+    def test_a_rejected_entry_is_matched_back_by_name(self):
+        # `make_testable` reports `{name, why}` because `prepare` sees proxies,
+        # not entries; the caller has to reattach source and fp.
+        entries = [self._entry("bad"), self._entry("good", "g.example")]
+        dropped = [{"name": "bad", "why": "kernel config error"}]
+        names = {i["name"] for i in dropped}
+        picked = [e for e in entries if e["name"] in names]
+        self.assertEqual([e["name"] for e in picked], ["bad"])
+        self.assertEqual(picked[0]["source"], "k")
+
+    def test_a_rejection_carries_the_entry_category_through(self):
+        """A rejected node must land in its own bucket, not in 直连.
+
+        `record_result`'s `category` is what `stats_by_category` groups on, and
+        a NULL there reads as `direct`. A rejected *chained* node would then be
+        counted against 直连 in both units -- the panel's 链式 failures would
+        under-report and 直连's would over-report, for a node that has nothing
+        to do with direct dialling.
+        """
+        entry = self._entry("bad")
+        entry["category"] = engine.CAT_CHAIN
+        with unittest.mock.patch.object(engine, "db") as mock_db:
+            mock_db.get_node.return_value = {
+                "source": "k", "fingerprint": entry["fp"], "consec_fail": 0,
+                "status": "alive", "total_ok": 1, "total_fail": 0}
+            engine._record_rejected_nodes(self._cfg(), 1, [entry], _nolog)
+        self.assertEqual(mock_db.record_result.call_args.kwargs.get("category"),
+                         engine.CAT_CHAIN,
+                         "a rejected chained node was recorded without a category")
+        self.assertEqual(mock_db.upsert_node.call_args.kwargs.get("category"),
+                         engine.CAT_CHAIN)
+
+    def test_a_rejected_entry_without_a_category_defaults_to_direct(self):
+        """Entries built by hand carry no category; direct is the safe reading."""
+        entry = self._entry("bad")
+        with unittest.mock.patch.object(engine, "db") as mock_db:
+            mock_db.get_node.return_value = {
+                "source": "k", "fingerprint": entry["fp"], "consec_fail": 0,
+                "status": "alive", "total_ok": 1, "total_fail": 0}
+            engine._record_rejected_nodes(self._cfg(), 1, [entry], _nolog)
+        self.assertEqual(mock_db.record_result.call_args.kwargs.get("category"),
+                         engine.CAT_DIRECT)
+
+
+class ChainFailureCategoryTest(unittest.TestCase):
+    """`_record_chain_failures` always writes a chain verdict.
+
+    Its entries are the chained ones a dead front pool killed -- the path exists
+    precisely so they are *not* dialled. Recording them without a category put
+    every such failure in 直连's tally.
+    """
+
+    def _entry(self, name):
+        proxy = {"name": name, "type": "vmess", "server": "s.example",
+                 "dialer-proxy": "g"}
+        return {"source": "s", "name": name, "original": name,
+                "proxy": proxy, "fp": engine._orig_fp(proxy),
+                "proto": "vmess", "server": "s.example",
+                "category": engine.CAT_CHAIN}
+
+    def test_a_front_dead_chain_is_recorded_as_a_chain(self):
+        entry = self._entry("c1")
+        cfg = {"policy": {"drop_after_consecutive_fails": 3}}
+        with unittest.mock.patch.object(engine, "db") as mock_db:
+            mock_db.get_node.return_value = {
+                "source": "s", "fingerprint": entry["fp"], "consec_fail": 0,
+                "status": "alive", "total_ok": 1, "total_fail": 0}
+            engine._record_chain_failures(cfg, 1, [entry], _nolog)
+        self.assertEqual(mock_db.record_result.call_args.kwargs.get("category"),
+                         engine.CAT_CHAIN,
+                         "a chain failure was recorded without the chain category")
+        self.assertEqual(mock_db.upsert_node.call_args.kwargs.get("category"),
+                         engine.CAT_CHAIN)
+        self.assertEqual(mock_db.record_result.call_args.args[6],
+                         engine.FRONT_DEAD_REASON)
+
+
+class CategoryClassificationTest(unittest.TestCase):
+    """The three-way split the 分类统计 panel reports on.
+
+    `direct` / `relay` / `chain` is a property of the node plus one flag on its
+    source, and it has to be decided *once*, in `collect_entries`, while that
+    flag is still in hand -- `core.prepare` only ever sees proxies, and a proxy
+    alone cannot tell a marked transit hop from an ordinary node.
+    """
+
+    def _proxy(self, **extra):
+        return {"name": "n", "type": "vmess", "server": "a.example", **extra}
+
+    def test_a_plain_node_is_direct(self):
+        self.assertEqual(engine.classify_category(self._proxy()), engine.CAT_DIRECT)
+
+    def test_a_node_from_a_relay_source_is_a_relay(self):
+        self.assertEqual(
+            engine.classify_category(self._proxy(), source_relay=True),
+            engine.CAT_RELAY)
+
+    def test_dialer_proxy_makes_it_a_chain(self):
+        self.assertEqual(
+            engine.classify_category(self._proxy(**{"dialer-proxy": "g"})),
+            engine.CAT_CHAIN)
+
+    def test_both_spellings_of_dialer_proxy_are_recognised(self):
+        """mihomo normalises `_` to `-`; upstream subscriptions use both."""
+        self.assertEqual(
+            engine.classify_category(self._proxy(dialer_proxy="g")),
+            engine.CAT_CHAIN)
+
+    def test_relay_beats_chain(self):
+        """A marked transit hop that also carries `dialer-proxy` is a relay.
+
+        Reporting it as a chain would double-count it -- it is already one of
+        the fronts the chain is measured through -- and the chain total would
+        stop agreeing with the front pool.
+        """
+        self.assertEqual(
+            engine.classify_category(self._proxy(dialer_proxy="g"), source_relay=True),
+            engine.CAT_RELAY)
+
+    def test_labels_cover_every_category(self):
+        for cat in engine.CATEGORIES:
+            self.assertIn(cat, engine.CATEGORY_LABELS)
+        self.assertEqual(engine.CATEGORIES,
+                         (engine.CAT_DIRECT, engine.CAT_RELAY, engine.CAT_CHAIN))
+
+    def test_expand_chains_leaves_a_relay_alone(self):
+        """A relay is already the hop a chain dials through.
+
+        Giving it a dialer-proxy would invent a topology this deployment does
+        not have, and because the ledger folds variants by fingerprint, the
+        variant's `chain` stamp would silently overwrite the `relay` one -- the
+        panel would then report the front pool as chain traffic.
+        """
+        relay = {"source": "cdn前置", "name": "F", "category": engine.CAT_RELAY,
+                 "proxy": self._proxy(**{"dialer-proxy": "g"})}
+        chain = {"source": "链式聚合", "name": "C", "category": engine.CAT_CHAIN,
+                 "proxy": self._proxy(**{"dialer-proxy": "g"})}
+        plain = {"source": "gammasub", "name": "D", "category": engine.CAT_DIRECT,
+                 "proxy": self._proxy()}
+
+        out, chained = engine.expand_chains([relay, chain, plain], ["PF0__", "PF1__"])
+        by_name = {}
+        for entry in out:
+            by_name.setdefault(entry["name"], []).append(entry)
+
+        self.assertEqual(len(by_name["F"]), 1, "the relay node was expanded")
+        self.assertEqual(by_name["F"][0]["category"], engine.CAT_RELAY)
+        self.assertEqual(len(by_name["C"]), 2, "the chain node should get one per front")
+        self.assertTrue(all(e["category"] == engine.CAT_CHAIN for e in by_name["C"]))
+        self.assertEqual(len(by_name["D"]), 1, "a direct node must pass through")
+        self.assertEqual(by_name["D"][0]["category"], engine.CAT_DIRECT)
+        self.assertEqual(chained, 1, "only the chain node should count as chained")
+
+    def test_expand_chains_keeps_each_variant_on_the_original_fingerprint(self):
+        """Variants must fold into one ledger row, or the node is over-counted."""
+        entry = {"source": "s", "name": "C", "category": engine.CAT_CHAIN,
+                 "fp": "fp-c", "proxy": self._proxy(**{"dialer-proxy": "g"})}
+        out, _ = engine.expand_chains([entry], ["PF0__", "PF1__", "PF2__"])
+        self.assertEqual(len(out), 3)
+        self.assertEqual({e["fp"] for e in out}, {"fp-c"})
+        self.assertEqual({e["category"] for e in out}, {engine.CAT_CHAIN})
+
+
+class ChainRoundTest(unittest.TestCase):
+    """End-to-end wiring for a whole round with chaining on.
+
+    The unit tests above cover each piece in isolation; this covers the joins --
+    the order of collect/classify/expand, `keep_dialer` actually reaching
+    `prepare`, and the front pool surviving the round's ledger hygiene. Those
+    joins are where a feature like this really breaks, and no unit test would
+    notice a `keep_dialer` that was computed and then never passed.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.old = (cfgmod.DATA, cfgmod.CORE_DIR, cfgmod.CORE_SECRET_PATH,
+                    engine.EXPORT_DIR, engine.db.DB_PATH, engine.db._conn)
+        cfgmod.DATA = self.tmp
+        cfgmod.CORE_DIR = self.tmp / "core"
+        # Bound at import time from DATA, so patching DATA alone is not enough.
+        cfgmod.CORE_SECRET_PATH = self.tmp / "core.secret"
+        engine.db.DB_PATH, engine.db._conn = self.tmp / "s.db", None
+        engine.EXPORT_DIR = self.tmp / "exports"
+        engine.db.connect()
+
+    def tearDown(self):
+        if engine.db._conn is not None:
+            engine.db._conn.close()
+        (cfgmod.DATA, cfgmod.CORE_DIR, cfgmod.CORE_SECRET_PATH,
+         engine.EXPORT_DIR, engine.db.DB_PATH, engine.db._conn) = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    class _RoundCore:
+        """Fake kernel that answers for the front and for anything chained."""
+
+        def __init__(self, core_cfg, secret):
+            self.seen = []
+
+        def start_and_load(self, log=None):
+            return "started"
+
+        def delay(self, name, url, timeout_ms, expected):
+            self.seen.append(name)
+            return (30, None, "") if name.startswith(engine.FRONT_NAME_PREFIX) \
+                else (99, None, "")
+
+        def select(self, group, name):
+            pass
+
+        def egress(self, port, trace_url, timeout_s=15):
+            return {"loc": "US", "ip": "1.2.3.4"}, None
+
+    def _cfg(self):
+        return {
+            "substore": {"backend": "http://127.0.0.1:3000"},
+            "core": {"api": "http://127.0.0.1:19190", "lanes": 2, "base_port": 19300,
+                     "container": "mihomo-probe",
+                     # Read with a direct subscript by `build_config` and absent
+                     # from DEFAULTS -- this is the deployment-specific override
+                     # config.py's DEAD_KEYS comment warns about.
+                     "mixed_port": 19194,
+                     "container_config_path": "/root/.config/mihomo/config.yaml"},
+            "sources": [{"key": "air", "kind": "sub", "name": "air",
+                         "label": "air", "enabled": True}],
+            "chain": {"enabled": True, "max_fronts": 4,
+                      "front_source": {"kind": "sub", "name": "cm-xhttp"}},
+            "test": {"targets": ["http://probe/generate_204"], "expected_status": "204",
+                     "timeout_ms": 100, "timeout_ms_retry": 100, "max_attempts": 1,
+                     "retry_pause_s": 0, "concurrency": 2},
+            "dns": {"views": {}, "timeout_s": 1, "cache_hours": 0},
+            "verify": {"enabled": False, "entry_check": True,
+                       "exclude_entry_countries": ["CN"],
+                       "exclude_countries": ["CN"]},
+            "policy": {"drop_after_consecutive_fails": 3,
+                       "suspect_floor_ratio": 0.5, "suspect_floor_absolute": 3},
+            "schedule": {"interval_minutes": 30, "enabled": False},
+            "publish": {"enabled": True, "prefix": "probe", "add_region_tag": False},
+            "watchdog": {"round_timeout_minutes": 20},
+            "alert": {"enabled": False},
+        }
+
+    def _store(self):
+        node = {"name": "N", "type": "vless", "server": "t.example", "port": 443,
+                "uuid": "u", "dialer-proxy": "hk_b"}
+        front = _front_proxy("edgetunnel")
+
+        class _Store:
+            def __init__(self, backend):
+                pass
+
+            def fetch_source(self, kind, name, target="ClashMeta"):
+                return [dict(front)] if name == "cm-xhttp" else [dict(node)]
+
+            def fetch_sub_proxies(self, name, target="ClashMeta"):
+                return []
+
+            def delete(self, kind, name):
+                raise NotFound(name)
+
+        return _Store
+
+    def _run(self):
+        cfg = self._cfg()
+        store_cls = self._store()
+        core_cls = self._RoundCore
+        with unittest.mock.patch.object(engine, "Client", store_cls), \
+                unittest.mock.patch.object(coremod, "Core", core_cls), \
+                unittest.mock.patch.object(coremod, "config_test",
+                                           return_value=(True, "")), \
+                unittest.mock.patch.object(engine, "_resolve_candidates",
+                                           return_value=["1.2.3.4"]), \
+                unittest.mock.patch.object(engine, "lookup_countries",
+                                           return_value={"1.2.3.4": "US"}), \
+                unittest.mock.patch.object(notifier, "send", lambda *a, **k: None):
+            return engine._run_round(cfg, "test", None, _nolog)
+
+    def test_the_round_builds_the_chain_into_the_kernel_config(self):
+        self._run()
+        text = (cfgmod.CORE_DIR / "config.yaml").read_text(encoding="utf-8")
+        self.assertIn('"dialer-proxy": "__FRONT0__"', text)
+        self.assertIn('"name": "__FRONT0__"', text)
+        # The node's own address is what gets dialled -- through the front.
+        self.assertIn('"server": "1.2.3.4"', text)
+
+    def test_the_export_leaks_no_probe_internal_names(self):
+        """`__FRONT0__` is the probe's own reservation and must never ship.
+
+        This used to assert `dialer-proxy: hk_b` was kept, on the theory that
+        the upstream author's own group name should survive publishing. The
+        real kernel rejects that file: the live `air` collection downloads as
+        `proxies` with no `proxy-groups` at all, so `hk_b` (like the `cdn` this
+        deployment actually hits) names nothing a client can resolve --
+        `dialer-proxy [hk_b] not found`, whole file refused. Keeping the name
+        was preserving the one thing that made the export unusable.
+        """
+        self._run()
+        text = (engine.EXPORT_DIR / "air.yaml").read_text(encoding="utf-8")
+        self.assertNotIn(engine.FRONT_NAME_PREFIX, text)
+        doc = yaml.safe_load(text)
+        dialers = {p["dialer-proxy"] for p in doc["proxies"] if "dialer-proxy" in p}
+        self.assertEqual(dialers, {"cm-xhttp"})
+        # The rewritten name has to resolve: the group is emitted alongside it.
+        self.assertEqual([g["name"] for g in doc["proxy-groups"]], ["cm-xhttp"])
+
+    def test_the_front_gets_ledger_rows_and_no_export_of_its_own(self):
+        summary = self._run()
+        self.assertIsNotNone(engine.db.get_node(engine.FRONT_SOURCE_KEY, _front_fp()))
+        # Three, not two: a chained node is measured both ways by default --
+        # once per front (chain) and once with its dialer stripped (direct) --
+        # and the two variants deliberately carry different fingerprints, so
+        # they are two ledger rows rather than one overwriting the other.
+        self.assertEqual(summary["alive"], 3)      # front + chain variant + direct variant
+        self.assertFalse((engine.EXPORT_DIR / f"{engine.FRONT_SOURCE_KEY}.yaml").exists())
+
+    def test_a_dead_front_fails_the_chain_with_front_dead(self):
+        class _DeadFrontCore(self._RoundCore):
+            def delay(self, name, url, timeout_ms, expected):
+                self.seen.append(name)
+                return (None, "timeout", "Timeout") if name.startswith(engine.FRONT_NAME_PREFIX) \
+                    else (99, None, "")
+
+        cfg = self._cfg()
+        store_cls = self._store()
+        with unittest.mock.patch.object(engine, "Client", store_cls), \
+                unittest.mock.patch.object(coremod, "Core", _DeadFrontCore), \
+                unittest.mock.patch.object(coremod, "config_test",
+                                           return_value=(True, "")), \
+                unittest.mock.patch.object(engine, "_resolve_candidates",
+                                           return_value=["1.2.3.4"]), \
+                unittest.mock.patch.object(engine, "lookup_countries",
+                                           return_value={"1.2.3.4": "US"}), \
+                unittest.mock.patch.object(notifier, "send", lambda *a, **k: None):
+            engine._run_round(cfg, "test", None, _nolog)
+
+        # The chained variant specifically: its direct twin is alive (the dialer
+        # is stripped, so the dead front never enters its path) and would
+        # otherwise win the race in `next()` depending on ledger order.
+        node = next(n for n in engine.db.list_nodes(source="air")
+                    if n["category"] == engine.CAT_CHAIN)
+        self.assertEqual(node["last_reason"], engine.FRONT_DEAD_REASON)
+        self.assertEqual(node["consec_fail"], 1)
+
+    def test_an_empty_front_pool_fails_the_chain_and_still_alerts(self):
+        """The pool never arrived at all -- the shape no unit test covered.
+
+        The round logs 「这些节点本轮全部判失败」 when `collect_fronts` comes
+        back empty, and it used to do the opposite: `expand_chains` returned
+        early, `keep_dialer` was `[]`, `prepare` stripped the dialer, and the
+        chained node was measured as its own server. A node reachable only
+        through its front then read `timeout` instead of `front_dead` (so the
+        streak needed extra rounds to converge), and one that happened to be
+        reachable direct was published as alive on a path its owner never
+        uses. The alert never fired either, because it was keyed on
+        `bool(fronts)`.
+        """
+        holder = {}
+        alerts = []
+
+        class _NoPoolStore:
+            def __init__(self, backend):
+                pass
+
+            def fetch_source(self, kind, name, target="ClashMeta"):
+                if name == "cm-xhttp":
+                    return []
+                return [{"name": "N", "type": "vless", "server": "t.example",
+                         "port": 443, "uuid": "u", "dialer-proxy": "hk_b"}]
+
+            def fetch_sub_proxies(self, name, target="ClashMeta"):
+                return []
+
+            def delete(self, kind, name):
+                raise NotFound(name)
+
+        class _SpyCore(self._RoundCore):
+            def __init__(self, core_cfg, secret):
+                super().__init__(core_cfg, secret)
+                holder["core"] = self
+
+        with unittest.mock.patch.object(engine, "Client", _NoPoolStore), \
+                unittest.mock.patch.object(coremod, "Core", _SpyCore), \
+                unittest.mock.patch.object(coremod, "config_test",
+                                           return_value=(True, "")), \
+                unittest.mock.patch.object(engine, "_resolve_candidates",
+                                           return_value=["1.2.3.4"]), \
+                unittest.mock.patch.object(engine, "lookup_countries",
+                                           return_value={"1.2.3.4": "US"}), \
+                unittest.mock.patch.object(
+                    notifier, "send",
+                    lambda *a, **k: alerts.append((a, k))):
+            summary = engine._run_round(self._cfg(), "test", None, _nolog)
+
+        dialed = holder["core"].seen
+        # Exactly one dial: the direct twin. The chain-role orphan shares the
+        # kernel config with it but must never reach `delay`.
+        self.assertEqual(len(dialed), 1, f"链式孤儿被拨号了: {dialed}")
+        self.assertFalse(any(n.startswith(engine.FRONT_NAME_PREFIX) for n in dialed))
+
+        nodes = engine.db.list_nodes(source="air")
+        chain_node = next(n for n in nodes if n["category"] == engine.CAT_CHAIN)
+        self.assertEqual(chain_node["last_reason"], engine.FRONT_DEAD_REASON)
+        self.assertEqual(chain_node["consec_fail"], 1)
+        direct_node = next(n for n in nodes if n["category"] == engine.CAT_DIRECT)
+        self.assertIsNone(direct_node["last_reason"])
+        self.assertEqual(summary["alive"], 1)
+
+        fired = [a for a, _k in alerts if len(a) > 1 and a[1] == "front_dead"]
+        self.assertEqual(len(fired), 1, f"空前置池没有告警: {[a[1] for a, _ in alerts]}")
+        self.assertIn("前置池为空", fired[0][3])
+
+
+def _front_fp():
+    """Fingerprint of the fixture front, as `collect_fronts` computes it."""
+    return engine._orig_fp(_front_proxy("edgetunnel"))
 
 
 class ApplyAndPublishTest(unittest.TestCase):
@@ -1971,8 +4473,13 @@ class TimestampTest(unittest.TestCase):
             captured["text"] = text
             return True, "ok"
 
+        # This temp dir is created here rather than by `_isolation`, so nothing
+        # else will ever remove it. `addCleanup` is the right home for it: the
+        # patch below only lives for the `with` block, the directory does not.
+        _state_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, _state_dir, True)
         with mock.patch.object(notifier, "telegram_send", fake_send), \
-             mock.patch.object(notifier, "STATE_PATH", Path(tempfile.mkdtemp()) / "s.json"):
+             mock.patch.object(notifier, "STATE_PATH", _state_dir / "s.json"):
             notifier.send(cfg, "probe_key", "题目", "正文", level="warn")
         import time as _t
         utc_hm = _t.strftime("%m-%d %H:%M", _t.gmtime())
@@ -2163,6 +4670,447 @@ class StripEchTest(unittest.TestCase):
     def test_off_by_default(self):
         proxies, _m, _d = coremod.prepare([self.entry()])
         self.assertIn("ech-opts", proxies[0])
+
+
+class ReapOrphanRoundsTest(unittest.TestCase):
+    """A round cannot outlive the process that was running it.
+
+    `_abandon_round` only runs in-process, so `docker compose up -d --build`
+    -- the documented way to deploy, and a container restart in the middle of a
+    round -- left the ledger row open forever. The watchdog deadline is a
+    monotonic timer that dies with the process, and the scheduler only starts
+    rounds, never closes them. On vps that stranded round 172.
+    """
+
+    def setUp(self):
+        from mihomo_test import db as dbmod
+
+        self.db = dbmod
+        self.cfg = {"watchdog": {"round_timeout_minutes": 20}}
+        self.rounds = []
+        for age_min in (175, 25, 1):
+            round_id = dbmod.start_round("test")
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S",
+                                  time.gmtime(time.time() - age_min * 60))
+            dbmod.execute("UPDATE rounds SET started_at=? WHERE id=?",
+                          (stamp, round_id))
+            self.rounds.append(round_id)
+
+    def tearDown(self):
+        for round_id in self.rounds:
+            self.db.execute("DELETE FROM rounds WHERE id=?", (round_id,))
+
+    def open_ids(self):
+        return {row["id"] for row in self.db.open_rounds()}
+
+    def test_only_rounds_past_the_budget_are_closed(self):
+        old, past, fresh = self.rounds
+        closed = engine.reap_orphan_rounds(self.cfg, log=_nolog)
+        self.assertEqual(sorted(closed), sorted([old, past]))
+        still_open = self.open_ids()
+        self.assertIn(fresh, still_open)
+        self.assertNotIn(old, still_open)
+        self.assertNotIn(past, still_open)
+
+    def test_a_reaped_round_is_marked_so_the_panel_can_explain_it(self):
+        engine.reap_orphan_rounds(self.cfg, log=_nolog)
+        row = self.db.one("SELECT * FROM rounds WHERE id=?", (self.rounds[0],))
+        self.assertIsNotNone(row["finished_at"])
+        self.assertIn("orphaned", row["note"])
+
+    def test_a_second_pass_is_a_no_op(self):
+        engine.reap_orphan_rounds(self.cfg, log=_nolog)
+        self.assertEqual(engine.reap_orphan_rounds(self.cfg, log=_nolog), [])
+
+    def test_reaping_is_logged(self):
+        seen = []
+        engine.reap_orphan_rounds(self.cfg, log=lambda level, msg: seen.append((level, msg)))
+        self.assertTrue(any("残留轮次" in msg for _lvl, msg in seen), seen)
+
+    def test_a_healthy_recent_round_is_never_touched(self):
+        self.db.execute("DELETE FROM rounds WHERE id IN (?, ?)",
+                        (self.rounds[0], self.rounds[1]))
+        self.assertEqual(engine.reap_orphan_rounds(self.cfg, log=_nolog), [])
+        self.assertIn(self.rounds[2], self.open_ids())
+
+
+class _FakePushStore:
+    """Records upserts; can be told to fail on a given subscription name.
+
+    `existing` seeds `/api/subs` so the prune path has something to walk;
+    `deletes` records what it removed.
+    """
+
+    def __init__(self, fail_on=(), existing=()):
+        self.upserts = []
+        self.fail_on = tuple(fail_on)
+        self.existing = list(existing)
+        self.deletes = []
+
+    def upsert(self, kind, name, payload):
+        if name in self.fail_on:
+            raise StoreError("sub-store said no")
+        self.upserts.append((kind, name, payload))
+        return "updated"
+
+    def get_json(self, path):
+        if path == "/api/subs":
+            return list(self.existing)
+        return []
+
+    def _request(self, method, path, body=None):
+        self.deletes.append((method, path))
+        return {}
+
+    def names(self):
+        return [name for _kind, name, _payload in self.upserts]
+
+
+class PushExportsTest(unittest.TestCase):
+    """A disabled source is not published, so it must not be pushed.
+
+    `push_exports` was fed `[s["key"] for s in cfg["sources"]]`, which put the
+    sources the operator had just switched off into the push. They have no
+    export file (`cleanup_exports` deleted it), so the panel reported them as
+    "还没有输出文件，先跑一轮" -- a line that reads like a failure for something
+    deliberately turned off. Worse, in the window between disabling a source
+    and the next round's cleanup its stale YAML is still on disk, so the push
+    resurrected it in Sub-Store -- and `link_substore` never prunes `-local`
+    subs, so nothing would have undone that.
+
+    `link_substore` and `exports_summary` already filtered on `enabled`; the
+    push path was the one that did not.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old = engine.EXPORT_DIR
+        engine.EXPORT_DIR = self.tmp
+
+    def tearDown(self):
+        engine.EXPORT_DIR = self._old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def export(self, key, count=1):
+        (self.tmp / f"{key}.yaml").write_text(
+            "proxies:\n  - {name: n, type: vless, server: s, port: 1}\n", encoding="utf-8")
+        (self.tmp / f"{key}.meta.json").write_text(
+            json.dumps({"count": count}), encoding="utf-8")
+
+    def cfg(self, sources):
+        return {"sources": sources, "publish": {"prefix": "probe"}}
+
+    def push(self, cfg, store, keys=None):
+        keys = engine.publish_keys(cfg) if keys is None else keys
+        return engine.push_exports(cfg, store, keys, log=_nolog)
+
+    def test_publish_keys_keeps_only_enabled_sources_that_have_a_key(self):
+        cfg = self.cfg([
+            {"key": "air", "enabled": True},
+            {"key": "eps1", "enabled": False},
+            {"key": "", "enabled": True},
+            {"name": "no-key-field", "enabled": True},
+            {"key": "deltasub"},
+        ])
+        self.assertEqual(engine.publish_keys(cfg), ["air", "deltasub"])
+
+    def test_a_disabled_source_is_never_pushed_even_with_a_stale_export(self):
+        self.export("air")
+        self.export("eps1")
+        store = _FakePushStore()
+        cfg = self.cfg([{"key": "air", "enabled": True},
+                        {"key": "eps1", "enabled": False}])
+        self.push(cfg, store)
+        self.assertEqual(store.names(), ["probe-air-local"])
+
+    def test_disabled_sources_do_not_appear_in_the_report(self):
+        self.export("air")
+        store = _FakePushStore()
+        cfg = self.cfg([{"key": "air", "enabled": True},
+                        {"key": "eps1", "enabled": False}])
+        lines = engine.push_report(self.push(cfg, store))
+        self.assertEqual(len(lines), 1)
+        self.assertNotIn("eps1", " ".join(lines))
+
+    def test_missing_export_is_reported_once_and_writes_nothing(self):
+        store = _FakePushStore()
+        records = self.push(self.cfg([{"key": "fresh", "enabled": True}]), store)
+        self.assertEqual(store.upserts, [])
+        self.assertFalse(records[0]["ok"])
+        self.assertEqual(records[0]["level"], "warn")
+        self.assertIn("还没有输出文件", records[0]["text"])
+
+    def test_records_carry_the_count_and_the_subscription_name(self):
+        self.export("air", count=7)
+        store = _FakePushStore()
+        records = self.push(self.cfg([{"key": "air", "enabled": True}]), store)
+        self.assertTrue(records[0]["ok"])
+        self.assertEqual(records[0]["count"], 7)
+        self.assertEqual(records[0]["name"], "probe-air-local")
+
+    def test_a_store_failure_is_reported_at_error_level(self):
+        self.export("air")
+        store = _FakePushStore(fail_on=("probe-air-local",))
+        records = self.push(self.cfg([{"key": "air", "enabled": True}]), store)
+        self.assertFalse(records[0]["ok"])
+        self.assertEqual(records[0]["level"], "error")
+
+    def test_summary_counts_pushed_and_failed(self):
+        self.assertEqual(engine.push_summary([]), "没有已启用的来源，未推送任何内容")
+        ok = {"ok": True, "count": 1}
+        self.assertEqual(engine.push_summary([ok, ok]), "已推送 2 个订阅")
+        self.assertIn("1 个未推送", engine.push_summary([ok, {"ok": False}]))
+
+    def test_cli_report_keeps_the_original_one_line_per_key_text(self):
+        self.export("air", count=3)
+        store = _FakePushStore()
+        records = self.push(self.cfg([{"key": "air", "enabled": True}]), store)
+        self.assertEqual(engine.push_report(records),
+                         ["probe-air-local: updated (3 节点)"])
+
+
+class PruneLocalSubsTest(unittest.TestCase):
+    """A push only ever wrote; nothing ever removed a retired `-local` sub.
+
+    `push_exports` upserts the keys it is handed and stops there, so a source
+    that stops being published keeps its last `-local` subscription forever.
+    The content is embedded at push time, so that copy keeps serving the nodes
+    it had when it was retired -- and for a muted source the export file is
+    gone, so it resolves to zero nodes and Sub-Store answers HTTP 500 for it.
+    On the live box `probe-alphasub-local` sat in exactly that state.
+
+    Scope matters as much as the deletion: only `source == "local"` names under
+    our prefix are ours to remove. A `remote` sub of the same name belongs to
+    `link_substore`.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old = engine.EXPORT_DIR
+        engine.EXPORT_DIR = self.tmp
+
+    def tearDown(self):
+        engine.EXPORT_DIR = self._old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def export(self, key, count=3):
+        (self.tmp / f"{key}.yaml").write_text(
+            "proxies:\n  - {name: n, type: vless, server: s, port: 1}\n", encoding="utf-8")
+        (self.tmp / f"{key}.meta.json").write_text(
+            json.dumps({"count": count}), encoding="utf-8")
+
+    def run_push(self, keys, existing):
+        store = _FakePushStore(existing=existing)
+        for key in keys:
+            self.export(key)
+        return engine.push_exports({"publish": {"prefix": "probe"}}, store, keys), store
+
+    def test_a_retired_local_sub_is_removed(self):
+        records, store = self.run_push(
+            ["alive"],
+            existing=[{"name": "probe-alive-local", "source": "local"},
+                      {"name": "probe-retired-local", "source": "local"}])
+        self.assertIn(("DELETE", "/api/sub/probe-retired-local"), store.deletes)
+
+    def test_the_still_published_local_sub_is_kept(self):
+        _records, store = self.run_push(
+            ["alive"],
+            existing=[{"name": "probe-alive-local", "source": "local"}])
+        self.assertEqual(store.deletes, [])
+
+    def test_remote_subs_of_the_same_name_are_left_alone(self):
+        """`link_substore` owns those; deleting here would fight it."""
+        _records, store = self.run_push(
+            ["alive"],
+            existing=[{"name": "probe-retired-local", "source": "remote"}])
+        self.assertEqual(store.deletes, [])
+
+    def test_someone_elses_sub_is_left_alone(self):
+        _records, store = self.run_push(
+            ["alive"],
+            existing=[{"name": "other-retired-local", "source": "local"},
+                      {"name": "probe-retired", "source": "local"}])
+        self.assertEqual(store.deletes, [])
+
+    def test_a_non_local_name_under_our_prefix_is_left_alone(self):
+        """Only the `-local` shape is ours to prune."""
+        _records, store = self.run_push(
+            ["alive"],
+            existing=[{"name": "probe-retired", "source": "local"}])
+        self.assertEqual(store.deletes, [])
+
+    def test_the_removal_is_reported(self):
+        records, _store = self.run_push(
+            ["alive"],
+            existing=[{"name": "probe-retired-local", "source": "local"}])
+        texts = engine.push_report(records)
+        self.assertTrue(any("probe-retired-local" in t and "已移除" in t for t in texts),
+                        f"removal not reported: {texts}")
+
+    def test_a_removal_failure_is_reported_at_error_level(self):
+        store = _FakePushStore(
+            existing=[{"name": "probe-retired-local", "source": "local"}])
+        store._request = lambda *a, **k: (_ for _ in ()).throw(StoreError("nope"))
+        self.export("alive")
+        records = engine.push_exports({"publish": {"prefix": "probe"}}, store, ["alive"])
+        bad = [r for r in records if "移除失败" in r["text"]]
+        self.assertEqual(len(bad), 1)
+        self.assertEqual(bad[0]["level"], "error")
+
+    def test_an_unreachable_store_does_not_break_the_push(self):
+        """The prune is housekeeping; it must not fail the push that preceded it."""
+        def boom(_path):
+            raise StoreError("sub-store unreachable")
+
+        store = _FakePushStore()
+        store.get_json = boom
+        self.export("alive")
+        records = engine.push_exports({"publish": {"prefix": "probe"}}, store, ["alive"])
+        self.assertTrue(records[0]["ok"])
+
+    def test_a_single_source_round_keeps_the_other_sources_subscriptions(self):
+        """`--source air` hands `push_exports` one key; the prune must not care.
+
+        `keep` was built from the keys of *this* push, so a round scoped to one
+        source -- `POST /api/run {"source": ...}`, or `--source` on the CLI --
+        deleted every other source's `-local` subscription. An unrelated source
+        lost its published list because the operator tested one of them. The
+        keys that may still exist come from `publish_keys(cfg)`, which is also
+        what keeps retired sources deletable.
+        """
+        existing = [{"name": "probe-air-local", "source": "local"},
+                    {"name": "probe-other-local", "source": "local"}]
+        self.export("air")
+        store = _FakePushStore(existing=existing)
+        cfg = {"publish": {"prefix": "probe"},
+               "sources": [{"key": "air", "enabled": True},
+                           {"key": "other", "enabled": True}]}
+        engine.push_exports(cfg, store, ["air"])
+        self.assertEqual(store.deletes, [],
+                         f"单来源轮次删掉了别人的订阅: {store.deletes}")
+
+        # A source that genuinely left the config is still removed: absence
+        # from `publish_keys` is the retirement signal, not absence from `keys`.
+        store = _FakePushStore(existing=existing)
+        cfg["sources"][1]["enabled"] = False
+        engine.push_exports(cfg, store, ["air"])
+        self.assertEqual(store.deletes, [("DELETE", "/api/sub/probe-other-local")])
+
+
+class PushEndpointTest(unittest.TestCase):
+    """The defect was at the call site, so the endpoint itself is exercised.
+
+    `engine.push_exports` was always correct; what fed it was not. A unit test
+    on `publish_keys` alone would have stayed green through the whole bug, so
+    this drives the real handler over a socket.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._old_dir = engine.EXPORT_DIR
+        engine.EXPORT_DIR = self.tmp
+        self._old_cfg = server._State.cfg
+        self.store = _FakePushStore()
+        for key, count in (("air", 5), ("eps1", 9)):
+            (self.tmp / f"{key}.yaml").write_text("proxies: []\n", encoding="utf-8")
+            (self.tmp / f"{key}.meta.json").write_text(
+                json.dumps({"count": count}), encoding="utf-8")
+
+    def tearDown(self):
+        engine.EXPORT_DIR = self._old_dir
+        server._State.cfg = self._old_cfg
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def post_push(self, cfg):
+        # `cfg["substore"]["backend"]` is still evaluated as the argument, so
+        # the stub has to be a real key even though Client itself is patched.
+        cfg.setdefault("substore", {"backend": "http://stub"})
+        with unittest.mock.patch.object(server, "Client", lambda *a, **k: self.store):
+            httpd = server.serve(cfg, "127.0.0.1", 0)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = httpd.server_address[1]
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/push", data=b"{}",
+                    headers={"Content-Type": "application/json",
+                             "X-Auth-Token": "tok"})
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_endpoint_pushes_enabled_sources_and_skips_disabled_ones(self):
+        cfg = {
+            "auth": {"token": "tok"},
+            "publish": {"prefix": "probe"},
+            "sources": [{"key": "air", "enabled": True},
+                        {"key": "eps1", "enabled": False}],
+        }
+        payload = self.post_push(cfg)
+        self.assertEqual(self.store.names(), ["probe-air-local"])
+        self.assertEqual(payload["message"], "已推送 1 个订阅")
+        self.assertEqual([r["key"] for r in payload["detail"]], ["air"])
+        self.assertNotIn("还没有输出文件", json.dumps(payload, ensure_ascii=False))
+
+    def test_endpoint_returns_a_summary_plus_records_not_one_long_sentence(self):
+        cfg = {
+            "auth": {"token": "tok"},
+            "publish": {"prefix": "probe"},
+            "sources": [{"key": "air", "enabled": True}],
+        }
+        payload = self.post_push(cfg)
+        self.assertEqual(payload["message"], "已推送 1 个订阅")
+        self.assertEqual(payload["detail"][0]["text"], "probe-air-local: updated (5 节点)")
+        self.assertTrue(payload["detail"][0]["ok"])
+
+
+
+
+class RegionTagIdempotenceTest(unittest.TestCase):
+    """Re-tagging must collapse *every* tag we may have added, not just one.
+
+    The old pattern matched a single `[XX]` and required the name to start with
+    `[`. A name that had already been through the flag operator (`flag [HK] Foo`)
+    therefore did not match, so the tag was appended instead of replaced. In a
+    source that feeds itself that leaks one tag per round -- the live `air`
+    collection reached `[HK] flag [HK]  [HK]  HK-Kwu...` after three passes.
+    """
+
+    def _strip(self, name):
+        return engine._LEADING_TAG.sub("", name)
+
+    def test_a_single_tag_is_removed(self):
+        self.assertEqual(self._strip("[HK] Foo"), "Foo")
+
+    def test_every_repeated_tag_is_removed(self):
+        self.assertEqual(self._strip("[HK] [HK] [HK] Foo"), "Foo")
+
+    def test_a_flag_between_tags_does_not_stop_the_strip(self):
+        self.assertEqual(self._strip("🇭🇰 [HK]  [HK]  Foo"), "Foo")
+
+    def test_the_live_air_shape_collapses(self):
+        """The exact name three round-trips through air produced."""
+        self.assertEqual(
+            self._strip("[HK] 🇭🇰 [HK]  [HK]  HK-Kwu Tung-h-6491845-wjhg"),
+            "HK-Kwu Tung-h-6491845-wjhg")
+
+    def test_stripping_is_idempotent(self):
+        name = "🇭🇰 [HK]  [HK]  Foo"
+        once = self._strip(name)
+        self.assertEqual(self._strip(once), once)
+
+    def test_a_hyphenated_region_tag_is_removed(self):
+        self.assertEqual(self._strip("[US-CA] Foo"), "Foo")
+
+    def test_a_tag_inside_the_name_is_left_alone(self):
+        """Only the leading run is ours; the rest belongs to upstream."""
+        self.assertEqual(self._strip("Foo [HK] Bar"), "Foo [HK] Bar")
+
+    def test_a_name_without_any_tag_is_untouched(self):
+        self.assertEqual(self._strip("HK-Kwu Tung-h-6491845-wjhg"),
+                         "HK-Kwu Tung-h-6491845-wjhg")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

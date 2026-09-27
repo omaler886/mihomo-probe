@@ -9,12 +9,14 @@ HTTP 504 {"message": "Timeout"} for a genuine timeout; collapsing both into
 "HTTP Error 503" is what made the previous pipeline's dead list unreadable.
 """
 import json
+import re
 import shutil
 import subprocess
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 from . import config as cfgmod
 
@@ -50,6 +52,25 @@ def fingerprint_proxy(proxy):
         material[key] = value
     blob = json.dumps(material, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def variant_fingerprint(fp, variant):
+    """A stable 16-hex identity for one *measurement* of a node.
+
+    `fingerprint_proxy` deliberately ignores `dialer-proxy` (it is in
+    DROP_FIELDS), which is what folds a node's per-front variants into one
+    ledger row -- "any front carried it" is the verdict, so they must share an
+    identity. The same property means a node measured both chained and direct
+    would collapse too, and the two results would overwrite each other instead
+    of being reported side by side.
+
+    So the second measurement gets a derived identity rather than a decorated
+    string: the ledger asserts a fingerprint is exactly 16 hex chars, and
+    `tests/test_live.py` detects the old name-keyed scheme by that length.
+    """
+    import hashlib
+
+    return hashlib.sha256(f"{fp}#{variant}".encode("utf-8")).hexdigest()[:16]
 
 
 class CoreError(RuntimeError):
@@ -99,16 +120,31 @@ def _reason_from(status, body):
     return f"http_{status}", message
 
 
-def prepare(entries, strip_ech=False):
+def prepare(entries, strip_ech=False, keep_dialer=None):
     """Return config-ready proxies plus a mapping back to source entries.
 
     Names are made unique because mihomo keys proxies by name and silently
     collapses duplicates; the previous pipeline hit this with two BageVM nodes.
+
+    `keep_dialer` names the proxies that exist in this config and may therefore
+    serve as a dialer. `dialer-proxy` is otherwise stripped, because a value
+    the kernel cannot resolve is a config error rather than a test result --
+    but a chained node must keep it, or the round tests it direct and reports a
+    node as alive on a path its owner never uses.
     """
+    keep_dialer = set(keep_dialer or ())
     proxies, mapping, dropped = [], [], []
     seen = {}
     for entry in entries:
-        proxy = {k: v for k, v in entry["proxy"].items() if k not in DROP_FIELDS}
+        proxy = {}
+        for key, value in entry["proxy"].items():
+            if key == "dialer-proxy":
+                # Kept only when the named dialer is really in this config.
+                if value in keep_dialer:
+                    proxy[key] = value
+                continue
+            if key not in DROP_FIELDS:
+                proxy[key] = value
         if strip_ech:
             proxy.pop("ech-opts", None)
         missing = [f for f in REQUIRED if proxy.get(f) in (None, "")]
@@ -135,32 +171,65 @@ def prepare(entries, strip_ech=False):
         # Per-address variants carry the ORIGINAL node's fingerprint: the
         # ledger and the export speak the domain form -- only this round's
         # kernel config is expanded to addresses.
-        fp = entry.get("fp") or fingerprint_proxy(proxy)
+        #
+        # The fallback must be computed from the *untransformed* proxy, exactly
+        # like `engine._orig_fp`. Deriving it from `proxy` here would use the
+        # version this function already stripped (`DROP_FIELDS`, optionally
+        # `ech-opts`) and int-coerced (`port`), which is a different hash -- and
+        # a different ledger identity -- for the same node.
+        #
+        # `orig_proxy` first: an entry expanded to per-address variants carries
+        # the IP in `proxy` and the domain form in `orig_proxy`, so hashing
+        # `proxy` there would key the ledger on the address instead of the node.
+        fp = entry.get("fp") or fingerprint_proxy(
+            {k: v for k, v in (entry.get("orig_proxy") or entry["proxy"]).items()
+             if k not in DROP_FIELDS})
         mapping.append(
             {
                 "source": entry["source"],
                 "original": entry["name"],
                 "mihomo": name,
                 "index": entry["index"],
-                "orig_proxy": entry.get("orig_proxy") or dict(proxy),
+                # Likewise the export form: `entry["proxy"]` untouched, not the
+                # stripped copy. Falling back to `proxy` silently dropped
+                # `dialer-proxy` from chained nodes.
+                "orig_proxy": entry.get("orig_proxy") or dict(entry["proxy"]),
                 "test_ip": entry.get("test_ip"),
                 "fp": fp,
                 "proto": proxy.get("type"),
                 "server": proxy.get("server"),
+                # Opaque passthroughs for the round: `role` distinguishes a
+                # front from a chained variant, `front` names the dialer a
+                # chained variant was built for. Kept here rather than
+                # re-derived downstream so a single `make_testable` call stays
+                # the only thing that decides what the kernel sees.
+                "role": entry.get("role"),
+                "front": entry.get("front"),
+                # Direct / relay / chain, decided in `engine.collect_entries`
+                # while the source's `relay` flag was still in hand. It travels
+                # with the entry so that every later stage -- the phase split,
+                # the ledger write, the per-category statistics -- reads one
+                # field instead of re-deriving the rule and drifting from it.
+                "category": entry.get("category"),
             }
         )
     return proxies, mapping, dropped
 
 
-def build_config(proxies, core_cfg, secret):
+def build_config(proxies, core_cfg, secret, out_dir=None):
     """Write the mihomo config; return the path.
 
     Everything binds to loopback. The probe container runs with host
     networking (required for IPv6), so a 0.0.0.0 listener here would put the
     kernel's API and its proxy port on the public internet.
+
+    `out_dir` lets a second kernel (ipmap) own its own config file instead of
+    sharing `core/config.yaml` with the round kernel -- writing the same file
+    is how one feature would clobber another's loaded config mid-round.
     """
-    cfgmod.CORE_DIR.mkdir(parents=True, exist_ok=True)
-    path = cfgmod.CORE_DIR / "config.yaml"
+    out_dir = Path(out_dir) if out_dir else cfgmod.CORE_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "config.yaml"
     names = [p["name"] for p in proxies]
     api_port = parse_port(core_cfg.get("api"), 19190)
     lines = [
@@ -253,29 +322,54 @@ def lane_ports(core_cfg, count=None):
     return [base + i for i in range(count)]
 
 
+_docker_cli_cache = {"at": 0.0, "path": None}
+# Short, not permanent: a daemon that comes back should be picked up within a
+# round, while a single round still avoids re-probing once per node.
+_DOCKER_PROBE_TTL = 60.0
+
+
 def docker_cli():
     """Path to a usable docker CLI, or None. The CLI talks to the host daemon
-    through a mounted socket, so the app can steer its own kernel container."""
+    through a mounted socket, so the app can steer its own kernel container.
+
+    Memoised for `_DOCKER_PROBE_TTL` seconds: `make_testable` calls
+    `config_test` up to six times per round and each call used to spawn its own
+    `docker version` probe, so a round paid for the same answer repeatedly.
+
+    A hung daemon raises `subprocess.TimeoutExpired`, which is a
+    `SubprocessError` but was not caught here -- it escaped all the way to
+    `run_round`, abandoning the round with a bare "TimeoutExpired" in the log
+    and nothing to say the docker socket was the problem.
+    """
+    now = time.monotonic()
+    if now - _docker_cli_cache["at"] < _DOCKER_PROBE_TTL:
+        return _docker_cli_cache["path"]
     which = shutil.which("docker")
-    if not which:
-        return None
-    probe = subprocess.run([which, "version", "--format", "{{.Server.Version}}"],
-                           capture_output=True, text=True, timeout=20)
-    return which if probe.returncode == 0 else None
+    path = None
+    if which:
+        try:
+            probe = subprocess.run([which, "version", "--format", "{{.Server.Version}}"],
+                                   capture_output=True, text=True, timeout=20)
+            path = which if probe.returncode == 0 else None
+        except subprocess.SubprocessError:
+            path = None
+    _docker_cli_cache.update({"at": now, "path": path})
+    return path
 
 
-def config_test(core_cfg):
+def config_test(core_cfg, host_dir=None):
     """Validate the config with the kernel itself; return (ok, error_text).
 
     The volume path must be the HOST path: this `docker run` is executed by the
     host daemon, which cannot see paths that only exist inside this container.
+    `host_dir` pairs with `build_config(out_dir=...)` for a second kernel.
     """
     cli = docker_cli()
     if cli is None:
         # No usable daemon: skip the check rather than fail the round. The
         # kernel still rejects a bad config at load time, just less precisely.
         return True, "docker unavailable; config validation skipped"
-    host_core = cfgmod.HOST_ROOT / "core"
+    host_core = Path(host_dir) if host_dir else cfgmod.HOST_ROOT / "core"
     cmd = [
         cli, "run", "--rm",
         "-v", f"{host_core}:/root/.config/mihomo",
@@ -290,22 +384,38 @@ def config_test(core_cfg):
     return proc.returncode == 0, output.strip()
 
 
-def make_testable(entries, core_cfg, secret, max_prune=5, log=None, strip_ech=False):
+def make_testable(entries, core_cfg, secret, max_prune=5, log=None, strip_ech=False,
+                  keep_dialer=None, core_dir=None, host_dir=None):
     """Build a config the kernel accepts, pruning offending nodes if needed.
 
     Returns (proxies, mapping, dropped). A single malformed node would
     otherwise fail the whole round, which is how one bad upstream entry used
     to take down every source at once.
+
+    `core_dir`/`host_dir` route the generated config and the `-t` bind-mount
+    at a second kernel's own directory (ipmap); None keeps the round kernel's.
+
+    Removal is by entry identity, not by name: `prepare()` renames duplicates
+    (`BageVM #2`) while `working` still holds the upstream names, so matching on
+    the name the kernel reported removed nothing, the loop burned all its
+    attempts, and it raised "could not produce a config the kernel accepts" --
+    losing the whole round over one bad node, which is precisely what this
+    function exists to prevent.
+
+    `keep_dialer` is forwarded to `prepare()`; see it for why a chained node's
+    `dialer-proxy` has to survive into the kernel config.
     """
     dropped = []
     working = list(entries)
     for attempt in range(max_prune + 1):
-        proxies, mapping, invalid = prepare(working, strip_ech=strip_ech)
+        proxies, mapping, invalid = prepare(working, strip_ech=strip_ech,
+                                            keep_dialer=keep_dialer)
         dropped.extend(invalid)
         if invalid:
-            working = [e for e in working if e.get("name") not in {d["name"] for d in invalid}]
-        build_config(proxies, core_cfg, secret)
-        ok, output = config_test(core_cfg)
+            bad = {d["name"] for d in invalid}
+            working = [e for e in working if e.get("name") not in bad]
+        build_config(proxies, core_cfg, secret, out_dir=core_dir)
+        ok, output = config_test(core_cfg, host_dir=host_dir)
         if ok:
             return proxies, mapping, dropped
         culprit = _culprit_from(output, proxies)
@@ -313,22 +423,44 @@ def make_testable(entries, core_cfg, secret, max_prune=5, log=None, strip_ech=Fa
             log("warn", f"config test failed (attempt {attempt + 1}): {output.splitlines()[-1][:200]}")
         if culprit is None:
             raise CoreError(f"mihomo rejected the config: {output.strip()[-400:]}")
-        dropped.append({"name": culprit, "why": "kernel config error"})
-        working = [e for e in working if e.get("name") != culprit]
+        dropped.append({"name": culprit["name"], "why": "kernel config error"})
+        # Map the kernel-facing proxy back to the entry that produced it, then
+        # drop every entry sharing that entry's index.
+        victim = mapping[proxies.index(culprit)]
+        working = [e for e in working if e.get("index") != victim["index"]]
+        if not working:
+            break
     raise CoreError("could not produce a config the kernel accepts")
 
 
 def _culprit_from(output, proxies):
-    """Find which proxy the kernel's error text points at."""
-    for line in output.splitlines():
+    """Return the proxy dict the kernel's error text points at, or None.
+
+    Returns the object rather than its name so the caller can map it back to
+    the originating entry through `mapping` (see `make_testable`).
+
+    Matching is deliberately conservative. The old `proxy["name"] in line` test
+    matched any short name against almost any line of kernel output -- a node
+    called "jp" matched everything -- and whatever it picked was then dropped
+    from the round. Prefer a quoted-name match, then a bounded token match on
+    names long enough to be meaningful, and only then the server address.
+    """
+    lines = output.splitlines()
+    for line in lines:
         for proxy in proxies:
-            if proxy["name"] and proxy["name"] in line:
-                return proxy["name"]
+            name = proxy.get("name")
+            if name and f'"{name}"' in line:
+                return proxy
+    for line in lines:
+        for proxy in proxies:
+            name = str(proxy.get("name") or "")
+            if len(name) >= 4 and re.search(r"(?<![\w-])" + re.escape(name) + r"(?![\w-])", line):
+                return proxy
     lowered = output.lower()
     for proxy in proxies:
         server = str(proxy.get("server") or "")
-        if server and server.lower() in lowered:
-            return proxy["name"]
+        if len(server) >= 4 and server.lower() in lowered:
+            return proxy
     return None
 
 
@@ -345,8 +477,16 @@ class Core:
         if cli is None:
             return subprocess.CompletedProcess(["docker"], 1, "",
                                                "docker CLI/daemon unavailable")
-        return subprocess.run([cli, *args], capture_output=True, text=True,
-                              timeout=timeout)
+        try:
+            return subprocess.run([cli, *args], capture_output=True, text=True,
+                                  timeout=timeout)
+        except subprocess.SubprocessError as exc:
+            # Returned as a failed CompletedProcess rather than raised: every
+            # caller already handles a non-zero return code, and a hung daemon
+            # should degrade the feature (no restart, no config check) instead
+            # of aborting the whole round.
+            return subprocess.CompletedProcess(
+                ["docker", *args], 1, "", f"docker command failed: {exc}")
 
     def up(self, recreate=False):
         """Start the kernel; recreate=True restarts it so it re-reads config.yaml.
@@ -365,9 +505,6 @@ class Core:
         if running.stdout.strip() != "true":
             return self._docker("start", self.cfg["container"])
         return running
-
-    def stop(self):
-        return self._docker("stop", self.cfg["container"])
 
     def logs(self, tail=60):
         proc = self._docker("logs", "--tail", str(tail), self.cfg["container"])

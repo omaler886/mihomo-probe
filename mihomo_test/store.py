@@ -187,16 +187,12 @@ class Client:
     def _exists(self, kind, name):
         return (self.sub(name) if kind == "sub" else self.collection(name)) is not None
 
-    def preview(self, kind, resource):
-        """Run a resource through Sub-Store's processors; return data."""
-        return self.get_json_post(f"/api/preview/{kind}", resource)
+    def delete(self, kind, name):
+        """Remove a sub/collection. Raises `NotFound` when it was not there.
 
-    def get_json_post(self, path, payload):
-        status, text = self._request("POST", path, payload)
-        try:
-            body = json.loads(text)
-        except ValueError:
-            raise StoreError(f"non-JSON response from {path}: {text[:160]}") from None
-        if body.get("status") != "success":
-            raise StoreError(f"Sub-Store rejected {path}: {str(body)[:200]}")
-        return body.get("data")
+        `NotFound` rather than a silent success on purpose: a caller cleaning up
+        something it believes it created needs to be able to tell "removed" from
+        "was never there", and the 500-that-means-404 shape this API uses is
+        exactly what the class at the top of this module normalises.
+        """
+        self._request("DELETE", f"/api/{kind}/{urllib.parse.quote(name, safe='')}")

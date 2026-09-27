@@ -17,6 +17,19 @@ from mihomo_test import config as cfgmod
 from mihomo_test import core as coremod
 from mihomo_test import engine, notifier
 
+try:
+    import _isolation
+except ImportError:  # imported as a package
+    from tests import _isolation
+
+
+def setUpModule():
+    _isolation.isolate()
+
+
+def tearDownModule():
+    _isolation.restore()
+
 
 class NotifierTest(unittest.TestCase):
     """Alerts must actually arrive, and must not repeat inside the cooldown."""
@@ -196,19 +209,33 @@ class StaleExportTest(unittest.TestCase):
 
 
 class SelfReferenceConfigTest(unittest.TestCase):
-    def test_rejects_a_source_named_like_the_output_collection(self):
+    def test_rejects_an_enabled_source_named_like_the_output_collection(self):
         with self.assertRaises(ValueError):
             cfgmod.reject_self_reference(
-                [{"key": "probe", "kind": "collection", "name": "probe"}], "probe")
+                [{"key": "probe", "kind": "collection", "name": "probe",
+                  "enabled": True}], "probe")
+
+    def test_a_disabled_entry_is_allowed(self):
+        """只有「启用」它才构成自我循环。
+
+        原来不管 enabled 一律拒绝，后果是死锁：配置里留着一条未勾选的
+        `collection/<prefix>` 时，**任何**保存都会失败 —— 连错误提示里说的
+        「请在面板里取消勾选它」都做不到（它本来就是没勾的）。未启用的条目是
+        惰性的，`engine.export_keys` 和轮次都只走 enabled 来源。
+        """
+        cfgmod.reject_self_reference(
+            [{"key": "probe", "kind": "collection", "name": "probe",
+              "enabled": False}], "probe")
 
     def test_allows_other_names_and_kinds(self):
         cfgmod.reject_self_reference(
-            [{"key": "air", "kind": "collection", "name": "air"},
-             {"key": "probe", "kind": "sub", "name": "probe"}], "probe")
+            [{"key": "air", "kind": "collection", "name": "air", "enabled": True},
+             {"key": "probe", "kind": "sub", "name": "probe", "enabled": True}], "probe")
 
     def test_blank_prefix_disables_the_check(self):
         cfgmod.reject_self_reference(
-            [{"key": "probe", "kind": "collection", "name": "probe"}], "")
+            [{"key": "probe", "kind": "collection", "name": "probe",
+              "enabled": True}], "")
 
     def test_update_surfaces_the_error(self):
         tmp = Path(tempfile.mkdtemp())

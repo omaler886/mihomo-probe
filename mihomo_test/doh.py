@@ -72,8 +72,6 @@ def _skip_name(data, offset):
 
 def parse_ips(data):
     """Return the A/AAAA addresses in the answer section, in order."""
-    import ipaddress as _ip
-
     ips = []
     if len(data) < 12:
         return ips
@@ -93,9 +91,9 @@ def parse_ips(data):
         offset += rdlength
         try:
             if rtype == TYPE_A and rdlength == 4:
-                ips.append(str(_ip.IPv4Address(rdata)))
+                ips.append(str(ipaddress.IPv4Address(rdata)))
             elif rtype == TYPE_AAAA and rdlength == 16:
-                ips.append(str(_ip.IPv6Address(rdata)))
+                ips.append(str(ipaddress.IPv6Address(rdata)))
         except ValueError:
             continue
     return ips

@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>节点测活中心</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M18 5 9 18h5l-1 9 9-13h-5z' fill='white'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+<script src="theme.js"></script>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span class="logo" aria-hidden="true">⚡</span>
+    <h1 id="app-title">节点测活中心</h1>
+  </div>
+  <div class="pills">
+    <span class="pill" id="p-round">—</span>
+    <span class="pill" id="p-sched">—</span>
+    <span class="pill" id="p-busy"></span>
+  </div>
+  <span class="spacer"></span>
+  <div class="actions">
+    <button class="primary" id="btn-run-direct" title="忽略每个来源的「直连/链式」开关：全部来源按直连测（剥掉 dialer-proxy，当作节点自己的服务器），前置池本轮不测">直连测活</button>
+    <button id="btn-run-chain" title="按每个来源的「直连/链式」开关测（链式关掉的来源按直连测）。链式未配置时会被拒绝。前置全死直接判 front_dead">链式测活</button>
+    <button id="btn-push">推送 Sub-Store</button>
+    <button id="btn-settings">设置</button>
+    <button class="icon" id="btn-theme" title="切换主题（跟随系统 / 浅色 / 深色）" aria-label="切换主题">◐</button>
+  </div>
+</header>
+<div class="progress hide" id="progress" aria-hidden="true"><i></i></div>
+
+<main>
+  <div id="notice" class="panel hide">
+    <h2><span id="notice-title">结果</span><span class="row"><button id="notice-action" class="hide"></button><button id="btn-notice-close">关闭</button></span></h2>
+    <div class="notice-body">
+      <div id="notice-msg" class="notice-msg"></div>
+      <div id="notice-list" class="notice-list"></div>
+    </div>
+  </div>
+
+  <div id="suspect" class="panel hide"><h2 style="color:var(--warn)">⚠️ 护栏提示</h2><div class="urlbox"><span id="suspect-text"></span></div></div>
+
+  <div id="gate" class="gate hide">
+    <div class="box">
+      <h2>需要访问令牌</h2>
+      <p>这个面板是纯静态前端，令牌不再随页面下发。粘贴一次即可，会记在这台浏览器里。</p>
+      <input id="gate-token" type="password" placeholder="访问令牌（config.json → auth.token）" autocomplete="off">
+      <div class="row">
+        <button class="primary" id="gate-enter">进入面板</button>
+        <button id="gate-clear">清除已存令牌</button>
+      </div>
+      <div class="err" id="gate-err"></div>
+    </div>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="panel" id="sources-panel">
+    <h2>数据源
+      <span class="row">
+        <button class="primary" id="btn-src-save">保存并应用</button>
+        <button id="btn-link">同步 Sub-Store 联动</button>
+        <button id="btn-refresh-src">刷新列表</button>
+      </span>
+    </h2>
+    <div class="srcbar">
+      <input id="src-search" placeholder="搜索名称…">
+      <select id="src-kind"><option value="">全部类型</option><option value="collection">组合订阅</option><option value="sub">单条订阅</option><option value="remote">远程订阅</option><option value="local">本地订阅</option></select>
+      <label class="inline"><input type="checkbox" id="src-onlyon"> 只看已启用</label>
+      <button id="btn-manual">＋ 手动添加</button>
+    </div>
+    <div id="src-manual" class="grid2 hide">
+      <label>类型<select id="m-kind"><option value="collection">组合订阅</option><option value="sub">单条订阅</option></select></label>
+      <label>Sub-Store 里的名称<input id="m-name" placeholder="例如 air"></label>
+      <label>标识 key（决定导出文件名与 URL）<input id="m-key" placeholder="留空按名称自动生成"></label>
+      <label>显示名<input id="m-label" placeholder="留空同名称"></label>
+      <div class="row" style="grid-column:1/-1">
+        <button class="primary" id="btn-manual-add">添加</button>
+        <button id="btn-manual-cancel">取消</button>
+        <span id="m-err" class="detail"></span>
+      </div>
+    </div>
+    <div class="scroll" style="max-height:340px"><table id="src-table">
+      <thead><tr><th style="width:72px"><label class="thall"><input type="checkbox" data-all="enabled" title="全选 / 全不选本列（只作用于当前列表里的行）"><span title="勾上即启用该来源：下一轮测活会拉取它。取消即停用。">启用</span></label></th><th style="width:72px"><label class="thall"><input type="checkbox" data-all="export" title="全选 / 全不选本列（只作用于当前列表里的行）"><span title="取消勾选后仍会测活，但不产出订阅文件。">导出</span></label></th><th style="width:72px"><label class="thall"><input type="checkbox" data-all="relay" title="全选 / 全不选本列（只作用于当前列表里的行）"><span title="把这些节点计入「中转节点」分类统计；只影响统计口径，不影响测活与导出。">中转</span></label></th><th style="width:72px"><label class="thall"><input type="checkbox" data-all="direct" title="全选 / 全不选本列（只作用于当前列表里的行）"><span title="按直连测：剥掉 dialer-proxy，把节点当作它自己的服务器。不带 dialer-proxy 的节点两种方式等价，只测一次。">直连</span></label></th><th style="width:72px"><label class="thall"><input type="checkbox" data-all="chain" title="全选 / 全不选本列（只作用于当前列表里的行）"><span title="按链式测：带 dialer-proxy 的节点经前置池测，每个前置一条变体。与「直连」互相独立，两个都开就两种都测。">链式</span></label></th><th>名称</th><th style="width:88px">类型</th><th>成员/来源</th><th style="width:150px">key</th><th style="width:130px">操作</th></tr></thead>
+      <tbody></tbody></table></div>
+    <div class="urlbox"><span id="src-summary" class="detail"></span></div>
+    <div class="urlbox"><span class="tiny">勾选「中转」把该来源的节点计入<b>中转节点</b>分类统计。它只影响分类口径，不改变测活方式，也不影响导出内容。</span></div>
+  </div>
+
+  <div class="panel">
+    <h2>订阅输出 <span class="pill">Sub-Store 直接拉这个链接</span></h2>
+    <div id="urls"></div>
+  </div>
+
+  <div class="panel" id="cat-panel">
+    <h2>分类统计
+      <span class="row">
+        <span class="pill" id="cat-round">—</span>
+        <button id="btn-cat-refresh">刷新</button>
+      </span>
+    </h2>
+    <div class="catgrid" id="cat-cards"></div>
+    <div class="urlbox"><span id="cat-note" class="detail"></span></div>
+  </div>
+
+  <div class="panel">
+    <h2>节点状态 <span class="pill" id="node-count">—</span>
+      <span class="row">
+        <select id="node-cat" title="按测活方式筛选">
+          <option value="">全部分类</option>
+          <option value="direct">直连节点</option>
+          <option value="relay">中转节点</option>
+          <option value="chain">链式代理</option>
+        </select>
+      </span>
+    </h2>
+    <div class="scroll" style="max-height:520px"><table id="nodes">
+      <thead><tr><th>源</th><th>节点</th><th>分类</th><th>协议</th><th>出口</th><th>IP</th><th>延迟</th><th>连败</th><th>状态</th><th>近况</th><th>最近原因</th></tr></thead>
+      <tbody></tbody></table></div>
+  </div>
+
+  <div class="panel hide" id="settings-panel">
+    <h2>设置 <button id="btn-save">保存</button></h2>
+    <div class="grid2" id="settings"></div>
+  </div>
+
+  <div class="panel">
+    <h2>日志 <button id="btn-clear-log">刷新</button></h2>
+    <div id="log"></div>
+  </div>
+</main>
+
+<script type="application/json" id="bootstrap">__BOOTSTRAP__</script>
+<script src="app.js" defer></script>
+</body>
+</html>

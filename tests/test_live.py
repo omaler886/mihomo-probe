@@ -48,6 +48,7 @@ import yaml
 ROOT = Path(os.environ.get("MIHOMO_TEST_ROOT", "/srv/mihomo-test"))
 sys.path.insert(0, str(ROOT))
 
+from mihomo_test import engine
 from mihomo_test.store import Client
 
 # This module talks to a running deployment. It must NOT be collected by a
@@ -659,14 +660,24 @@ class SubStoreLinkTest(unittest.TestCase):
                               "a probe sub URL carries no token")
 
     def test_linked_subs_are_not_empty(self):
-        """Sub-Store answers 500 for a zero-node sub, so we never create one."""
+        """Sub-Store answers 500 for a zero-node sub, so we never create one.
+
+        Only subs the exporter would link *now* are checked. A source can be
+        muted (`export: false`) after its sub was created, and that sub is then
+        an orphan waiting for the next `link_substore` to prune it -- failing
+        here for it would report a deliberate mute as a broken deployment. The
+        check is against the live `export_keys`, so it tracks the config rather
+        than a hardcoded list.
+        """
         prefix = self.cfg["publish"].get("prefix", "probe")
         try:
             items = self.store.get_json("/api/subs") or []
         except Exception as exc:
             self.skipTest(f"Sub-Store unreachable: {exc}")
+        expected = {f"{prefix}-{k}" for k in engine.export_keys(self.cfg)}
         ours = [i for i in items if str(i.get("name", "")).startswith(prefix + "-")
-                and i.get("source") == "remote"]
+                and i.get("source") == "remote"
+                and str(i.get("name")) in expected]
         if not ours:
             self.skipTest("no remote subs linked yet")
         for item in ours:
