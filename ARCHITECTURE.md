@@ -73,9 +73,12 @@
 | `mihomo_test/server.py` | 触及（两处最小 diff） | ① `auth_ok` 的 publish 作用域扩入 `/api/probe/nodes`（§3.2）；② `do_GET` 新增一个路由分支（§3.1）。其余逻辑不动 |
 | `mihomo_test/substore_bridge.py` | 新增（N-03） | `probe_nodes_payload(rows)` 纯函数 + 字段/状态白名单常量——payload 形状的单一事实来源，server 端点与测试共用 |
 | `substore_bridge/probe_filter.script.js` | 新增（N-02，新目录） | Sub-Store Script Operator 脚本：调 probe API，按账本过滤 dead / 标注国别，契约见 §4 |
-| `tests/test_substore_bridge.py` | 新增 | N-03 纯函数行为 + N-01 端点契约（payload 形状、白名单、空账本）；N-02 的 Node 24 行为 harness（mock fetch + 官方 operator 签名） |
-| `tests/test_hardening.py` | 触及（仅追加用例） | N-01 HTTP 面用例：无 token 401 / publish token 200 / auth token 200 / publish token 仍打不开 `/api/status` 与 `/api/config` / 响应形状 / 不含敏感字段（沿用 `_LiveServer` 风格，见 §3.5） |
+| `tests/test_substore_bridge.py` | 新增 | N-03 纯函数行为 + **N-01 端点 HTTP 面用例（ProbeNodesEndpointTest：无 token 401 / publish token 200 / auth token 200 / publish token 仍打不开 `/api/status` 与 `/api/config` / 响应形状 / 不含敏感字段，沿用 `_LiveServer` 风格，见 §3.5）** + N-02 的 Node 24 行为 harness（mock fetch + 官方 operator 签名） |
 | `MIGRATION_GUIDE.md` | main Agent 写（N-04） | 路径 B/A 分步配置、$arguments 填法、回滚、凭据轮换与历史清洗前置项。需要 §3/§4 的契约文字，直接引用本文件 |
+
+（B4 修订，REVIEW R-02：原白名单含 `tests/test_hardening.py`「仅追加用例」一行——实际实现中 N-01 的 16 个
+端点用例由 tests Agent 独立决定集中落位 `tests/test_substore_bridge.py`，`test_hardening.py` 未被触碰，
+该行已按实际实现更正并入上表第一行。）
 
 约束重申：不为「看起来完整」改任何 deprecate 项（MIGRATION_MAPPING §3）；`db.py` **不需要改**——
 `db.list_nodes(source=None, status=None)`（db.py:472）已同时支持两个过滤参数。
@@ -151,7 +154,9 @@ def auth_ok(handler, cfg, path=None):
 
 - `generated_at`：`db.now()`（UTC，`%Y-%m-%dT%H:%M:%S`，秒精度无时区后缀——与全仓时间戳约定一致，
   test_logic TimestampTest 锁定）。由 N-03 构建器填，端点不自行生成。
-- 字段类型：`name/source/status/category` = string；`country/server/proto` = string 或 `null`（账本可能还没写上，
+- 字段类型：`name/source/status/category` = string（`category` 若账本行尚未盖章——迁移补列的 NULL——按全仓
+  约定归一为 `"direct"`，与 `db.list_nodes` 的 `n.category || "direct"` 同款，B4 按 REVIEW R-05 显式成文）；
+  `country/server/proto` = string 或 `null`（账本可能还没写上，
   如本轮尚未完成归属查询）；`delay_ms` = int 或 `null`（从未测成）；`consec_fail` = int。
 - `status` 枚举 = `policy.py` 五常量（ALIVE/PENDING/DEAD/UNKNOWN/EXCLUDED）。
 - **字段白名单（单一事实来源 = N-03 的 `PROBE_NODE_FIELDS`）**，恰好 9 个：
@@ -287,6 +292,7 @@ async function operator(proxies, targetPlatform, context) {
   const missing = args.missing === "drop" ? "drop" : "keep";
   const url = String(args.probe_url || "").trim();
   if (!url) throw new Error("probe_filter: $arguments.probe_url 缺失");
+  if (Array.isArray(proxies) && proxies.length === 0) return proxies;  // 空订阅不 fetch（配置错误已在上行抛出，fail-loud 优先）
 
   let nodes = null;                       // null = 「按 missing 策略」的失败/无记录态
   try {
@@ -459,5 +465,7 @@ Sub-Store 侧回滚（N-04 指南承载）：删订阅 process 里的 Script Ope
    「publish 作用域 = `/api/export/`（前缀）∪ `/api/probe/nodes`（精确）」，与 `AuthLogicTest` 语义对齐。
 3. **N-01 risk**「加 ?source= 过滤与 count 上限」→ count 上限按 §3.3 裁量**不实现**（截断制造静默差异；
    nodes 表行数有上界），仅保留 `source`/`status` 两个过滤参数。
-4. **测试落点**：N-01 的 HTTP 面用例落在 `tests/test_hardening.py`（追加用例，该文件因此进入文件白名单），
-   N-03/N-02 用例落在新增 `tests/test_substore_bridge.py`——§2 tests 字段已隐含，编码前在矩阵里写明归属。
+4. **测试落点**：N-01 的 HTTP 面用例与 N-03/N-02 用例统一落在新增 `tests/test_substore_bridge.py`
+   （N-01 = `ProbeNodesEndpointTest` 16 例；`test_hardening.py` 未触碰）。（B4 修订，REVIEW R-02/R-05：
+   原写「N-01 用例落 test_hardening.py、该文件进入白名单」与实际实现不符——tests Agent 独立决定集中落位，
+   本节已按实际实现更正。）

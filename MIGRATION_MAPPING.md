@@ -5,7 +5,7 @@
 > （feature / legacy_entry / official_equivalent / decision / target_module / compatibility / tests / risk / owner）。
 > decision 取值：`reuse`=官方能力直接复用｜`enhance`=官方能力+本服务增强｜`extension`=官方无对应，独立扩展模块｜
 > `adapter`=平台/语义差异适配器｜`deprecate`=不进入目标架构（保留为私有运维资产或一次性产物）。
-> 决策统计（F-01~F-100）：reuse 3 / enhance 8 / extension 68 / adapter 6 / deprecate 15；另有本批新增 N-01~N-04（extension）。
+> 决策统计（F-01~F-100，程序化逐列统计，B4 按 REVIEW R-01 更正）：reuse 3 / enhance 9 / extension 66 / adapter 6 / deprecate 16；另有本批新增 N-01~N-04（extension）。
 
 ## 0. 总体架构决策（先于逐条映射）
 
@@ -169,7 +169,7 @@
 
 | # | 功能 | legacy 入口 | 官方对应 | 决策 | 目标模块 | 兼容方式 | 测试 | 风险 | owner |
 |---|---|---|---|---|---|---|---|---|---|
-| F-76~F-85 | 诊断/修复/部署脚本族（loop_snapshot、loop_query、loop_scan、fix_round_times、wire_telegram、deploy_files/pull_file/push_run、chain_*、v6_*、lanes_verify、verify_measure_switch） | tools/ 各文件 | null | deprecate | 不进入目标架构 | 原样保留为私有运维资产（绑定 vps 路径/凭据/部署拓扑，见 FEATURE_INVENTORY 域 14）；其中 S-01~S-03 涉及的 4 个已跟踪脚本需凭据轮换+历史清洗后方可外发 | 不适用（运维工具） | 凭据泄露（SECURITY_REVIEW A 节） | 无 |
+| F-76~F-85 | 诊断/修复/部署脚本族（loop_snapshot、loop_query、loop_scan、fix_round_times、wire_telegram、deploy_files/pull_file/push_run、chain_*、v6_*、lanes_verify、verify_measure_switch）（聚合行，10 项同质 deprecate——REVIEW R-06 记录粒度观察） | tools/ 各文件 | null | deprecate | 不进入目标架构 | 原样保留为私有运维资产（绑定 vps 路径/凭据/部署拓扑，见 FEATURE_INVENTORY 域 14）；其中 S-01~S-03 涉及的 4 个已跟踪脚本需凭据轮换+历史清洗后方可外发 | 不适用（运维工具） | 凭据泄露（SECURITY_REVIEW A 节） | 无 |
 
 ### 域 15 部署形态
 
@@ -205,8 +205,8 @@
   "official_equivalent": "官方 /api/utils/node-info（仅入口归属，无账本语义）——本端点是 Sub-Store 侧脚本的数据源",
   "decision": "extension",
   "target_module": "mihomo_test/server.py（新增 GET /api/probe/nodes）+ mihomo_test/substore_bridge.py（payload 纯函数）",
-  "compatibility": "鉴权沿用现有模型：publish.token 或 auth.token 皆可（与 /api/export 同一作用域）；只读；响应不含任何凭据/token 字段；新增路由不影响现有路由",
-  "tests": ["test_hardening 风格：无 token 401 / publish token 200 / auth token 200 / 响应形状 / 不含敏感字段"],
+  "compatibility": "鉴权沿用现有模型：publish.token 或 auth.token 皆可；publish 作用域经 _publish_scoped 精确扩展 = /api/export/（前缀）∪ /api/probe/nodes（精确匹配，尾随路径不入作用域）（B4 按 ARCHITECTURE §9.2/REVIEW R-05 补句）；只读；响应不含任何凭据/token 字段；新增路由不影响现有路由",
+  "tests": ["tests/test_substore_bridge.py ProbeNodesEndpointTest（16 例，B4 按 REVIEW R-02 修正落点描述）：无 token 401 / publish token 200 / auth token 200 / 作用域未放大 / 响应形状 / 不含敏感字段"],
   "risk": "账本行数大时响应体大（?source=/status 过滤；不做 count 截断——截断制造静默差异，且 nodes 表行数有界）",
   "owner": "backend-impl → tests"
 }

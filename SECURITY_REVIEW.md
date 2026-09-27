@@ -183,3 +183,18 @@ chain-alive-*.md
 ### E. 底线回答
 - **功能代码本身（mihomo_test/*、web/、多数 tests/tools）是干净的**，鉴权/CORS/路径穿越/命令注入面经核查无 P0/P1 漏洞；
 - 阻塞基线的全部是**数据文件与四个已跟踪的凭据文件**：完成第三节 A/B/D 三步（轮换、ignore、脱敏、必要时清洗历史）后，基线提交即可安全进行。
+
+---
+
+## 四、整改状态（B4 回填，2026-09-28）
+
+| 项 | 状态 | 落点 |
+|---|---|---|
+| S-04 dom 快照含 publish token | **已整改（不入库）** | `.gitignore` 新增 `dom_*.html`；token 轮换待部署侧（MIGRATION_GUIDE §1.1） |
+| S-05/S-06 .tmp_diag/ 含订阅 URL 与节点凭据 | **已整改（不入库）** | `.gitignore` 新增 `.tmp_diag/`；本地留存清理由使用者决定 |
+| S-07 reports/ 含订阅 URL 与 orig_proxy 凭据 | **已整改（不入库）** | `.gitignore` 新增 `reports/` |
+| S-08 测试夹具真实凭据 | **已整改** | 基线提交 B1：test_ipmap.py 真实 UUID/IPv6/IPv4/域名 → 占位 UUID + RFC 5737/2001:db8 文档地址（连带修复审查补充发现的 test_logic.py:2927、tools/chain_verify.py:70 同款真实 UUID） |
+| S-01~S-03 已跟踪 tools 脚本凭据（已在 git 历史 初始提交） | **未整改（外发硬前置）** | 凭据轮换 + `git filter-repo`/BFG 清洗，见 MIGRATION_GUIDE §1；完成前仓库不得推共享/公共远端 |
+| S-10 chain-alive-r365.md | **已整改（不入库）** | `.gitignore` 新增 `chain-alive-*.md` |
+| S-13 默认面板域名硬编码（P3） | **本批有意不动** | vps 现网依赖 `config.py` 默认值生成联动 URL，改默认即行为回归；已固化为公开发行版前置项（MIGRATION_GUIDE §4） |
+| S-09/S-12/S-14~S-19（P2/P3） | **未整改，未放大** | 本批（B3）零触碰相关代码；新端点经 reviewer 核对零泄露面 |
