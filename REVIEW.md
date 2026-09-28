@@ -3,8 +3,8 @@
 - 审查人：reviewer 子 Agent（第二轮独立审查）
 - 日期：2026-09-28
 - 工作仓库：`D:\ChatGPT\代理测活`（Windows + Git Bash）
-- 审查范围：`B1`（基线入库 + S-04~S-08 整改）、`B2`（迁移文档）、`B3`（扩展面实现 N-01~N-03）三个提交，及全部迁移文档
-- 审查方法：全部指定材料通读（diff / 三个新代码文件全文 / 七份文档）；server.py 基线版（`git show B1:mihomo_test/server.py`）与工作区版逐行对照鉴权语义；映射决策矩阵程序化统计（awk 逐列）；新文件硬编码与官方源码引入痕迹 grep；**独立复跑** `tests.test_substore_bridge`（52 用例 OK，10.5s）与全量 `python -m unittest discover -s tests`（Ran 531, OK skipped=2, 40.2s）；复跑后 `git status --porcelain` 为空（审查过程零残留，本报告是唯一产出文件）
+- 审查范围：B1（基线入库 + S-04~S-08 整改）、B2（迁移文档）、B3（扩展面实现 N-01~N-03）三个提交，及全部迁移文档
+- 审查方法：全部指定材料通读（diff / 三个新代码文件全文 / 七份文档）；server.py 基线版（`git show <B1 提交>:mihomo_test/server.py`）与工作区版逐行对照鉴权语义；映射决策矩阵程序化统计（awk 逐列）；新文件硬编码与官方源码引入痕迹 grep；**独立复跑** `tests.test_substore_bridge`（52 用例 OK，10.5s）与全量 `python -m unittest discover -s tests`（Ran 531, OK skipped=2, 40.2s）；复跑后 `git status --porcelain` 为空（审查过程零残留，本报告是唯一产出文件）
 - 严重级定义沿用 SECURITY_REVIEW：P0=立即泄露风险｜P1=高危｜P2=中｜P3=低/文档完善建议
 
 ---
@@ -44,7 +44,7 @@
 - **F-01~F-100 无缺号**：MIGRATION_MAPPING.md §1 十六个域的分段（F-01~05 / 06~11 / 12~23 / 24~25 / 26~34 / 35~40 / 41~44 / 45~47 / 48~52 / 53~61 / 62~65 / 66~71 / 72~75 / 76~85 / 86~93 / 94~100）连续覆盖 1~100，无跳号。
 - **字段齐全**：程序化核对每行第 6 列（decision）取值 ∈ {reuse, enhance, extension, adapter, deprecate}，无异常行；第 10 列（owner）无空缺。
 - **R-01（P2）统计数字错误**：`MIGRATION_MAPPING.md:8` 与 `PLAN.md:6` 声称 "reuse 3 / enhance 8 / extension 68 / adapter 6 / deprecate 15"。实际逐行统计（91 行表格行，其中 F-76~F-85 一行聚合 10 项）：行级 reuse 3 / enhance 9 / extension 66 / adapter 6 / deprecate 7 行；**按功能折算 deprecate = 7 − 1 + 10 = 16**，即功能级真实分布为 **reuse 3 / enhance 9 / extension 66 / adapter 6 / deprecate 16 = 100**。声称值三处错位（enhance 少 1、extension 多 2、deprecate 少 1——且凑巧总和仍为 100，说明是手算错误而非漏项）。enhance 实际 9 项 = F-04、F-38、F-41、F-42、F-43、F-44、F-53、F-62、F-63。
-- **B3 编码范围**：`git show B3 --stat` 触及 7 文件——ARCHITECTURE.md（新）、MIGRATION_MAPPING.md（2 处修正，内容与其自身 §9.1/§9.3 建议逐字对应）、TEST_REPORT.md（追加 §10）、server.py、substore_bridge.py、probe_filter.script.js、test_substore_bridge.py。代码面恰为 N-01~N-03，未越界；文档三件属批次交付物。ARCHITECTURE.md 原排 B4 提前到 B3 提交（PLAN.md:8），commit message 已声明，属计划偏差的良性方向。
+- **B3 编码范围**：`git show <B3 提交> --stat` 触及 7 文件——ARCHITECTURE.md（新）、MIGRATION_MAPPING.md（2 处修正，内容与其自身 §9.1/§9.3 建议逐字对应）、TEST_REPORT.md（追加 §10）、server.py、substore_bridge.py、probe_filter.script.js、test_substore_bridge.py。代码面恰为 N-01~N-03，未越界；文档三件属批次交付物。ARCHITECTURE.md 原排 B4 提前到 B3 提交（PLAN.md:8），commit message 已声明，属计划偏差的良性方向。
 - **R-06（P3，观察）**：F-76~F-85 十项聚合为一行。decision/owner 齐全且全部 deprecate 同质，可接受；粒度粗于其余 90 项，仅记录。
 
 ### 2. 重复实现
@@ -54,7 +54,7 @@
 
 ### 3. 语义变化（重点核对）
 
-对照 `git show B1:mihomo_test/server.py`（:93-135）与工作区版：
+对照 `git show <B1 提交>:mihomo_test/server.py`（:93-135）与工作区版：
 
 - `_matches`（server.py:104-117）与 `_presented_tokens`（:119-126）**逐字未变**：UTF-8 字节 `hmac.compare_digest`、空串双侧拒绝、三传法（`?token=` / `X-Auth-Token` / `Bearer`）不变。
 - `auth_ok`（:128-149）唯一实质变化是 :145 `path.startswith("/api/export/")` → `_publish_scoped(path)`；:63-70 谓词 = `path.startswith("/api/export/") or path == "/api/probe/nodes"`。
@@ -73,9 +73,9 @@
 
 ### 5. 侵入式修改
 
-- server.py diff 全文核对（`git show B3 -- mihomo_test/server.py`）：+1 import、`_publish_scoped` 谓词 10 行、`auth_ok` docstring +3 行、路由分支 +22 行，**无其他改动**；分支插在 `/api/nodes` 之后（ARCHITECTURE §3.1 要求的位置），自动继承 401 前置与 500 兜底。
+- server.py diff 全文核对（`git show <B3 提交> -- mihomo_test/server.py`）：+1 import、`_publish_scoped` 谓词 10 行、`auth_ok` docstring +3 行、路由分支 +22 行，**无其他改动**；分支插在 `/api/nodes` 之后（ARCHITECTURE §3.1 要求的位置），自动继承 401 前置与 500 兜底。
 - 官方源码引入检查：三个新文件 grep `createDynamicFunction|scriptResourceCache|SUB_STORE_` 无结果；probe_filter.script.js 为原创（fetch + Map 匹配 + 正则改名，未抄官方 demo.js/ip-flag.js 的任何片段）；本仓库内不存在官方 backend 源码。AGPL 风险仅以"不分发官方代码"的架构决策规避（ARCHITECTURE §8、OFFICIAL_CAPABILITY_MAP §8.5），路径 A/B 均不触发分发义务——判断成立。
-- 基线提交 `B1` 的脱敏抽查：`.gitignore` 新增行与 SECURITY_REVIEW §三.C 清单一致（.tmp_diag/ reports/ dom_*.html console_*.txt chain-alive-*.md，另加 dist/ .wrangler/）；test_ipmap 夹具 UUID 已换 `00000000-0000-4000-8000-…`、server 已换 example.com（S-08 落实）。
+- 基线提交 B1 的脱敏抽查：`.gitignore` 新增行与 SECURITY_REVIEW §三.C 清单一致（.tmp_diag/ reports/ dom_*.html console_*.txt chain-alive-*.md，另加 dist/ .wrangler/）；test_ipmap 夹具 UUID 已换 `00000000-0000-4000-8000-…`、server 已换 example.com（S-08 落实）。
 
 ### 6. 测试缺口
 
@@ -126,7 +126,7 @@
 5. **同名校验取"最后一条"**：JS `byName` Map 对账本内同名多记录取最后一条（未文档化、未测试的边缘；账本侧 (source,fingerprint) 主键下同名跨源可能发生，实际影响极小）。
 6. **annotate 模式下 missing=drop 无效果**：纯改名模式从不删节点（§4.5 契约如此，实现一致），组合语义只有 filter/both 受 missing 删除影响；文档已写但使用者易误读。
 7. **决策统计（R-01）在修正前不可作为台账引用**：任何引用 "reuse 3 / enhance 8 / extension 68 / adapter 6 / deprecate 15" 的下游文档/汇报都会继承错误。
-8. **外发前置仍未完成**：S-01~S-03 四个已跟踪 tools 脚本的真实凭据仍在 git 历史（初始提交），publish token 快照历史仍在——轮换 + filter-repo/BFG 清洗未做（ARCHITECTURE §6.3 已固化为 MIGRATION_GUIDE 硬前置，即 N-04）。
+8. **外发前置仍未完成**：S-01~S-03 四个已跟踪 tools 脚本的真实凭据仍在 git 历史（公开前已清洗），publish token 快照历史仍在——轮换 + filter-repo/BFG 清洗未做（ARCHITECTURE §6.3 已固化为 MIGRATION_GUIDE 硬前置，即 N-04）。
 
 ---
 
@@ -135,7 +135,7 @@
 | ID | 级别 | 发现 | 证据 | 建议 |
 |---|---|---|---|---|
 | R-01 | **P2** | 决策统计与矩阵实际不符：声称 reuse 3/enhance 8/extension 68/adapter 6/deprecate 15，实际（按功能折算）reuse 3/**enhance 9**/**extension 66**/adapter 6/**deprecate 16** | MIGRATION_MAPPING.md:8、PLAN.md:6；本轮 awk 逐列统计（91 行，F-76~F-85 一行含 10 项） | main Agent 重算后统一更正两处；今后统计用脚本生成而非手算 |
-| R-02 | P3 | 测试落点描述与实现不符：§2/§9.4 称 N-01 用例落 test_hardening.py，实际 B3 未触该文件，用例在 test_substore_bridge.py | ARCHITECTURE.md:77,462-463；`git show B3 --stat` | B4 修订 §2 白名单表行与 §9.4，如实写"N-01 用例随 N-03 落 test_substore_bridge.py" |
+| R-02 | P3 | 测试落点描述与实现不符：§2/§9.4 称 N-01 用例落 test_hardening.py，实际 B3 未触该文件，用例在 test_substore_bridge.py | ARCHITECTURE.md:77,462-463；`git show <B3 提交> --stat` | B4 修订 §2 白名单表行与 §9.4，如实写"N-01 用例随 N-03 落 test_substore_bridge.py" |
 | R-03 | P3 | N-04 MIGRATION_GUIDE.md 与 CHANGELOG_MIGRATION.md 未交付（B4 排期内） | `ls` 确认不存在；PLAN.md:8-9 | B4 按 PLAN 交付；MIGRATION_GUIDE 必须包含凭据轮换+历史清洗硬前置与真机 produce 验收步骤 |
 | R-04 | P3 | ARCHITECTURE §4.6 参考骨架缺"空入站早退"一行（实现与 §4.5 文字正确，测试双向锁定） | ARCHITECTURE.md:284-348 对照 probe_filter.script.js:25-27 | B4 把 :27 那行补进骨架，或加一句"骨架省略空入站早退，见 §4.5" |
 | R-05 | P3 | ARCHITECTURE §9 修正建议只落 2/4：§9.2（作用域描述补句）、§9.4（测试落点）未落进 MIGRATION_MAPPING；category NULL→direct 亦未在 ARCHITECTURE §3.4 正文显式成文 | MIGRATION_MAPPING.md:208（N-01 compatibility/risk 现文）；ARCHITECTURE.md:154-155 | B4 落齐 §9.2/§9.4；§3.4 类型行补一句"NULL category 归一为 direct（迁移列未盖章时）" |
@@ -148,10 +148,10 @@
 ## 七、建议的后续动作（本轮不动手）
 
 1. **main Agent（B4 前）**：更正 R-01 统计（PLAN.md:6 + MIGRATION_MAPPING.md:8）；顺手修订 R-02/R-04/R-05 三处文档。
-2. **main Agent（B4）**：交付 N-04 MIGRATION_GUIDE.md（分步配置 + $arguments 填法 + 回滚 + **凭据轮换与 git 历史清洗硬前置**）与 CHANGELOG_MIGRATION.md（回补 B1/B2/B3 三行 SHA/目的/影响/回滚）。
+2. **main Agent（B4）**：交付 N-04 MIGRATION_GUIDE.md（分步配置 + $arguments 填法 + 回滚 + **凭据轮换与 git 历史清洗硬前置**）与 CHANGELOG_MIGRATION.md（回补 B1/B2/B3 三行批次/目的/影响/回滚）。
 3. **tests/deploy Agent**：在 vps 或任一真实官方 Sub-Store 实例上做一次端到端验收（建远程订阅指向 `/api/export/<key>.yaml?token=<publish.token>` + 粘贴脚本 + produce 一次），把结果记入 TEST_REPORT——这是把 N-02 从"完成（附保留意见）"变成"无保留完成"的唯一缺口；同时覆盖已知限制 1/2。
 4. **CI 建议**：若未来迁移门禁上 CI，显式断言 Node 存在（或把 skip 计入门禁口径），防止 21 个 JS 用例无声消失（已知限制 3）。
-5. **外发闸门（不变）**：凭据轮换 + `git filter-repo`/BFG 清洗 初始提交 完成前，仓库不得推任何共享/公共远端（SECURITY_REVIEW §三.A、ARCHITECTURE §6.3、已知限制 8）。
+5. **外发闸门（不变）**：凭据轮换 + `git filter-repo`/BFG 清洗完成前，仓库不得推任何共享/公共远端（SECURITY_REVIEW §三.A、ARCHITECTURE §6.3、已知限制 8）。
 
 ---
 

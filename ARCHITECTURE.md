@@ -413,7 +413,7 @@ async function operator(proxies, targetPlatform, context) {
    - S-16（P3，query token 进反代日志）——对**既有**导出 URL 是既定兼容形态；对**新**端点，N-02 脚本改用
      `X-Auth-Token` 头传 token，不再新增 query token 用法。
 3. **外发前置 = 凭据轮换 + 历史清洗**（SECURITY_REVIEW 三.A）：S-01~S-03 的四个已跟踪 tools 脚本凭据已进
-   git 历史（初始提交），S-04 的 publish token 快照已明文留存——**先轮换（节点 UUID/REALITY 参数/前置凭据/
+   git 历史，S-04 的 publish token 快照已明文留存——**先轮换（节点 UUID/REALITY 参数/前置凭据/
    publish token），再 `git filter-repo`/BFG 清洗**，之后基线才可推任何共享远端。由 MIGRATION_GUIDE 承载为
    硬前置，不因本批是「纯增量」而豁免。
 4. **零存活语义对齐**：官方「零节点订阅必 500」已被 link_substore 用「零存活跳过联动」建模；路径 A 脚本侧的

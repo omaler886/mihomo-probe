@@ -14,11 +14,11 @@
 
 ### S-01（P0）已提交文件含真实节点凭据（vless 分享链接）
 - 证据：`tools/chain_diagnose.py:31-36` —— `TARGET_URIS` 内含 4 条真实 vless 分享链接：真实 UUID（分别以 `<UUID 片段>`、`<UUID 片段>` 开头）、REALITY 公钥/short-id（`pbk=<公钥片段>`、`pbk=<公钥片段>`）、真实服务器域名/IP；`FRONT_URI` 含自建前置节点真实 UUID（`<UUID 片段>`）及自建前置域名（`<前置域名>`）。
-- 状态：**该文件已被 git 跟踪，内容已进入提交 初始提交，即 git 历史中已存在这些凭据**（`git log -p --all` 可见）。
+- 状态：**该文件已被 git 跟踪，内容已进入历史提交，即 git 历史中已存在这些凭据**（`git log -p --all` 可见）。
 - 建议：
   1. 视这些 UUID/REALITY 参数已泄露，**先在订阅侧/节点侧换发凭据（轮换 UUID、更换 pbk/sid）**；
   2. 将 `TARGET_URIS`/`FRONT_URI` 改为从环境变量或本地未跟踪文件读取；
-  3. 若基线要推到公开/共享远端，必须改写历史（`git filter-repo` / BFG 清洗 初始提交）。
+  3. 若基线要推到公开/共享远端，必须改写历史（`git filter-repo` / BFG 清洗）。
 
 ### S-02（P0）已提交文件以 proxy 字典形式重复同一批真实凭据
 - 证据：`tools/chain_test2.py:26-59` —— `EDGETUNNEL`/`T2/T3/T4` 节点字典内嵌与 S-01 相同的真实 UUID（`<UUID 片段>`、`<UUID 片段>`、`<UUID 片段>`）、自建前置域名与 REALITY 参数。
@@ -150,7 +150,7 @@
 **结论：当前状态「不能」直接做基线提交。** 存在两类阻塞：
 
 ### A. 已在 git 历史中的泄露（P0，与本次提交无关但决定「基线能否外发」）
-- `tools/chain_diagnose.py`、`tools/chain_test2.py`、`tools/front_debug.py`、`tools/front_ablation.py` 四个已跟踪文件含真实节点 UUID/REALITY 参数/自建前置凭据（S-01~S-03），已随提交 初始提交 进入历史。
+- `tools/chain_diagnose.py`、`tools/chain_test2.py`、`tools/front_debug.py`、`tools/front_ablation.py` 四个已跟踪文件含真实节点 UUID/REALITY 参数/自建前置凭据（S-01~S-03），内容已进入 git 历史。
 - 处置：**先轮换这批节点凭据**（订阅侧换 UUID、前置节点换发），然后把四个文件中的真实链接/字典改为环境变量或占位符；若基线要推送到任何共享/公开远端，历史必须用 `git filter-repo`/BFG 清洗后才推。清洗+轮换完成前，仓库只能留在本机/私有环境。
 
 ### B. 未跟踪文件逐个裁决
@@ -194,7 +194,7 @@ chain-alive-*.md
 | S-05/S-06 .tmp_diag/ 含订阅 URL 与节点凭据 | **已整改（不入库）** | `.gitignore` 新增 `.tmp_diag/`；本地留存清理由使用者决定 |
 | S-07 reports/ 含订阅 URL 与 orig_proxy 凭据 | **已整改（不入库）** | `.gitignore` 新增 `reports/` |
 | S-08 测试夹具真实凭据 | **已整改** | 基线提交 B1：test_ipmap.py 真实 UUID/IPv6/IPv4/域名 → 占位 UUID + RFC 5737/2001:db8 文档地址（连带修复审查补充发现的 test_logic.py:2927、tools/chain_verify.py:70 同款真实 UUID） |
-| S-01~S-03 已跟踪 tools 脚本凭据（已在 git 历史 初始提交） | **未整改（外发硬前置）** | 凭据轮换 + `git filter-repo`/BFG 清洗，见 MIGRATION_GUIDE §1；完成前仓库不得推共享/公共远端 |
+| S-01~S-03 已跟踪 tools 脚本凭据（已在 git 历史） | **未整改（外发硬前置）** | 凭据轮换 + `git filter-repo`/BFG 清洗，见 MIGRATION_GUIDE §1；完成前仓库不得推共享/公共远端 |
 | S-10 chain-alive-r365.md | **已整改（不入库）** | `.gitignore` 新增 `chain-alive-*.md` |
 | S-13 默认面板域名硬编码（P3） | **本批有意不动** | vps 现网依赖 `config.py` 默认值生成联动 URL，改默认即行为回归；已固化为公开发行版前置项（MIGRATION_GUIDE §4） |
 | S-09/S-12/S-14~S-19（P2/P3） | **未整改，未放大** | 本批（B3）零触碰相关代码；新端点经 reviewer 核对零泄露面 |

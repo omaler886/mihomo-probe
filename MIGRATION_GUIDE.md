@@ -10,12 +10,12 @@
 
 当前仓库**只能留在本机/私有环境**。推送到任何共享/公共远端前必须完成：
 
-1. **凭据轮换**（这些值已进 git 历史 初始提交，视同泄露）：
+1. **凭据轮换**（这些值已进 git 历史，视同泄露）：
    - `tools/chain_diagnose.py` / `chain_test2.py` / `front_debug.py` / `front_ablation.py` 内嵌的真实节点
      UUID（`<UUID 片段>`、`<UUID 片段>`、`<UUID 片段>`）、REALITY 公钥/short-id（`pbk=<公钥片段>` 等）、自建前置域名；
    - `dom_live.html` / `dom_offline.html` 快照中的真实 publish token（`<token 片段>`，已在 vps 侧明文留存，**在面板
      设置里换掉 publish.token**）。
-2. **历史清洗**：`git filter-repo`（或 BFG）清洗 初始提交 中上述四个文件后强推（如有远端）。
+2. **历史清洗**：`git filter-repo`（或 BFG）清洗上述四个文件后强推（如有远端）。
 3. 工作区遗留敏感文件（`.tmp_diag/`、`reports/`、`dom_*.html`、`chain-alive-*.md`、`console_*.txt`）已被
    .gitignore 挡住且未入库；确认本地留存是否还需要，不需要就删。
 
@@ -40,7 +40,7 @@ probe 每轮把收敛后的活节点写到 `data/exports/<key>.yaml`，官方把
 
 给**任意**订阅（不限于 probe 导出的）按测活账本过滤死节点 / 标注实测国别。
 
-1. 前提：probe 服务可达（`GET /api/probe/nodes` 已随 B3 上线，publish.token 或 auth.token 皆可访问）。
+1. 前提：probe 服务可达（`GET /api/probe/nodes` 已随 <B3 提交> 上线，publish.token 或 auth.token 皆可访问）。
 2. 在 Sub-Store 目标订阅的「操作(process)」里添加**脚本操作**，粘贴
    `substore_bridge/probe_filter.script.js` 全文，并在订阅链接参数（`$arguments`）里传：
    ```
