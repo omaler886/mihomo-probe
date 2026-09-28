@@ -221,10 +221,30 @@ def test_one(core, entry, test_cfg, deadline=None):
     can exceed the whole 20-minute budget and keep going, while the scheduler
     is blocked by the round lock and the panel reports "正在测试" the entire
     time. Overrun is now bounded by a single attempt.
+
+    Only an HTTPS target can produce an "alive" verdict. The default target
+    list once opened with a plain-HTTP connectivity endpoint, and its rotation
+    meant the first success short-circuited the loop: a node could be published
+    on the strength of an `http://` 204 alone, then fail every HTTPS site in
+    real use (measured on the live CDN-front chains on 2026-09-28: 8 of 16
+    alive chained nodes had never been HTTPS-verified). The plain-HTTP target
+    is still dialled -- it is the only CN-reachable one, and its outcome is
+    diagnostic -- but its success merely notes "HTTP 通" and the loop keeps
+    hunting for an HTTPS pass; if none arrives the node fails on its last
+    HTTPS outcome.
+
+    HTTPS targets are also tried first, whatever order the config lists them
+    in: a plain-HTTP target can never rescue an HTTPS failure, so spending an
+    attempt on it before the HTTPS ones are exhausted would waste the very
+    retry the HTTPS targets needed.
     """
     urls = test_cfg["targets"]
     if not urls:
         raise ValueError("no test targets configured")
+    # Stable partition: every https:// target before every non-https one.
+    urls = ([u for u in urls if str(u).startswith("https://")]
+            + [u for u in urls if not str(u).startswith("https://")])
+    https_required = str(urls[0]).startswith("https://")
     expected = str(test_cfg.get("expected_status", "204"))
     max_attempts = max(1, int(test_cfg.get("max_attempts", 3)))
     base_timeout = int(test_cfg.get("timeout_ms", 5000))
@@ -237,6 +257,9 @@ def test_one(core, entry, test_cfg, deadline=None):
     reason = "unknown"
     detail = ""
     url = urls[0]
+    http_pass = None      # (delay, url): a plain-HTTP success, not a verdict
+    last_https = None     # (reason, detail) of the latest failed HTTPS attempt
+    last_fail = None      # ultimate fallback when nothing HTTPS was attempted
     while attempts < max_attempts:
         if deadline is not None and time.monotonic() > deadline:
             raise RoundTimeout(f"round exceeded its budget while testing {entry['mihomo']}")
@@ -244,15 +267,32 @@ def test_one(core, entry, test_cfg, deadline=None):
         attempts += 1
         delay, reason, detail = core.delay(entry["mihomo"], url, timeout, expected)
         if reason is None:
-            return {"delay_ms": delay, "reason": None, "detail": "",
-                    "attempts": attempts, "url": url}
-        if reason in TERMINAL_REASONS:
-            break
-        if reason == "timeout":
-            # A timeout is the one failure a bigger budget can overturn.
-            timeout = long_timeout
+            if not https_required or url.startswith("https://"):
+                return {"delay_ms": delay, "reason": None, "detail": "",
+                        "attempts": attempts, "url": url}
+            http_pass = (delay, url)
+        else:
+            last_fail = (reason, detail)
+            if not https_required or url.startswith("https://"):
+                last_https = (reason, detail)
+            if reason in TERMINAL_REASONS:
+                break
+            if reason == "timeout":
+                # A timeout is the one failure a bigger budget can overturn.
+                timeout = long_timeout
         if attempts < max_attempts:
             time.sleep(pause)
+    if last_https is None:
+        # Only reachable when the config has no https:// target at all -- then
+        # `https_required` is False and the loop returned above -- or every
+        # attempt failed before any HTTPS target was dialled.
+        reason, detail = last_fail or (reason, detail)
+    elif http_pass is not None:
+        reason, detail = last_https
+        detail = (f"{detail}；plain-HTTP 探测点 {http_pass[1]} 通（{http_pass[0]}ms），"
+                  "但 HTTPS 未通过，不判活").strip("；")
+    else:
+        reason, detail = last_https
     return {"delay_ms": delay, "reason": reason, "detail": detail,
             "attempts": attempts, "url": url}
 
@@ -1233,7 +1273,8 @@ def _run_round(cfg, trigger, only_source, log, mode=None):
                                  excluded_entries=excluded_entries,
                                  unverified=unverified, over_limit=over_limit,
                                  chain_failed_entries=chain_failed,
-                                 rejected_entries=rejected_entries)
+                                 rejected_entries=rejected_entries,
+                                 fronts=fronts)
     _reconcile_ledger(cfg, sources, fronts, chain_configured, log)
     stale = cleanup_exports(cfg)
     if stale:
@@ -1829,16 +1870,64 @@ def export_keys(cfg):
             if s.get("key") and s.get("enabled", True) and s.get("export", True)]
 
 
-def _publish_sources(cfg, store, sources, alive_by_source, proxy_by_name, countries, log):
-    """Write each source's export file, and optionally upsert into Sub-Store."""
+def _front_state_path():
+    return EXPORT_DIR / "fronts.json"
+
+
+def _write_front_state(chain_fronts, log):
+    """Record the round's live front proxies for the exports of rounds that
+    test no fronts.
+
+    A 直连测活 round (or a round with chaining switched off) still publishes
+    chained nodes in their configured form, and those dialers need fronts to
+    resolve against. The last chain round's live pool is the best available
+    answer, so it is kept here; an empty pool is written just as deliberately,
+    so a pool that died is not resurrected by stale state.
+    """
+    try:
+        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"updated_at": db.now(), "fronts": list(chain_fronts)}
+        path = _front_state_path()
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        log("warn", f"前置留档写入失败（不影响本轮导出）: {type(exc).__name__}: {exc}")
+
+
+def _read_front_state(log=None):
+    """The last recorded live front proxies, or [] when there is none."""
+    try:
+        payload = json.loads(_front_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    fronts = payload.get("fronts") if isinstance(payload, dict) else None
+    if not isinstance(fronts, list):
+        return []
+    return [f for f in fronts if isinstance(f, dict) and f.get("name")]
+
+
+def _publish_sources(cfg, store, sources, alive_by_source, proxy_by_name, countries, log,
+                     chain_fronts=None):
+    """Write each source's export file, and optionally upsert into Sub-Store.
+
+    `chain_fronts` is the round's live front proxies: `[]` when the round
+    tested fronts and none survived, `None` when this round tested no fronts
+    at all -- then the last recorded pool from `_write_front_state` stands in.
+    """
     if not cfg["publish"].get("enabled", True):
         return False
+    if chain_fronts is None:
+        chain_fronts = _read_front_state(log)
+    else:
+        _write_front_state(chain_fronts, log)
     keys = set(export_keys(cfg))
     for source in sources:
         key = source["key"]
         if key not in keys:
             continue
-        _write_export(cfg, key, alive_by_source.get(key, []), proxy_by_name, countries)
+        _write_export(cfg, key, alive_by_source.get(key, []), proxy_by_name, countries,
+                      chain_fronts=chain_fronts)
     if cfg["publish"].get("push_to_substore"):
         push_exports(cfg, store, [s["key"] for s in sources if s["key"] in keys], log)
     return True
@@ -1846,7 +1935,7 @@ def _publish_sources(cfg, store, sources, alive_by_source, proxy_by_name, countr
 
 def _apply_and_publish(cfg, round_id, store, by_name, proxies, results, countries, sources, log,
                        excluded_entries=None, unverified=None, over_limit=None,
-                       chain_failed_entries=None, rejected_entries=None):
+                       chain_failed_entries=None, rejected_entries=None, fronts=None):
     """Converge every tested node, reconcile the ledger, then publish.
 
     Thin orchestrator: the per-node state machine lives in `_converge_bucket`,
@@ -1854,6 +1943,11 @@ def _apply_and_publish(cfg, round_id, store, by_name, proxies, results, countrie
     `_prune_removed_nodes`, and the export write in `_publish_sources`. The
     guardrail decision stays here because it gates publishing and depends on the
     totals only this function has.
+
+    `fronts` is the round's front pool (from `collect_fronts`); the ones whose
+    delay test passed are what the chained exports publish as their dialer
+    targets. A front the round could not carry traffic through must not be
+    published -- that is exactly how a panel-alive chain breaks in a client.
     """
     excluded = {c.upper() for c in verify_cfg_excludes(cfg)}
     domain_pass = str(cfg.get("verify", {}).get("domain_pass", "any")).lower()
@@ -1934,8 +2028,11 @@ def _apply_and_publish(cfg, round_id, store, by_name, proxies, results, countrie
     # A suspect round keeps the previous exports on disk -- that is the whole
     # point of the guardrail, so publishing is skipped rather than overwritten.
     if not suspect:
+        live_fronts = [f["orig_proxy"] for f in (fronts or [])
+                       if (results.get(f["proxy"]["name"]) or {}).get("reason") is None]
         if not _publish_sources(cfg, store, sources, alive_by_source,
-                                proxy_by_name, countries, log):
+                                proxy_by_name, countries, log,
+                                chain_fronts=live_fronts):
             note = note or "publish disabled"
 
     return {"total": total, "alive": alive, "dropped": dropped, "restored": restored,
@@ -1963,65 +2060,99 @@ def _previous_alive_count():
     return int(row["ok"]) if row else 0
 
 
-def derived_dialer_groups(cfg, key, proxies):
-    """Groups an export needs alongside its proxies so `dialer-proxy` resolves.
+# Display tag for the front nodes published inside a chained export. Reserved
+# so a front can never collide with a tested node's region-tagged name, and so
+# an operator can see at a glance which entries are transit hops.
+FRONT_EXPORT_TAG = "[前置] "
+# Select-group name when `chain.front_source.name` itself would shadow a node.
+FRONT_GROUP_FALLBACK = "chain-front"
 
-    Why this exists: a tested chained node reaches the kernel as
-    `dialer-proxy: __FRONT0__`, a reserved name that exists only inside the
-    probe's own config. The export speaks the *upstream* form instead, so the
-    published file still said `dialer-proxy: cdn` -- and `cdn` is not a proxy
-    name anywhere. Verified against the real kernel (v1.19.29):
 
-        proxy [[GB] GB-09 · SS] dialer-proxy [cdn] not found
-        configuration file test failed
+def _resolve_chain_dialers(cfg, out, chain_fronts):
+    """Make every published chained node's `dialer-proxy` resolve in the file.
 
-    That is not a cosmetic defect: the whole file is rejected, so importing
-    the chained source into a client yielded nothing at all. Measured on the
-    live `air` collection, the upstream download carries `proxies` and *no*
-    `proxy-groups` at all, so the author's `cdn` group never reaches a client
-    either -- the value is simply dangling, and rewriting it is the only way
-    this export can load.
+    A chained node reaches a client as `dialer-proxy: <front>`, and that name
+    must resolve *inside the published file* -- the probe's own kernel config
+    is invisible to a client. Two regression layers led here:
 
-    Two values are left alone rather than rewritten:
+    * The upstream form dangles outright. A real client kernel (v1.19.29)
+      rejects the whole file:
+      `proxy [[GB] GB-09 · SS] dialer-proxy [cdn] not found`.
+    * The first rewrite fixed loadability but not topology: it emitted a
+      select group named `chain.front_source.name` whose members were the
+      export's own chained nodes -- every selection dialled itself. And the
+      front proxies were never published at all, so no client could resolve a
+      working front even by hand. Worse, Sub-Store drops `proxy-groups` when
+      re-rendering a subscription for download (measured on this deployment:
+      the exported group exists on disk, the downloaded sub has none), so a
+      group-based rewrite does not survive the pipeline clients pull through.
 
-    - one naming a proxy in this same export, which the client can already
-      resolve, and where the author's own topology may be meaningful;
-    - one we cannot name a group for (no chain block, no front source, or a
-      name that would shadow a node -- mihomo keys proxies by name, so that
-      would point the dialer at the node itself).
+    So the fronts themselves are published: `chain_fronts` -- the round's live
+    front proxies -- enter the export under `[前置] ` names, and a dangling
+    dialer points at them. A single-front pool points *directly at the front
+    proxy*, which is the one form that survives Sub-Store; a multi-front pool
+    needs the group for failover, and direct-file consumers get it, while
+    Sub-Store consumers of a multi-front pool must keep the group themselves
+    (or narrow the pool to one front).
 
-    The name rewritten in is always `chain.front_source.name`. An earlier
-    version used the *consuming* source's key so a multi-front round would not
-    claim a specific front, which broke the mirror: this group lives in the
-    chained export but the front's nodes are published in the front source's
-    export, so the two files would carry differently-named groups.
+    Dialers that already name a published proxy are left alone: the upstream
+    author's own topology may be meaningful, and the client resolves it.
 
-    Returns `[]` for any export with no chained nodes -- output untouched.
+    With no live fronts available (`chain_fronts` empty -- every front failed
+    this round, a direct round with no front history, or chaining switched
+    off) there is nothing a client could resolve, so the chained nodes are
+    dropped from the export instead of published broken: one dangling dialer
+    makes a client kernel reject the whole file, taking every working direct
+    node down with it.
+
+    Returns (proxies, groups).
     """
-    if not proxies:
-        return []
-    dialers = {p[DIALER_FIELD] for p in proxies if p.get(DIALER_FIELD)}
-    if not dialers:
-        return []
-    local = {p["name"] for p in proxies}
-    if dialers <= local:
-        # Every dialer already names a published proxy: the client resolves it.
-        return []
-    block = chain_block(cfg)
-    if block is None:
-        return []
-    front = block.get("front_source") or {}
-    name = str(front.get("name") or "").strip()
-    if not name or name in local:
-        return []
-    for proxy in proxies:
-        if proxy.get(DIALER_FIELD) and proxy[DIALER_FIELD] not in local:
-            proxy[DIALER_FIELD] = name
-    return [{"name": name, "type": "select",
-             "proxies": [p["name"] for p in proxies]}]
+    published = {p["name"] for p in out}
+    dangling = [p for p in out
+                if p.get(DIALER_FIELD) and p[DIALER_FIELD] not in published]
+    if not dangling:
+        return out, []
+    if not chain_fronts or chain_block(cfg) is None:
+        # Unpublishable as chained: drop exactly the dangling nodes and keep
+        # every node whose dialer the file already resolves.
+        drop = {id(p) for p in dangling}
+        return [p for p in out if id(p) not in drop], []
+
+    fronts, taken = [], set(published)
+    for proxy in chain_fronts:
+        proxy = {k: v for k, v in proxy.items() if k not in coremod.DROP_FIELDS}
+        base = f"{FRONT_EXPORT_TAG}{str(proxy.get('name') or '').strip() or 'front'}"
+        name, suffix = base, 2
+        while name in taken:
+            name = f"{base} #{suffix}"
+            suffix += 1
+        taken.add(name)
+        fronts.append({**proxy, "name": name})
+    if len(fronts) == 1:
+        # One front needs no indirection, and a plain proxy reference is the
+        # only rewrite that survives Sub-Store's group-stripping download.
+        target, groups = fronts[0]["name"], []
+    else:
+        ref = (chain_block(cfg).get("front_source") or {})
+        target = str(ref.get("name") or "").strip()
+        if not target or target in taken:
+            # Never shadow a node: mihomo keys proxies and groups in one
+            # namespace, and a colliding group name points the dialer nowhere.
+            target = FRONT_GROUP_FALLBACK
+        if target in taken:
+            suffix = 2
+            while target in taken:
+                target = f"{FRONT_GROUP_FALLBACK} #{suffix}"
+                suffix += 1
+        taken.add(target)
+        groups = [{"name": target, "type": "select",
+                   "proxies": [f["name"] for f in fronts]}]
+    for p in dangling:
+        p[DIALER_FIELD] = target
+    return out + fronts, groups
 
 
-def _export_proxies(names, proxy_by_name, countries, cfg, key):
+def _export_proxies(names, proxy_by_name, countries, cfg, key, chain_fronts=()):
     """Build the published list, collapsing repeats of the same endpoint.
 
     Upstream lists sometimes carry one server under two names (an "IPv6"
@@ -2036,6 +2167,10 @@ def _export_proxies(names, proxy_by_name, countries, cfg, key):
     the client would receive two nodes called the same thing. The export speaks
     for the source's *configured* form, so the chained variant wins: the direct
     one exists to tell the panel whether the node also works on its own.
+
+    `chain_fronts` carries the round's live front proxies (see
+    `_publish_sources`); the chained dialers and the front publishing are
+    resolved by `_resolve_chain_dialers`.
     """
     best = {}
     for name in names:
@@ -2058,7 +2193,7 @@ def _export_proxies(names, proxy_by_name, countries, cfg, key):
             # Trust the measured exit over whatever tag the name already had.
             proxy["name"] = f"[{country}] {_LEADING_TAG.sub('', str(proxy['name']))}"
         out.append(proxy)
-    return out, derived_dialer_groups(cfg, key, out)
+    return _resolve_chain_dialers(cfg, out, chain_fronts)
 
 
 # Strings the YAML 1.1 resolver reads as something other than text. A client
@@ -2107,9 +2242,10 @@ def _represent_str(dumper, value):
 _ExportDumper.add_representer(str, _represent_str)
 
 
-def _write_export(cfg, key, names, proxy_by_name, countries):
+def _write_export(cfg, key, names, proxy_by_name, countries, chain_fronts=()):
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    proxies, groups = _export_proxies(names, proxy_by_name, countries, cfg, key)
+    proxies, groups = _export_proxies(names, proxy_by_name, countries, cfg, key,
+                                      chain_fronts=chain_fronts)
     payload = {"proxies": proxies}
     if groups:
         payload["proxy-groups"] = groups

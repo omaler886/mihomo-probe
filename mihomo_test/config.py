@@ -223,10 +223,16 @@ DEFAULTS = {
         {"key": "air", "kind": "collection", "name": "air", "label": "air", "enabled": True},
     ],
     "test": {
+        # HTTPS targets first, the plain-HTTP one last. `engine.test_one`
+        # re-partitions them anyway (an https:// target is tried before any
+        # non-https one, whatever this order says) and only an HTTPS pass can
+        # mark a node alive -- a bare 204 over http:// proves reachability, not
+        # usability, and once published an HTTPS-broken node fails in real
+        # use. The listed order is what the docs and the panel show.
         "targets": [
-            "http://connectivitycheck.platform.hicloud.com/generate_204",
             "https://www.gstatic.com/generate_204",
             "https://cp.cloudflare.com/generate_204",
+            "http://connectivitycheck.platform.hicloud.com/generate_204",
         ],
         "expected_status": "204",
         "timeout_ms": 5000,

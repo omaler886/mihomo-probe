@@ -173,8 +173,8 @@ class RetryTest(unittest.TestCase):
             self.calls.append((url, timeout_ms))
             return self.outcomes.pop(0)
 
-    def cfg(self, attempts=3):
-        return {"targets": ["u1", "u2", "u3"], "expected_status": "204",
+    def cfg(self, attempts=3, targets=None):
+        return {"targets": targets or ["u1", "u2", "u3"], "expected_status": "204",
                 "timeout_ms": 5000, "timeout_ms_retry": 9000,
                 "max_attempts": attempts, "retry_pause_s": 0}
 
@@ -221,6 +221,88 @@ class RetryTest(unittest.TestCase):
         out = engine.test_one(fake, {"mihomo": "n"}, self.cfg())
         self.assertEqual(out["reason"], "kernel_error")
         self.assertIn("delay test", out["detail"])
+
+
+class HttpsVerdictTest(unittest.TestCase):
+    """Only an HTTPS target may produce an "alive" verdict.
+
+    The rotation once opened on a plain-HTTP connectivity endpoint, and the
+    first success short-circuited the loop: 8 of 16 alive chained nodes on the
+    live CDN-front chains (2026-09-28) had never been HTTPS-verified, and a
+    plain-HTTP 204 says nothing about the TLS path real traffic needs. The
+    HTTP target stays in rotation -- it is the only CN-reachable one -- but a
+    pass there is a note, not a verdict.
+    """
+
+    H = "https://gstatic.example/generate_204"
+    C = "https://cloudflare.example/generate_204"
+    P = "http://hicloud.example/generate_204"
+
+    class FakeCore:
+        def __init__(self, outcomes):
+            self.outcomes = list(outcomes)
+            self.calls = []
+
+        def delay(self, name, url, timeout_ms, expected):
+            self.calls.append(url)
+            return self.outcomes.pop(0)
+
+    def cfg(self, attempts=3):
+        return {"targets": [self.P, self.H, self.C], "expected_status": "204",
+                "timeout_ms": 5000, "timeout_ms_retry": 9000,
+                "max_attempts": attempts, "retry_pause_s": 0}
+
+    def test_https_targets_are_tried_before_the_plain_http_one(self):
+        # Config order puts the http:// target first; the partition must not
+        # spend an attempt on a target that cannot produce a verdict.
+        fake = self.FakeCore([(None, "timeout", "T"), (55, None, "")])
+        out = engine.test_one(fake, {"mihomo": "n"}, self.cfg())
+        self.assertIsNone(out["reason"])
+        self.assertEqual(fake.calls, [self.H, self.C])
+
+    def test_https_success_is_alive_immediately(self):
+        fake = self.FakeCore([(42, None, "")])
+        out = engine.test_one(fake, {"mihomo": "n"}, self.cfg())
+        self.assertIsNone(out["reason"])
+        self.assertEqual(out["attempts"], 1)
+
+    def test_http_pass_alone_is_not_alive(self):
+        # Both https targets fail, the plain-http one succeeds: the old loop
+        # returned alive on the http pass; the new one fails on the https
+        # outcome and notes the http pass in the detail.
+        fake = self.FakeCore([(None, "timeout", "Timeout"), (None, "timeout", "Timeout"),
+                              (99, None, "")])
+        out = engine.test_one(fake, {"mihomo": "n"}, self.cfg())
+        self.assertEqual(out["reason"], "timeout")
+        self.assertEqual(out["attempts"], 3)
+        self.assertIn("HTTPS 未通过", out["detail"])
+        self.assertIn("通（99ms）", out["detail"])
+
+    def test_http_pass_after_https_failures_reports_the_https_reason(self):
+        # The verdict is the LAST https attempt's outcome, matching the
+        # all-failed case which also reports the last reason.
+        fake = self.FakeCore([(None, "kernel_error", "delay test"), (None, "timeout", "T"),
+                              (31, None, "")])
+        out = engine.test_one(fake, {"mihomo": "n"}, self.cfg())
+        self.assertEqual(out["reason"], "timeout")
+        self.assertIn("HTTPS 未通过", out["detail"])
+        self.assertIn("通（31ms）", out["detail"])
+
+    def test_second_https_target_can_still_save_the_node(self):
+        fake = self.FakeCore([(None, "timeout", "T"), (77, None, "")])
+        out = engine.test_one(fake, {"mihomo": "n"}, self.cfg())
+        self.assertIsNone(out["reason"])
+        self.assertEqual(out["attempts"], 2)
+
+    def test_http_only_config_keeps_the_legacy_verdict(self):
+        # A deployment with no https:// target at all has no rule to enforce:
+        # the first pass is still an alive verdict.
+        cfg = {"targets": [self.P], "expected_status": "204", "timeout_ms": 5000,
+               "timeout_ms_retry": 9000, "max_attempts": 3, "retry_pause_s": 0}
+        fake = self.FakeCore([(120, None, "")])
+        out = engine.test_one(fake, {"mihomo": "n"}, cfg)
+        self.assertIsNone(out["reason"])
+        self.assertEqual(out["attempts"], 1)
 
 
 class ReasonTest(unittest.TestCase):
@@ -565,17 +647,23 @@ class YamlScalarQuotingTest(unittest.TestCase):
 
 
 class DerivedDialerGroupTest(unittest.TestCase):
-    """An export must be loadable by a client, not just by this probe.
+    """An export must be usable by a client, not just loadable.
 
-    The regression these cover was found by feeding a real export to the real
-    kernel, which refused the whole file:
+    Two regression layers led here. The first was found by feeding a real
+    export to the real kernel, which refused the whole file:
 
         proxy [[GB] GB-09 · SS] dialer-proxy [cdn] not found
         configuration file test failed
 
-    `cdn` is the *upstream* author's own dialer name and exists in no export,
-    so every chained node was unusable at import time even though the round
-    had tested it correctly.
+    `cdn` is the *upstream* author's own dialer name and exists in no export.
+    The first rewrite made the file loadable but not usable: the emitted group
+    listed the export's own chained nodes (every selection dialled itself) and
+    the front proxies were never published, so no client could resolve a
+    working front. On top of that, Sub-Store drops `proxy-groups` when
+    re-rendering a subscription for download -- measured on this deployment,
+    the group exists on disk but the downloaded sub has none -- so the only
+    rewrite guaranteed to survive the client's pipeline points the dialer
+    straight at a published front proxy.
     """
 
     def cfg(self, front="CM-CF", kind="sub", cap=1, sources=None):
@@ -591,73 +679,99 @@ class DerivedDialerGroupTest(unittest.TestCase):
         return {"A": {"name": "node-a", "type": "ss", "server": "1.1.1.1", "port": 443,
                       engine.DIALER_FIELD: dialer}}
 
-    def test_dialer_is_rewritten_to_the_front_source_name(self):
-        # The group has to be named after the *front* source, because that is
-        # where the front's proxies are published -- a name invented here would
-        # not match the front export's own group.
-        out, groups = engine._export_proxies(["A"], self.proxies(), {}, self.cfg(), "k")
-        self.assertEqual(out[0][engine.DIALER_FIELD], "CM-CF")
-        self.assertEqual([g["name"] for g in groups], ["CM-CF"])
+    def fronts(self, *names):
+        return [{"name": n, "type": "vless", "server": f"{n}.example", "port": 443,
+                 "uuid": "u", "network": "ws"} for n in names]
 
-    def test_same_rewrite_for_a_multi_front_round(self):
-        # max_fronts only changes how many fronts a round dials; it does not
-        # change which group a client must resolve, so the name is the same.
-        out, groups = engine._export_proxies(["A"], self.proxies(), {}, self.cfg(cap=8), "k")
-        self.assertEqual(out[0][engine.DIALER_FIELD], "CM-CF")
-        self.assertEqual([g["name"] for g in groups], ["CM-CF"])
+    def test_one_live_front_is_published_and_referenced_directly(self):
+        # Single-front pool: no group, the dialer names the published front
+        # proxy itself -- the form that survives Sub-Store's group-stripping.
+        out, groups = engine._export_proxies(["A"], self.proxies(), {}, self.cfg(), "k",
+                                             chain_fronts=self.fronts("HK-Alice"))
+        by_name = {p["name"]: p for p in out}
+        self.assertIn("[前置] HK-Alice", by_name)
+        self.assertEqual(by_name["node-a"][engine.DIALER_FIELD], "[前置] HK-Alice")
+        self.assertEqual(groups, [])
+        front = by_name["[前置] HK-Alice"]
+        self.assertEqual(front["server"], "HK-Alice.example")
 
-    def test_second_source_over_the_same_pool_resolves_to_the_same_group(self):
-        # Two chained sources fed by one front pool must agree on the group
-        # name, otherwise importing both produces two unrelated groups.
-        cfg = self.cfg(cap=3, sources=[
-            {"key": "k", "kind": "collection", "enabled": True},
-            {"key": "k2", "kind": "collection", "enabled": True}])
-        a, ga = engine._export_proxies(["A"], self.proxies(), {}, cfg, "k")
-        b, gb = engine._export_proxies(["A"], self.proxies(dialer="cdn"), {}, cfg, "k2")
-        self.assertEqual(ga[0]["name"], gb[0]["name"])
-        self.assertEqual(a[0][engine.DIALER_FIELD], b[0][engine.DIALER_FIELD])
+    def test_multi_front_pool_gets_a_select_group_of_fronts(self):
+        out, groups = engine._export_proxies(["A"], self.proxies(), {}, self.cfg(), "k",
+                                             chain_fronts=self.fronts("F1", "F2"))
+        names = [p["name"] for p in out]
+        self.assertEqual(groups[0]["name"], "CM-CF")
+        self.assertEqual(groups[0]["proxies"], ["[前置] F1", "[前置] F2"])
+        self.assertTrue(set(groups[0]["proxies"]) <= set(names))
+        node = next(p for p in out if p["name"] == "node-a")
+        self.assertEqual(node[engine.DIALER_FIELD], "CM-CF")
 
-    def test_derived_group_lists_the_exported_node_names(self):
-        out, groups = engine._export_proxies(["A"], self.proxies(), {}, self.cfg(), "k")
-        self.assertEqual(groups[0]["type"], "select")
-        self.assertEqual(groups[0]["proxies"], [p["name"] for p in out])
+    def test_group_name_falls_back_when_a_node_shadows_it(self):
+        # mihomo keys proxies and groups in one namespace: a node named CM-CF
+        # would make the group unresolvable, so the name falls back.
+        proxies = {"A": {"name": "CM-CF", "type": "ss", "server": "s", "port": 1,
+                         engine.DIALER_FIELD: "cdn"}}
+        out, groups = engine._export_proxies(["A"], proxies, {}, self.cfg(), "k",
+                                             chain_fronts=self.fronts("F1", "F2"))
+        self.assertEqual(groups[0]["name"], engine.FRONT_GROUP_FALLBACK)
+        self.assertEqual(groups[0]["proxies"], ["[前置] F1", "[前置] F2"])
 
     def test_export_without_chained_nodes_is_untouched(self):
         plain = {"A": {"name": "n", "type": "ss", "server": "s", "port": 1}}
-        out, groups = engine._export_proxies(["A"], plain, {}, self.cfg(), "k")
+        out, groups = engine._export_proxies(["A"], plain, {}, self.cfg(), "k",
+                                             chain_fronts=self.fronts("F1"))
         self.assertEqual(groups, [])
+        self.assertEqual([p["name"] for p in out], ["n"])
         self.assertNotIn(engine.DIALER_FIELD, out[0])
 
-    def test_chaining_switched_off_leaves_the_upstream_value_alone(self):
-        # With no chain block there is no pool to name, and inventing one would
-        # claim a topology the operator has not configured.
+    def test_no_live_fronts_drops_the_chained_nodes(self):
+        # An unpublishable chained node must not drag the whole file down with
+        # it: one dangling dialer makes a client kernel reject the export.
+        out, groups = engine._export_proxies(["A"], self.proxies(), {}, self.cfg(), "k",
+                                             chain_fronts=[])
+        self.assertEqual(out, [])
+        self.assertEqual(groups, [])
+
+    def test_no_front_history_drops_the_chained_nodes_too(self):
+        out, groups = engine._export_proxies(["A"], self.proxies(), {}, self.cfg(), "k")
+        self.assertEqual(out, [])
+        self.assertEqual(groups, [])
+
+    def test_chaining_switched_off_drops_the_chained_nodes(self):
+        # With no chain block there is no pool to resolve against; publishing
+        # the chained form anyway is what made the file unloadable.
         cfg = self.cfg()
         cfg["chain"] = None
-        out, groups = engine._export_proxies(["A"], self.proxies(), {}, cfg, "k")
+        out, groups = engine._export_proxies(["A"], self.proxies(), {}, cfg, "k",
+                                             chain_fronts=self.fronts("F1"))
+        self.assertEqual(out, [])
         self.assertEqual(groups, [])
-        self.assertEqual(out[0][engine.DIALER_FIELD], "cdn")
 
-    def test_a_node_named_like_the_front_source_is_not_shadowed(self):
-        # mihomo keys proxies by name, so rewriting into a name a node already
-        # uses would point the dialer at the node itself.
-        clash = {"A": {"name": "CM-CF", "type": "ss", "server": "s", "port": 1,
-                       engine.DIALER_FIELD: "cdn"}}
-        out, groups = engine._export_proxies(["A"], clash, {}, self.cfg(), "k")
-        self.assertEqual(groups, [])
-        self.assertEqual(out[0][engine.DIALER_FIELD], "cdn")
+    def test_second_source_over_the_same_pool_resolves_to_the_same_target(self):
+        # Two chained sources fed by one front pool must agree on the dialer
+        # target, otherwise importing both produces two unrelated topologies.
+        cfg = self.cfg(cap=3, sources=[
+            {"key": "k", "kind": "collection", "enabled": True},
+            {"key": "k2", "kind": "collection", "enabled": True}])
+        fronts = self.fronts("F1", "F2")
+        a, ga = engine._export_proxies(["A"], self.proxies(), {}, cfg, "k",
+                                       chain_fronts=fronts)
+        b, gb = engine._export_proxies(["A"], self.proxies(dialer="cdn"), {}, cfg, "k2",
+                                       chain_fronts=fronts)
+        self.assertEqual(ga[0]["name"], gb[0]["name"])
+        self.assertEqual(a[0][engine.DIALER_FIELD], b[0][engine.DIALER_FIELD])
 
     def test_a_dialer_naming_a_published_proxy_is_left_alone(self):
         # Self-consistent upstream: the client can already resolve it, and the
         # author's own topology may be meaningful, so nothing is rewritten and
-        # no group is invented.
+        # no front is published.
         proxies = {
             "A": {"name": "front-node", "type": "ss", "server": "f", "port": 1},
             "B": {"name": "node-b", "type": "ss", "server": "s", "port": 2,
                   engine.DIALER_FIELD: "front-node"},
         }
-        out, groups = engine._export_proxies(["A", "B"], proxies, {}, self.cfg(), "k")
-        b = next(p for p in out if p["name"] == "node-b")
-        self.assertEqual(b[engine.DIALER_FIELD], "front-node")
+        out, groups = engine._export_proxies(["A", "B"], proxies, {}, self.cfg(), "k",
+                                             chain_fronts=self.fronts("F1"))
+        self.assertEqual([p["name"] for p in out], ["front-node", "node-b"])
         self.assertEqual(groups, [])
 
     def test_only_the_unresolvable_dialer_is_rewritten(self):
@@ -669,13 +783,30 @@ class DerivedDialerGroupTest(unittest.TestCase):
             "C": {"name": "node-c", "type": "ss", "server": "s", "port": 3,
                   engine.DIALER_FIELD: "dangling"},
         }
-        out, groups = engine._export_proxies(["A", "B", "C"], proxies, {}, self.cfg(), "k")
+        out, groups = engine._export_proxies(["A", "B", "C"], proxies, {}, self.cfg(), "k",
+                                             chain_fronts=self.fronts("F1", "F2"))
         by = {p["name"]: p for p in out}
         self.assertEqual(by["node-b"][engine.DIALER_FIELD], "front-node")
         self.assertEqual(by["node-c"][engine.DIALER_FIELD], "CM-CF")
         self.assertEqual([g["name"] for g in groups], ["CM-CF"])
 
-    def test_written_export_carries_the_group_so_the_kernel_can_resolve_it(self):
+    def test_front_proxies_are_sanitised_and_deduplicated(self):
+        # A front carries no dialer of its own (a nested chain is not a
+        # topology this deployment has), and two fronts with the same display
+        # name must not collapse -- mihomo keys proxies by name, so the second
+        # gets a distinguishing suffix.
+        fronts = [{"name": "F1", "type": "vless", "server": "f", "port": 443,
+                   "uuid": "u", engine.DIALER_FIELD: "other"},
+                  {"name": "F1", "type": "vless", "server": "f2", "port": 443,
+                   "uuid": "u"}]
+        out, groups = engine._export_proxies(["A"], self.proxies(), {}, self.cfg(), "k",
+                                             chain_fronts=fronts)
+        fronts_out = [p for p in out if p["name"].startswith("[前置] ")]
+        self.assertEqual([p["name"] for p in fronts_out],
+                         ["[前置] F1", "[前置] F1 #2"])
+        self.assertNotIn(engine.DIALER_FIELD, fronts_out[0])
+
+    def test_written_export_carries_the_front_so_the_kernel_can_resolve_it(self):
         # End-to-end within the module: whatever `_write_export` writes is what
         # the client loads, so the rewrite has to survive serialisation.
         import tempfile
@@ -683,14 +814,16 @@ class DerivedDialerGroupTest(unittest.TestCase):
             original = engine.EXPORT_DIR
             engine.EXPORT_DIR = Path(d)
             try:
-                path = engine._write_export(self.cfg(), "k", ["A"], self.proxies(), {})
+                path = engine._write_export(self.cfg(), "k", ["A"], self.proxies(), {},
+                                            chain_fronts=self.fronts("HK-Alice"))
             finally:
                 engine.EXPORT_DIR = original
             data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        self.assertEqual(data["proxies"][0][engine.DIALER_FIELD], "CM-CF")
-        self.assertEqual(data["proxy-groups"][0]["name"], "CM-CF")
         names = {p["name"] for p in data["proxies"]}
-        self.assertTrue(set(data["proxy-groups"][0]["proxies"]) <= names)
+        self.assertIn("[前置] HK-Alice", names)
+        node = next(p for p in data["proxies"] if p["name"] == "node-a")
+        self.assertEqual(node[engine.DIALER_FIELD], "[前置] HK-Alice")
+        self.assertNotIn("proxy-groups", data)
 
 
 class RoundModeTest(unittest.TestCase):
@@ -4017,15 +4150,19 @@ class ChainRoundTest(unittest.TestCase):
         deployment actually hits) names nothing a client can resolve --
         `dialer-proxy [hk_b] not found`, whole file refused. Keeping the name
         was preserving the one thing that made the export unusable.
+
+        The pool's one live front is published under its `[前置] ` tag and the
+        dialer names it directly -- no group for Sub-Store to drop.
         """
         self._run()
         text = (engine.EXPORT_DIR / "air.yaml").read_text(encoding="utf-8")
         self.assertNotIn(engine.FRONT_NAME_PREFIX, text)
         doc = yaml.safe_load(text)
         dialers = {p["dialer-proxy"] for p in doc["proxies"] if "dialer-proxy" in p}
-        self.assertEqual(dialers, {"cm-xhttp"})
-        # The rewritten name has to resolve: the group is emitted alongside it.
-        self.assertEqual([g["name"] for g in doc["proxy-groups"]], ["cm-xhttp"])
+        self.assertEqual(dialers, {"[前置] edgetunnel"})
+        names = {p["name"] for p in doc["proxies"]}
+        self.assertIn("[前置] edgetunnel", names)
+        self.assertNotIn("proxy-groups", doc)
 
     def test_the_front_gets_ledger_rows_and_no_export_of_its_own(self):
         summary = self._run()
