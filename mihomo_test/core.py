@@ -624,3 +624,39 @@ class Core:
         if not fields:
             return None, "empty trace response"
         return fields, None
+
+    def fetch(self, port, url, timeout_s=15):
+        """Pull a real page through a lane's HTTP port; (status, nbytes, error).
+
+        The payload-check companion to `egress`: where `egress` reads a trace
+        endpoint, `fetch` asks for a real page so a round can tell "the chain
+        answered a 204" from "the chain carries a real TLS session". The
+        home-vantage comparison (2026-09-28) caught nodes that pass the delay
+        check and then fail every real fetch with a TLS reset -- exactly the
+        class this exists to catch, and one the client's own gstatic
+        health-check shares.
+
+        Any completed HTTP response counts: some exits see google.com 302s,
+        and a 403 still proves the TLS path delivered real traffic. What fails
+        a node is a dial error, timeout or TLS reset, which urllib surfaces as
+        an exception. Reading is capped so one check cannot turn into a
+        download.
+        """
+        port = int(port)
+        handler = urllib.request.ProxyHandler(
+            {"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"}
+        )
+        opener = urllib.request.build_opener(handler)
+        try:
+            with opener.open(url, timeout=timeout_s) as resp:
+                nbytes = 0
+                while nbytes < 262144:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    nbytes += len(chunk)
+                return int(resp.status), nbytes, None
+        except urllib.error.HTTPError as exc:
+            return int(exc.code), 0, None
+        except Exception as exc:
+            return None, 0, f"{type(exc).__name__}: {exc}"[:160]

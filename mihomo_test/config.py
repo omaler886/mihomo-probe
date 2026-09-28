@@ -268,6 +268,16 @@ DEFAULTS = {
         "exclude_countries": ["CN"],
         "max_nodes": 0,
         "timeout_s": 15,
+        # 链式真实拉流校验：延迟 204 只证明链路应答，不证明能跑真实 TLS 会话
+        # （2026-09-28 家宽视角对比实测：延迟通过的节点真实拉流 TLS 握手全断，
+        # 客户端的 gstatic health-check 有同样的盲区）。对判活的链式节点和前置
+        # 经车道各拉一次真实页面；任何完成的 HTTP 响应都算通过，拨号错误/超时/
+        # TLS 重置判 payload_fail（前置则连坐其链式变体为 front_dead）。
+        "chain_payload": {
+            "enabled": True,
+            "url": "https://www.google.com/",
+            "timeout_s": 15,
+        },
     },
     # 链式代理测活。
     #

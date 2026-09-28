@@ -305,6 +305,120 @@ class HttpsVerdictTest(unittest.TestCase):
         self.assertEqual(out["attempts"], 1)
 
 
+class ChainPayloadVerifyTest(unittest.TestCase):
+    """A 204 delay does not prove a chain carries real traffic.
+
+    The home-vantage comparison (2026-09-28) caught a chained node that
+    passed the delay check and then failed every real fetch with a TLS
+    reset -- and the client's gstatic health-check shares that blind spot,
+    so the panel showed it alive while it was unusable. The payload phase
+    pulls one real page per alive front / chained node through the lanes:
+    any completed HTTP response passes, a dial/timeout/TLS error fails, a
+    dead front drags its chains to front_dead (blame the front, not the
+    node), and a node failing under a healthy front gets payload_fail.
+    """
+
+    class _Core:
+        def __init__(self, fail_names=()):
+            self.fail_names = set(fail_names)
+            self.selected, self.fetched = [], []
+            self._current = None
+
+        def select(self, group, name):
+            self._current = name
+            self.selected.append(name)
+
+        def fetch(self, port, url, timeout_s):
+            self.fetched.append(self._current)
+            if self._current in self.fail_names:
+                return None, 0, "URLError: TLS handshake reset"
+            return 302, 372, None
+
+    def cfg(self, enabled=True):
+        return {"verify": {"chain_payload": {"enabled": enabled,
+                                             "url": "https://x.example/",
+                                             "timeout_s": 9}}}
+
+    def mapping(self):
+        front = {"source": engine.FRONT_SOURCE_KEY, "name": "F", "fp": "f" * 16,
+                 "role": "front", "mihomo": "__FRONT0__", "front": None,
+                 "proxy": {"name": "__FRONT0__"}}
+        n1 = {"source": "saki", "name": "N1", "fp": "a" * 16, "role": "chain",
+              "mihomo": "N1", "front": "__FRONT0__",
+              "proxy": {"name": "N1"}}
+        return [front, n1]
+
+    def results(self, *names):
+        return {n: {"delay_ms": 99, "reason": None, "detail": ""} for n in names}
+
+    def test_all_pass_leaves_results_alone(self):
+        core = self._Core()
+        results = self.results("__FRONT0__", "N1")
+        engine._verify_chain_payload(core, {"lanes": 1, "base_port": 19300},
+                                     self.mapping(), results, self.cfg(), _nolog)
+        self.assertEqual([r["reason"] for r in results.values()], [None, None])
+        self.assertEqual(sorted(core.fetched), ["N1", "__FRONT0__"])
+
+    def test_node_payload_failure_fails_the_node(self):
+        core = self._Core(fail_names=["N1"])
+        results = self.results("__FRONT0__", "N1")
+        engine._verify_chain_payload(core, {"lanes": 1, "base_port": 19300},
+                                     self.mapping(), results, self.cfg(), _nolog)
+        self.assertEqual(results["N1"]["reason"], "payload_fail")
+        self.assertIn("真实拉流失败", results["N1"]["detail"])
+        self.assertIsNone(results["__FRONT0__"]["reason"])
+
+    def test_dead_front_drags_its_chains_to_front_dead(self):
+        core = self._Core(fail_names=["__FRONT0__", "N1"])
+        results = self.results("__FRONT0__", "N1")
+        engine._verify_chain_payload(core, {"lanes": 1, "base_port": 19300},
+                                     self.mapping(), results, self.cfg(), _nolog)
+        self.assertEqual(results["__FRONT0__"]["reason"], engine.FRONT_DEAD_REASON)
+        self.assertEqual(results["N1"]["reason"], engine.FRONT_DEAD_REASON)
+        self.assertIn("前置真实拉流失败", results["N1"]["detail"])
+
+    def test_one_variant_per_fingerprint(self):
+        mapping = self.mapping()
+        twin = dict(mapping[1], mihomo="N1 #2")
+        core = self._Core()
+        results = self.results("__FRONT0__", "N1", "N1 #2")
+        engine._verify_chain_payload(core, {"lanes": 1, "base_port": 19300},
+                                     mapping + [twin], results, self.cfg(), _nolog)
+        self.assertEqual(sorted(core.fetched), ["N1", "__FRONT0__"])
+
+    def test_undialled_variants_are_skipped(self):
+        # chain_failed variants never get dialled, so they have no results
+        # entry at all; indexing `results` straight keyed on the mihomo name
+        # KeyError'd exactly there (caught by the ChainRoundTest front_dead
+        # path), so the phase must skip entries without an outcome.
+        mapping = self.mapping()
+        undialled = dict(mapping[1], mihomo="N0", front=None)
+        core = self._Core()
+        results = self.results("__FRONT0__", "N1")
+        engine._verify_chain_payload(core, {"lanes": 1, "base_port": 19300},
+                                     [mapping[0], undialled, mapping[1]], results,
+                                     self.cfg(), _nolog)
+        self.assertEqual(sorted(core.fetched), ["N1", "__FRONT0__"])
+
+    def test_disabled_skips_everything(self):
+        core = self._Core()
+        engine._verify_chain_payload(core, {"lanes": 1, "base_port": 19300},
+                                     self.mapping(), self.results("__FRONT0__", "N1"),
+                                     self.cfg(enabled=False), _nolog)
+        self.assertEqual(core.fetched, [])
+
+    def test_deadline_leaves_unchecked_nodes_alone(self):
+        # Fail-open: the phase is best-effort, and the checkpoint after it
+        # handles overrun. A node never pulled keeps its delay verdict.
+        core = self._Core()
+        results = self.results("__FRONT0__", "N1")
+        engine._verify_chain_payload(core, {"lanes": 1, "base_port": 19300},
+                                     self.mapping(), results, self.cfg(), _nolog,
+                                     deadline=time.monotonic() - 1)
+        self.assertEqual(core.fetched, [])
+        self.assertEqual([r["reason"] for r in results.values()], [None, None])
+
+
 class ReasonTest(unittest.TestCase):
     def test_timeout_body_maps_to_timeout(self):
         self.assertEqual(coremod._reason_from(504, '{"message":"Timeout"}')[0], "timeout")
@@ -573,8 +687,36 @@ class ExportTest(unittest.TestCase):
 
     def test_verified_exit_overrides_a_stale_tag(self):
         proxies = {"A": {"name": "[SG] node", "type": "vless", "server": "s", "port": 1}}
-        out, _ = engine._export_proxies(["A"], proxies, {"A": {"country": "JP"}}, self.cfg(tag=True), "k")
+        out, _ = engine._export_proxies(["A"], proxies, {"A": {"country": "JP"}},
+                                        self.cfg(tag=True), "k")
         self.assertEqual(out[0]["name"], "[JP] node")
+
+    def test_the_published_form_follows_the_measured_one(self):
+        """chain alive -> chained form; only-direct alive -> direct form.
+
+        Round 488 shipped a node whose chain had just failed the payload pull
+        as `dialer-proxy: [前置] ...` -- the direct twin's pass rescued the
+        display name and the chained-wins collapse dressed the node back into
+        the very chain the round had disproved.
+        """
+        proxies = {
+            "HK-01": {"name": "HK-01", "type": "vless", "server": "s", "port": 1,
+                      "uuid": "u", "dialer-proxy": "cdn"},
+            "HK-01 #2": {"name": "HK-01", "type": "vless", "server": "s", "port": 1,
+                         "uuid": "u"},
+            "cdn": {"name": "cdn", "type": "vless", "server": "f", "port": 1,
+                    "uuid": "f"},
+        }
+        names = ["HK-01", "HK-01 #2", "cdn"]
+        out, _ = engine._export_proxies(names, proxies, {}, self.cfg(), "k",
+                                        alive_forms={"HK-01": "chain"})
+        self.assertEqual(out[0].get("dialer-proxy"), "cdn")
+        out, _ = engine._export_proxies(names, proxies, {}, self.cfg(), "k",
+                                        alive_forms={"HK-01": "direct"})
+        self.assertNotIn("dialer-proxy", out[0])
+        # No form info at all keeps the chained-wins rule.
+        out, _ = engine._export_proxies(names, proxies, {}, self.cfg(), "k")
+        self.assertEqual(out[0].get("dialer-proxy"), "cdn")
 
 
 class YamlScalarQuotingTest(unittest.TestCase):
@@ -4067,6 +4209,11 @@ class ChainRoundTest(unittest.TestCase):
 
         def egress(self, port, trace_url, timeout_s=15):
             return {"loc": "US", "ip": "1.2.3.4"}, None
+
+        def fetch(self, port, url, timeout_s=15):
+            # The payload phase only queues nodes that passed the delay test,
+            # so a success here leaves every delay verdict intact.
+            return 302, 372, None
 
     def _cfg(self):
         return {

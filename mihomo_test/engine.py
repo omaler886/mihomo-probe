@@ -1255,6 +1255,12 @@ def _run_round(cfg, trigger, only_source, log, mode=None):
         except Exception as exc:  # noqa: BLE001 - an alert must never fail a round
             log("error", f"告警发送失败（不影响本轮结果）: {type(exc).__name__}: {exc}")
 
+    _checkpoint(deadline, "delay-test", round_id)
+    # Real-payload verification before the survivor list is built: a node that
+    # answered the 204 but cannot carry a real TLS session must not be
+    # egress-verified or published as alive.
+    _verify_chain_payload(core, core_cfg, mapping, results, cfg, log, deadline=deadline)
+
     survivors = [name for name, outcome in results.items() if outcome["reason"] is None]
     log("info", f"存活 {len(survivors)}/{len(mapping)}，开始出口验证")
 
@@ -1576,6 +1582,117 @@ def _verify_egress(core, core_cfg, survivors, verify_cfg, log, deadline=None):
     return out, unverified, over_limit
 
 
+def _verify_chain_payload(core, core_cfg, mapping, results, cfg, log, deadline=None):
+    """Real-fetch verification for alive fronts and chained nodes.
+
+    A 204 delay test proves the chain dialled and answered -- it does not
+    prove the path carries a real TLS session. The home-vantage comparison
+    (2026-09-28) caught a chained node that passed the delay check and then
+    failed every real fetch with a TLS reset, and the client's own gstatic
+    health-check shares that blind spot, so the panel kept showing it alive
+    while it was unusable. One real page pull per node through the lanes
+    catches the class.
+
+    Any completed HTTP response passes (`core.fetch`); dial errors, timeouts
+    and TLS resets fail:
+
+    * a front that fails the pull fails with `front_dead` -- and every chained
+      variant dialling through it fails with the same reason, so the panel
+      blames the front rather than the nodes (the rule FRONT_DEAD_REASON's
+      own docstring states);
+    * a chained node whose front is fine fails with `payload_fail` -- a
+      non-terminal reason, so the convergence policy treats an intermittent
+      node exactly like any other flapper instead of executing it on one
+      strike.
+
+    One variant per fingerprint is pulled: the per-fingerprint fold already
+    rules "any front carried it", so testing one variant per node is the same
+    statement at payload granularity, and the pool is small by construction.
+    Best-effort at the deadline: entries never reached keep their delay
+    verdict, and the checkpoint after this call handles overrun.
+
+    Config: `verify.chain_payload` -- `{enabled, url, timeout_s}`; disabled
+    with `enabled: false`.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    vc = (cfg.get("verify") or {}).get("chain_payload") or {}
+    if vc.get("enabled") is False:
+        return
+    url = str(vc.get("url") or "https://www.google.com/")
+    timeout_s = int(vc.get("timeout_s", 15))
+    # `mapping` holds every prepared entry, but `results` only the dialled
+    # ones: chain_failed variants (no live front) and other never-dialled
+    # entries have no outcome to verify, so `results.get` is load-bearing --
+    # indexing straight into `results` KeyError'd exactly there.
+    fronts = [m for m in mapping
+              if m.get("role") == "front"
+              and (results.get(m["mihomo"]) or {}).get("reason") is None]
+    chains, seen = [], set()
+    for m in mapping:
+        outcome = results.get(m["mihomo"])
+        if (m.get("role") == "chain" and outcome is not None
+                and outcome["reason"] is None
+                and (m["source"], m["fp"]) not in seen):
+            seen.add((m["source"], m["fp"]))
+            chains.append(m)
+    if not fronts and not chains:
+        return
+
+    lanes = coremod.lane_count(core_cfg)
+    ports = coremod.lane_ports(core_cfg, lanes)
+    queue = fronts + chains
+    failures, lock, progress = {}, threading.Lock(), [0]
+
+    def run_lane(index):
+        lane_out = {}
+        group, port = coremod.lane_group(index), ports[index]
+        for m in queue[index::lanes]:
+            if deadline is not None and time.monotonic() > deadline:
+                break
+            try:
+                core.select(group, m["mihomo"])
+            except coremod.CoreError as exc:
+                lane_out[m["mihomo"]] = str(exc)[:120]
+                continue
+            _status, _nbytes, error = core.fetch(port, url, timeout_s)
+            if error:
+                lane_out[m["mihomo"]] = error
+            with lock:
+                progress[0] += 1
+        return lane_out
+
+    with ThreadPoolExecutor(max_workers=lanes) as pool:
+        for lane_out in pool.map(run_lane, range(lanes)):
+            failures.update(lane_out)
+
+    if not failures:
+        log("info", f"链式真实拉流校验: {len(queue)}/{len(queue)} 通过")
+        return
+    dead_fronts = {m["mihomo"] for m in fronts if m["mihomo"] in failures}
+    n_front = n_node = 0
+    for m in queue:
+        error = failures.get(m["mihomo"])
+        if error is None:
+            continue
+        if m.get("role") == "front":
+            results[m["mihomo"]] = {**results[m["mihomo"]],
+                                    "reason": FRONT_DEAD_REASON,
+                                    "detail": f"真实拉流失败: {error}"}
+            n_front += 1
+        elif m.get("front") in dead_fronts:
+            results[m["mihomo"]] = {**results[m["mihomo"]],
+                                    "reason": FRONT_DEAD_REASON,
+                                    "detail": f"前置真实拉流失败（延迟已过，不怪节点）: {error}"}
+        else:
+            results[m["mihomo"]] = {**results[m["mihomo"]],
+                                    "reason": "payload_fail",
+                                    "detail": f"延迟通过但真实拉流失败: {error}"}
+            n_node += 1
+    log("warn", f"链式真实拉流校验: {len(queue) - n_front - n_node}/{len(queue)} 通过，"
+                f"{n_front} 个前置、{n_node} 个链式节点判失败")
+
+
 def group_by_fingerprint(results, by_name):
     """Fold aliases of one endpoint into a single bucket.
 
@@ -1652,7 +1769,11 @@ def _converge_bucket(cfg, round_id, bucket, proxy_by_name, countries, excluded,
                      domain_pass, log):
     """Converge every alias of one endpoint and write the round's result rows.
 
-    Returns ("drop" | "restore" | None, [alive primary names]).
+    Returns ("drop" | "restore" | None, [alive primary names], alive category).
+    The category is the bucket's own -- `chain` or `direct` -- and is None on
+    a failed bucket: the export uses it to publish the form that actually
+    passed (a chained node whose chain failed the round but whose direct twin
+    passed must go out direct, not as a chain the round just disproved).
     """
     entry = bucket["entry"]
     source, fingerprint = entry["source"], entry["fp"]
@@ -1689,7 +1810,7 @@ def _converge_bucket(cfg, round_id, bucket, proxy_by_name, countries, excluded,
                      "ok" if ok else "fail", delay, reason, country,
                      max(o["attempts"] for o in bucket["outcomes"]), detail[:200],
                      category=category)
-    return transition, ([primary] if ok else [])
+    return transition, ([primary] if ok else []), (category if ok else None)
 
 
 REJECTED_REASON = "kernel_rejected"
@@ -1908,12 +2029,14 @@ def _read_front_state(log=None):
 
 
 def _publish_sources(cfg, store, sources, alive_by_source, proxy_by_name, countries, log,
-                     chain_fronts=None):
+                     chain_fronts=None, alive_forms=None):
     """Write each source's export file, and optionally upsert into Sub-Store.
 
     `chain_fronts` is the round's live front proxies: `[]` when the round
     tested fronts and none survived, `None` when this round tested no fronts
     at all -- then the last recorded pool from `_write_front_state` stands in.
+    `alive_forms` maps source -> display -> which measured form ("chain" or
+    "direct") earned the node its alive verdict this round.
     """
     if not cfg["publish"].get("enabled", True):
         return False
@@ -1927,7 +2050,7 @@ def _publish_sources(cfg, store, sources, alive_by_source, proxy_by_name, countr
         if key not in keys:
             continue
         _write_export(cfg, key, alive_by_source.get(key, []), proxy_by_name, countries,
-                      chain_fronts=chain_fronts)
+                      chain_fronts=chain_fronts, alive_forms=(alive_forms or {}).get(key))
     if cfg["publish"].get("push_to_substore"):
         push_exports(cfg, store, [s["key"] for s in sources if s["key"] in keys], log)
     return True
@@ -1953,11 +2076,12 @@ def _apply_and_publish(cfg, round_id, store, by_name, proxies, results, countrie
     domain_pass = str(cfg.get("verify", {}).get("domain_pass", "any")).lower()
     proxy_by_name = _index_original_proxies(by_name, proxies)
     alive_by_source = {}
+    alive_forms = {}
     dropped = restored = new_alive = 0
     previous_alive = _previous_alive_count()
 
     for bucket in group_by_fingerprint(results, by_name).values():
-        transition, alive_names = _converge_bucket(
+        transition, alive_names, alive_cat = _converge_bucket(
             cfg, round_id, bucket, proxy_by_name, countries, excluded, domain_pass, log)
         if transition == "drop":
             dropped += 1
@@ -1966,7 +2090,19 @@ def _apply_and_publish(cfg, round_id, store, by_name, proxies, results, countrie
         elif transition == "new":
             new_alive += 1
         if alive_names:
-            alive_by_source.setdefault(bucket["entry"]["source"], []).extend(alive_names)
+            src = bucket["entry"]["source"]
+            alive_by_source.setdefault(src, []).extend(alive_names)
+            # The form that gets published follows the measurement: a chain
+            # verdict outranks the direct twin (the export speaks the source's
+            # configured form), but a node whose chain failed while its direct
+            # twin passed must go out direct -- shipping the chained form would
+            # publish a dialer the round just disproved.
+            forms = alive_forms.setdefault(src, {})
+            display = bucket["entry"]["original"]
+            if alive_cat == CAT_CHAIN:
+                forms[display] = "chain"
+            else:
+                forms.setdefault(display, "direct")
 
     excluded_by_source, excluded_fps = _record_excluded_nodes(round_id, excluded_entries)
     _, chain_fps = _record_chain_failures(cfg, round_id, chain_failed_entries, log)
@@ -2032,7 +2168,7 @@ def _apply_and_publish(cfg, round_id, store, by_name, proxies, results, countrie
                        if (results.get(f["proxy"]["name"]) or {}).get("reason") is None]
         if not _publish_sources(cfg, store, sources, alive_by_source,
                                 proxy_by_name, countries, log,
-                                chain_fronts=live_fronts):
+                                chain_fronts=live_fronts, alive_forms=alive_forms):
             note = note or "publish disabled"
 
     return {"total": total, "alive": alive, "dropped": dropped, "restored": restored,
@@ -2152,7 +2288,8 @@ def _resolve_chain_dialers(cfg, out, chain_fronts):
     return out + fronts, groups
 
 
-def _export_proxies(names, proxy_by_name, countries, cfg, key, chain_fronts=()):
+def _export_proxies(names, proxy_by_name, countries, cfg, key, chain_fronts=(),
+                    alive_forms=None):
     """Build the published list, collapsing repeats of the same endpoint.
 
     Upstream lists sometimes carry one server under two names (an "IPv6"
@@ -2168,16 +2305,31 @@ def _export_proxies(names, proxy_by_name, countries, cfg, key, chain_fronts=()):
     for the source's *configured* form, so the chained variant wins: the direct
     one exists to tell the panel whether the node also works on its own.
 
+    With one exception, measured on 2026-09-28: a chained node whose chain
+    failed the round (payload_fail -- the 204 answered but a real page pull
+    hit a TLS reset) while its direct twin passed still landed in the export
+    as the chained form, i.e. published wearing the exact dialer the round
+    had just disproved. So the form follows the measurement: `alive_forms`
+    (source -> display -> "chain" | "direct", see `_apply_and_publish`) says
+    which form earned the alive verdict, and only a chain verdict publishes
+    the chained shape. No form info at all keeps the old chained-wins rule.
+
     `chain_fronts` carries the round's live front proxies (see
     `_publish_sources`); the chained dialers and the front publishing are
     resolved by `_resolve_chain_dialers`.
     """
+    forms = alive_forms or {}
     best = {}
     for name in names:
         proxy = proxy_by_name[name]
         display = str(proxy.get("name") or "")
         cur = best.get(display)
-        if cur is None or (proxy.get(DIALER_FIELD) and not cur[1].get(DIALER_FIELD)):
+        if cur is None:
+            best[display] = (name, proxy)
+            continue
+        chained = bool(proxy.get(DIALER_FIELD))
+        cur_chained = bool(cur[1].get(DIALER_FIELD))
+        if chained != cur_chained and chained == (forms.get(display) != "direct"):
             best[display] = (name, proxy)
     out, seen = [], {}
     tag = cfg["publish"].get("add_region_tag", True)
@@ -2242,10 +2394,12 @@ def _represent_str(dumper, value):
 _ExportDumper.add_representer(str, _represent_str)
 
 
-def _write_export(cfg, key, names, proxy_by_name, countries, chain_fronts=()):
+def _write_export(cfg, key, names, proxy_by_name, countries, chain_fronts=(),
+                  alive_forms=None):
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     proxies, groups = _export_proxies(names, proxy_by_name, countries, cfg, key,
-                                      chain_fronts=chain_fronts)
+                                      chain_fronts=chain_fronts,
+                                      alive_forms=alive_forms)
     payload = {"proxies": proxies}
     if groups:
         payload["proxy-groups"] = groups
