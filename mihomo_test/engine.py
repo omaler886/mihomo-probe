@@ -811,7 +811,8 @@ def _measure_flags(source_key, source_flags):
     return bool(direct), bool(chain)
 
 
-def expand_chains(entries, front_names, source_flags=None, fail_without_front=False):
+def expand_chains(entries, front_names, source_flags=None, fail_without_front=False,
+                  plain_too=False):
     """Give every chained node one test variant per front.
 
     `source_flags` maps a source key to its (direct, chain) switches; see
@@ -847,13 +848,23 @@ def expand_chains(entries, front_names, source_flags=None, fail_without_front=Fa
       documents as "reports a node as alive on a path its owner never uses".
       It is emitted with `role="chain"` and `front=None` so `_test_phases`
       routes it into `chain_failed` without dialling it.
+
+    `plain_too` extends all of the above to nodes the upstream ships *without*
+    a `dialer-proxy`: each gets front variants (carrying the pool's dialer, so
+    the export can publish the chained form) and -- deliberately -- no direct
+    twin, because the mode exists to make the ledger's verdict the *client's*
+    verdict. See the in-loop comment for the measurement that motivated it.
     """
     if not front_names and not (source_flags is not None and fail_without_front):
         return entries, 0
     out, chained = [], 0
     for entry in entries:
         proxy = entry["proxy"]
-        if DIALER_FIELD not in proxy or entry.get("role") == "front":
+        plain = DIALER_FIELD not in proxy
+        if entry.get("role") == "front":
+            out.append(entry)
+            continue
+        if plain and not plain_too:
             out.append(entry)
             continue
         # A node from a relay-flagged source is a *front*, not a passenger: it
@@ -868,6 +879,23 @@ def expand_chains(entries, front_names, source_flags=None, fail_without_front=Fa
             out.append(entry)
             continue
         direct, chain = _measure_flags(entry["source"], source_flags)
+        if plain:
+            # Client-path mode (`plain_too`): a node the upstream ships without
+            # a dialer is measured exactly the way the consuming client uses it
+            # -- dialled through the front pool. Measured on 2026-09-29, 24 of
+            # 155 probe-alive nodes were dead through exactly that path while
+            # their direct dial from the vantage succeeded, because the client
+            # (the `air` collection) forces every node behind a CDN front the
+            # probe's direct dial never traverses. No direct twin is emitted on
+            # purpose: the ledger verdict for this node IS the client's verdict,
+            # so a node that only answers as its own server does not get
+            # rescued into the export by its direct twin and shipped wearing a
+            # chain that failed. A source with its `chain` switch off keeps the
+            # old direct-only measurement.
+            if not chain:
+                out.append(entry)
+                continue
+            direct = False
         if chain:
             chained += 1
             if not front_names:
@@ -1156,6 +1184,13 @@ def _run_round(cfg, trigger, only_source, log, mode=None):
     direct_only = sorted(k for k, (d, c) in (source_flags or {}).items() if d and not c)
     if direct_only:
         log("info", "仅按直连测的来源：" + "、".join(direct_only))
+    # Client-path mode: plain nodes (no upstream dialer) are measured through
+    # the front pool too, because that is the path the consuming client forces
+    # on them. Inert without chaining -- say so rather than silently ignoring
+    # the switch.
+    plain_too = bool((cfg.get("chain") or {}).get("test_plain_nodes"))
+    if plain_too and not chain_configured:
+        log("warn", "chain.test_plain_nodes 已开启但链式未生效，普通节点本轮仍按直连测")
     # `fail_without_front` is set only when this round *is* a chain round. An
     # empty pool there is a failure to report (`front_dead`), not an
     # invitation to measure the chained nodes direct: the kernel would strip
@@ -1165,11 +1200,13 @@ def _run_round(cfg, trigger, only_source, log, mode=None):
     # a round with chaining off reach this call with an empty pool on purpose,
     # so they keep the fall-through-to-direct behaviour they log before here.
     test_entries, chained = expand_chains(test_entries, front_names, source_flags,
-                                          fail_without_front=chained_round)
+                                          fail_without_front=chained_round,
+                                          plain_too=plain_too)
     if chained:
         if front_names:
-            log("info", f"{chained} 个节点带 {DIALER_FIELD}，每个展开为 "
-                        f"{len(front_names)} 条链式变体（共 {chained * len(front_names)} 条）")
+            log("info", f"{chained} 个节点展开为链式变体，每个前置一条 "
+                        f"（共 {chained * len(front_names)} 条）"
+                        + ("，含全节点链式模式" if plain_too else ""))
         else:
             log("warn", f"{chained} 个链式节点没有可用前置，本轮不拨号，"
                         f"全部按 {FRONT_DEAD_REASON} 判失败")

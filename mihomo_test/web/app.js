@@ -1137,6 +1137,7 @@ function renderSettings(cfg) {
     <label>链式代理测活<select id="s-chain"><option value="1"${(cfg.chain || {}).enabled ? " selected" : ""}>开启</option><option value="0"${(cfg.chain || {}).enabled ? "" : " selected"}>关闭</option></select></label>
     <label>前置来源（kind/名称，如 sub/cm-xhttp）<input id="s-chain-front" value="${esc((((cfg.chain || {}).front_source) || {}).kind || "sub")}/${esc((((cfg.chain || {}).front_source) || {}).name || "")}" placeholder="sub/cm-xhttp"></label>
     <label>前置池上限<input id="s-chain-max" type="number" value="${((cfg.chain || {}).max_fronts) || 8}"></label>
+    <label class="inline" style="grid-column:1/-1" title="上游不带 dialer-proxy 的普通节点也经前置池测链式变体，账本判活口径=客户端真实口径（客户端把所有节点挂在 CDN 前置后时开启）。直连信息退位；首轮存活数可能下跌触发护栏，属预期。需先开启链式。"><input type="checkbox" id="s-chain-plain"${(cfg.chain || {}).test_plain_nodes ? " checked" : ""}> 全节点过前置链测（按客户端真实路径判活）</label>
     <div style="grid-column:1/-1">
       <div class="row">
         <button id="btn-front-pick">从来源里挑前置节点</button>
@@ -1260,6 +1261,7 @@ async function saveSettings() {
         enabled: val("s-chain") === "1", max_fronts: +val("s-chain-max"),
         front_source: { kind: (kind === "collection" ? "collection" : "sub"), name },
         front_pick: [...FRONT_PICK], front_text: val("s-chain-text"),
+        test_plain_nodes: document.getElementById("s-chain-plain").checked,
       };
     })(),
     publish: { push_to_substore: val("s-push") === "1" },

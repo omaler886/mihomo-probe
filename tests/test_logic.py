@@ -3397,6 +3397,60 @@ class ChainTest(unittest.TestCase):
         self.assertEqual(chained, 0)
         self.assertEqual(out, [plain, front])
 
+    # ------------------------------------------- 全节点链式（客户端路径）模式
+
+    def test_plain_nodes_get_front_variants_in_client_path_mode(self):
+        """plain_too: a dialer-less node is measured the way the client uses it.
+
+        The consuming collection forces every node behind a CDN front, and the
+        direct dial from the vantage says nothing about that path (measured
+        2026-09-29: 24 of 155 direct-alive nodes dead through the chain). The
+        variant carries the pool's dialer so the export can publish the chained
+        form, and the fingerprint stays the node's own -- the ledger verdict
+        for this node IS the client's verdict.
+        """
+        plain = self._node(dialer=None)
+        out, chained = engine.expand_chains([plain], ["__FRONT0__"],
+                                            {"air": (True, True)}, plain_too=True)
+        self.assertEqual(chained, 1)
+        self.assertEqual(len(out), 1)
+        e = out[0]
+        self.assertEqual(e["role"], "chain")
+        self.assertEqual(e["front"], "__FRONT0__")
+        self.assertEqual(e["proxy"]["dialer-proxy"], "__FRONT0__")
+        self.assertEqual(e["category"], engine.CAT_CHAIN)
+        # No direct twin, and the node's own identity: the ledger row IS the
+        # client's verdict, and a direct pass must not rescue a chain failure.
+        self.assertEqual(e["fp"], "a" * 16)
+
+    def test_client_path_mode_respects_the_source_chain_switch(self):
+        plain = self._node(dialer=None)
+        out, chained = engine.expand_chains([plain], ["__FRONT0__"],
+                                            {"air": (True, False)}, plain_too=True)
+        self.assertEqual(chained, 0)
+        self.assertEqual(out, [plain])
+
+    def test_client_path_mode_never_expands_fronts_or_relays(self):
+        front = {"source": engine.FRONT_SOURCE_KEY, "name": "F", "index": 0,
+                 "fp": "f" * 16, "role": "front",
+                 "proxy": {"name": "__FRONT0__", "type": "vless", "server": "f",
+                           "port": 443}}
+        relay = self._node(name="R", dialer=None)
+        relay["category"] = engine.CAT_RELAY
+        out, chained = engine.expand_chains([front, relay], ["__FRONT0__"],
+                                            {"air": (True, True)}, plain_too=True)
+        self.assertEqual(chained, 0)
+        self.assertEqual(out, [front, relay])
+
+    def test_client_path_mode_front_dead_when_the_pool_is_empty(self):
+        plain = self._node(dialer=None)
+        out, chained = engine.expand_chains([plain], [], {"air": (True, True)},
+                                            fail_without_front=True, plain_too=True)
+        self.assertEqual(chained, 1)
+        self.assertEqual(out[0]["role"], "chain")
+        self.assertIsNone(out[0]["front"])
+        self.assertEqual(out[0]["category"], engine.CAT_CHAIN)
+
     # ------------------------------------------- per-source 直连/链式 switches
 
     def test_measure_flags_without_a_policy_keeps_the_old_behaviour(self):
