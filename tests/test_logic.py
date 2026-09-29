@@ -495,6 +495,58 @@ class DelayClassificationTest(unittest.TestCase):
             self.assertEqual(reason, "bad_delay")
 
 
+class ReloadFallbackTest(unittest.TestCase):
+    """A hung kernel reload must degrade to the recreate path, not kill the round.
+
+    `start_and_load` learns "reload failed" only from a False return. The PUT
+    ran unguarded on `_req`'s 20s default, so a controller whose event loop
+    stayed busy past 20s raised CoreError("TimeoutError: timed out") through
+    the round's top-level handler as 轮次执行异常 and threw the whole round
+    away -- twice on 2026-09-29 -- when restarting the kernel and carrying on
+    was the designed fallback one return-False away.
+    """
+
+    def _core(self):
+        return coremod.Core(
+            {"api": "http://127.0.0.1:1",
+             "container_config_path": "/root/.config/mihomo/config.yaml"}, "")
+
+    def test_a_hung_reload_is_a_false_not_a_raise(self):
+        def boom(*_a, **_k):
+            raise coremod.CoreError("TimeoutError: timed out")
+
+        with unittest.mock.patch.object(coremod, "_req", boom):
+            self.assertFalse(self._core().reload())
+
+    def test_reload_gets_its_own_longer_timeout(self):
+        seen = {}
+
+        def fake(method, url, secret, payload=None, timeout=20):
+            seen["timeout"] = timeout
+            return 204, ""
+
+        with unittest.mock.patch.object(coremod, "_req", fake):
+            self.assertTrue(self._core().reload())
+        self.assertEqual(seen["timeout"], coremod.RELOAD_TIMEOUT_S)
+
+    def test_start_and_load_restarts_when_the_reload_hangs(self):
+        core = self._core()
+        recreates = []
+
+        def boom(*_a, **_k):
+            raise coremod.CoreError("TimeoutError: timed out")
+
+        with unittest.mock.patch.object(coremod.Core, "_alive", lambda self: True), \
+                unittest.mock.patch.object(
+                    coremod.Core, "up",
+                    lambda self, recreate=False: recreates.append(recreate)), \
+                unittest.mock.patch.object(
+                    coremod.Core, "wait_ready", lambda self, timeout_s=45: True), \
+                unittest.mock.patch.object(coremod, "_req", boom):
+            self.assertEqual(core.start_and_load(), "restarted")
+        self.assertEqual(recreates, [True])
+
+
 class PrepareTest(unittest.TestCase):
     def entries(self, proxies):
         return [{"source": "s", "name": p["name"], "proxy": p, "index": i}

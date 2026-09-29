@@ -25,6 +25,12 @@ from . import config as cfgmod
 DROP_FIELDS = ("dialer-proxy", "interface-name", "routing-mark")
 REQUIRED = ("name", "type", "server", "port")
 
+# A force-reload makes the kernel re-read the whole config, and with a few
+# hundred proxies its event loop can stay busy well past `_req`'s 20s default.
+# 40s sits just under `wait_ready`'s 45s window -- the codebase's existing
+# answer to "how long may a kernel take to come back".
+RELOAD_TIMEOUT_S = 40
+
 
 def parse_port(url, default):
     """Return the port from an API URL like http://127.0.0.1:19190."""
@@ -511,11 +517,24 @@ class Core:
         return (proc.stdout or "") + (proc.stderr or "")
 
     def reload(self):
-        """Ask the kernel to re-read the config file; restart if it refuses."""
-        status, body = _req(
-            "PUT", f"{self.api}/configs?force=true", self.secret,
-            {"path": self.cfg["container_config_path"]},
-        )
+        """Ask the kernel to re-read the config file; restart if it refuses.
+
+        Every failure -- a hung controller included -- is a False, so
+        `start_and_load` takes its recreate+wait_ready fallback. The PUT used
+        to run unguarded on `_req`'s 20s default: a controller whose event
+        loop stayed busy past 20s raised CoreError("TimeoutError: timed out")
+        through the round's top-level handler as 轮次执行异常 and threw the
+        whole round away (twice on 2026-09-29) when restarting the kernel and
+        carrying on was the designed fallback one return-False away.
+        """
+        try:
+            status, _body = _req(
+                "PUT", f"{self.api}/configs?force=true", self.secret,
+                {"path": self.cfg["container_config_path"]},
+                timeout=RELOAD_TIMEOUT_S,
+            )
+        except CoreError:
+            return False
         if status in (200, 204):
             return True
         self.up()
