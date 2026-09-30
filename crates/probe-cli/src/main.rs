@@ -2,27 +2,34 @@
 //!
 //! Subcommands mirror the Python module's shape (`python3 -m mihomo_test
 //! serve|round|status`) so the shadow run can drive both implementations with
-//! the same muscle memory:
+//! the same muscle memory, plus the migration tooling GLM_5.3_Flash §18
+//! requires:
 //!
 //!     probe-cli --root <dir> status
 //!     probe-cli --root <dir> round
 //!     probe-cli --root <dir> serve --host 127.0.0.1 --port 8088
+//!     probe-cli --root <dir> db check | verify | backup [--out P]
+//!     probe-cli --root <dir> db migrate          # backup -> apply -> verify
+//!     probe-cli --root <dir> db rollback --from P [--yes]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use probe_api::AppState;
 use probe_config::Config;
 use probe_mihomo::Controller;
-use probe_storage::Storage;
+use probe_storage::{migrations, Storage};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut root: Option<PathBuf> = None;
-    let mut command: Option<String> = None;
+    let mut positionals: Vec<String> = Vec::new();
     let mut host = "127.0.0.1".to_string();
     let mut port: u16 = 8088;
     let mut trigger = "cli".to_string();
+    let mut from: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut assume_yes = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -42,9 +49,16 @@ fn main() {
                 i += 1;
                 trigger = args.get(i).cloned().unwrap_or(trigger);
             }
-            other if command.is_none() && !other.starts_with("--") => {
-                command = Some(other.to_string());
+            "--from" => {
+                i += 1;
+                from = args.get(i).map(PathBuf::from);
             }
+            "--out" => {
+                i += 1;
+                out = args.get(i).map(PathBuf::from);
+            }
+            "--yes" => assume_yes = true,
+            other if !other.starts_with("--") => positionals.push(other.to_string()),
             other => {
                 eprintln!("unknown argument: {other}");
                 std::process::exit(2);
@@ -54,10 +68,18 @@ fn main() {
     }
 
     let root = probe_config::resolve_root(root.as_deref());
-    let command = command.unwrap_or_else(|| "serve".into());
+    let command = positionals
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "serve".into());
     match command.as_str() {
         "status" => cmd_status(&root),
         "round" => cmd_round(&root, &trigger),
+        "db" => {
+            let sub = positionals.get(1).map(String::as_str).unwrap_or("");
+            let code = cmd_db(&root, sub, from.as_deref(), out.as_deref(), assume_yes);
+            std::process::exit(code);
+        }
         "serve" => {
             if let Err(err) = run_async(async move { cmd_serve(&root, &host, port).await }) {
                 eprintln!("serve failed: {err}");
@@ -65,13 +87,13 @@ fn main() {
             }
         }
         other => {
-            eprintln!("unknown command: {other} (expected serve | round | status)");
+            eprintln!("unknown command: {other} (expected serve | round | status | db)");
             std::process::exit(2);
         }
     }
 }
 
-fn load(root: &std::path::Path) -> Config {
+fn load(root: &Path) -> Config {
     match Config::load(&root.join("data").join("config.json")) {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -81,9 +103,16 @@ fn load(root: &std::path::Path) -> Config {
     }
 }
 
-fn cmd_status(root: &std::path::Path) {
-    let cfg = load(root);
-    let storage = Storage::open(&root.join("data").join("state.db")).expect("open ledger");
+fn db_path(root: &Path) -> PathBuf {
+    root.join("data").join("state.db")
+}
+
+fn cmd_status(root: &Path) {
+    let _cfg = load(root);
+    let storage = Storage::open_without_migrating(&db_path(root)).unwrap_or_else(|err| {
+        eprintln!("open ledger failed: {err}");
+        std::process::exit(1);
+    });
     let last = storage.last_round().expect("query");
     match last {
         Some(round) => println!(
@@ -92,12 +121,11 @@ fn cmd_status(root: &std::path::Path) {
         ),
         None => println!("no rounds recorded yet"),
     }
-    let _ = &cfg;
 }
 
-fn cmd_round(root: &std::path::Path, trigger: &str) {
+fn cmd_round(root: &Path, trigger: &str) {
     let cfg = load(root);
-    let storage = Storage::open(&root.join("data").join("state.db")).expect("open ledger");
+    let storage = Storage::open(&db_path(root)).expect("open ledger");
     let secret = Config::core_secret(&root.join("data")).expect("core secret");
     let round_id = storage.start_round(trigger, None).expect("start round");
     // Slice scope: generate the kernel config the round would load, then try
@@ -133,10 +161,212 @@ fn cmd_round(root: &std::path::Path, trigger: &str) {
     println!("round {round_id}: {note}");
 }
 
-async fn cmd_serve(root: &std::path::Path, host: &str, port: u16) -> std::io::Result<()> {
+/// `db` subcommands. Returns the process exit code.
+fn cmd_db(
+    root: &Path,
+    subcommand: &str,
+    from: Option<&Path>,
+    out: Option<&Path>,
+    assume_yes: bool,
+) -> i32 {
+    match subcommand {
+        "check" => db_check(root),
+        "migrate" => db_migrate(root),
+        "verify" => db_verify(root),
+        "backup" => db_backup(root, out),
+        "rollback" => db_rollback(root, from, assume_yes),
+        other => {
+            eprintln!("unknown db subcommand: {other:?} (expected check | migrate | verify | backup | rollback)");
+            2
+        }
+    }
+}
+
+fn stamp() -> String {
+    // Python `_backup` style: state.db.bak-YYYYmmdd-HHMMSS (UTC).
+    let fmt = time::macros::format_description!("[year][month][day]-[hour][minute][second]");
+    time::OffsetDateTime::now_utc()
+        .format(&fmt)
+        .unwrap_or_else(|_| "unknown".into())
+}
+
+fn db_check(root: &Path) -> i32 {
+    let path = db_path(root);
+    if !path.exists() {
+        println!("no database at {}", path.display());
+        return 1;
+    }
+    let storage = match Storage::open_without_migrating(&path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            eprintln!("open failed: {err}");
+            return 1;
+        }
+    };
+    let done = storage.applied_migrations().unwrap_or_default();
+    let pending = migrations::LATEST_VERSION - done.len() as i64;
+    println!("applied {} migration(s), {pending} pending", done.len());
+    for (version, name, at) in &done {
+        println!("  {version} {name} @ {at}");
+    }
+    match storage.integrity_check() {
+        Ok(what) => println!("integrity_check: {what}"),
+        Err(err) => {
+            eprintln!("integrity_check failed: {err}");
+            return 1;
+        }
+    }
+    match storage.table_counts() {
+        Ok(counts) => {
+            for (table, count) in counts {
+                println!("  {table}: {count}");
+            }
+        }
+        Err(err) => println!("required tables missing (run `db migrate`): {err}"),
+    }
+    0
+}
+
+fn db_migrate(root: &Path) -> i32 {
+    let path = db_path(root);
+    if !path.exists() {
+        println!("no database at {} yet; creating it", path.display());
+    } else {
+        // A migration that destroys data must not exist; this backup is the
+        // belt to the migrations' braces (GLM_5.3_Flash §11).
+        let storage = match Storage::open_without_migrating(&path) {
+            Ok(storage) => storage,
+            Err(err) => {
+                eprintln!("pre-migration open failed: {err}");
+                return 1;
+            }
+        };
+        let backup_path = path.with_file_name(format!("state.db.bak-{}", stamp()));
+        if let Err(err) = storage.backup_to(&backup_path) {
+            eprintln!("pre-migration backup failed: {err}");
+            return 1;
+        }
+        println!("backup written: {}", backup_path.display());
+    }
+    let storage = match Storage::open(&path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            eprintln!("migrate failed: {err}");
+            return 1;
+        }
+    };
+    let applied = storage.applied_migrations().unwrap_or_default();
+    println!("schema at {} migration(s) applied", applied.len());
+    db_verify_inner(&storage)
+}
+
+fn db_verify(root: &Path) -> i32 {
+    let storage = match Storage::open_without_migrating(&db_path(root)) {
+        Ok(storage) => storage,
+        Err(err) => {
+            eprintln!("open failed: {err}");
+            return 1;
+        }
+    };
+    db_verify_inner(&storage)
+}
+
+fn db_verify_inner(storage: &Storage) -> i32 {
+    match storage.integrity_check() {
+        Ok(what) if what == "ok" => println!("integrity_check: ok"),
+        Ok(what) => {
+            eprintln!("integrity_check: {what}");
+            return 1;
+        }
+        Err(err) => {
+            eprintln!("integrity_check failed: {err}");
+            return 1;
+        }
+    }
+    match storage.table_counts() {
+        Ok(counts) => {
+            for (table, count) in counts {
+                println!("  {table}: {count}");
+            }
+            0
+        }
+        Err(err) => {
+            eprintln!("required tables missing: {err}");
+            1
+        }
+    }
+}
+
+fn db_backup(root: &Path, out: Option<&Path>) -> i32 {
+    let path = db_path(root);
+    if !path.exists() {
+        eprintln!("no database at {}", path.display());
+        return 1;
+    }
+    let storage = match Storage::open_without_migrating(&path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            eprintln!("open failed: {err}");
+            return 1;
+        }
+    };
+    let target = match out {
+        Some(explicit) => explicit.to_path_buf(),
+        None => path.with_file_name(format!("state.db.bak-{}", stamp())),
+    };
+    match storage.backup_to(&target) {
+        Ok(()) => {
+            println!("backup written: {}", target.display());
+            0
+        }
+        Err(err) => {
+            eprintln!("backup failed: {err}");
+            1
+        }
+    }
+}
+
+fn db_rollback(root: &Path, from: Option<&Path>, assume_yes: bool) -> i32 {
+    let Some(from) = from else {
+        eprintln!("rollback needs --from <backup file>");
+        return 2;
+    };
+    let path = db_path(root);
+    if !from.exists() {
+        eprintln!("backup not found: {}", from.display());
+        return 1;
+    }
+    // Restoring the main file under a live WAL corrupts the database: the
+    // WAL belongs to the *current* file's writer, not to the snapshot. A
+    // -wal on disk means a writer may still be attached.
+    let wal = path.with_file_name("state.db-wal");
+    if wal.exists() {
+        eprintln!(
+            "refusing: {} exists -- a writer may be attached. Stop the service, then retry.",
+            wal.display()
+        );
+        return 1;
+    }
+    if !assume_yes {
+        eprintln!(
+            "this replaces {} with {} (loses everything since the backup). Re-run with --yes.",
+            path.display(),
+            from.display()
+        );
+        return 2;
+    }
+    if let Err(err) = std::fs::copy(from, &path) {
+        eprintln!("rollback failed: {err}");
+        return 1;
+    }
+    println!("rolled back {} <- {}", path.display(), from.display());
+    db_verify(root)
+}
+
+async fn cmd_serve(root: &Path, host: &str, port: u16) -> std::io::Result<()> {
     let cfg = load(root);
-    let storage = Storage::open(&root.join("data").join("state.db"))
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let storage =
+        Storage::open(&db_path(root)).map_err(|e| std::io::Error::other(e.to_string()))?;
     let secret = Config::core_secret(&root.join("data"))
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     let controller = Controller::new(&cfg.core.api, Some(&secret));
@@ -152,7 +382,12 @@ async fn cmd_serve(root: &std::path::Path, host: &str, port: u16) -> std::io::Re
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    tracing::info!(root = %root.display(), %host, port, "probe slice serving (shadow; Python remains the default implementation)");
+    tracing::info!(
+        root = %root.display(),
+        %host,
+        port,
+        "probe slice serving (shadow; Python remains the default implementation)"
+    );
     probe_api::serve(state, host, port).await
 }
 

@@ -1,7 +1,7 @@
 # 主控状态（Master Status）
 
 ## 当前阶段与总体状态
-- 阶段：R0（基线审计 + P0 整改）与 R1（Rust workspace + 纵向切片）已交付；R2（迁移体系）未开始。
+- 阶段：R0/R1/R2 已交付（R2=迁移体系：migrations/ + probe-cli db 五子命令）；R3（Mihomo 控制器补全）未开始。
 - 原则：Python 实现保持为默认运行路径；Rust 以 shadow 双跑方式逐步逼近门禁。
 - 总控需求文档：`GLM_5.3_Flash_mihomo_probe_Rust_full_rewrite.md`（已入库）。
 
@@ -43,7 +43,7 @@
 - R1：Rust workspace + 纵向切片。
 
 ## 当前失败测试
-- 无。Python 568 通过 / 2 跳过（R0 新增 14 例）；Rust cargo test 见 TEST_REPORT_RUST.md。
+- 无。Python 568 通过 / 2 跳过（R0 新增 14 例）；Rust 30 通过（R2 新增迁移/备份/兼容 5 例）。
 
 ## 待决策 ADR
 - ADR-0001 存储驱动：切片用 rusqlite(bundled)，R2 迁移落地时复评 sqlx（理由见 08）。

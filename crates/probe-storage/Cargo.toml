@@ -5,7 +5,12 @@ edition.workspace = true
 
 [dependencies]
 probe-domain = { path = "../probe-domain" }
-rusqlite = { workspace = true }
+# "backup" enables the SQLite online backup API used by `probe-cli db
+# migrate` for its automatic pre-migration snapshot.
+rusqlite = { workspace = true, features = ["backup"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -58,3 +58,30 @@ data/ 产出 state.db(+WAL) / core.secret(0600 语义) / config.json 未被改�
 - 本机无 Docker / 无真 mihomo 内核：`mihomo -t` 校验与真内核 reload 在 vps 复核（R3 门禁）。
 - Controller 对 127.0.0.1:1（无监听）的连接失败归类为 Controller 错误——由单测锚定。
 - 快照测试发现的 serde_json key 顺序差异已用 `preserve_order` 对齐 Python `json.dumps` 文档序。
+
+---
+
+## R2 — 2026-09-30
+
+### cargo fmt / clippy
+```
+cargo +stable-x86_64-pc-windows-msvc fmt --all -- --check   # 通过
+cargo +stable-x86_64-pc-windows-msvc clippy --workspace --all-targets -- -D warnings
+→ Finished（一处 needless_mut_ref 于测试代码已改）
+```
+
+### cargo test --workspace --locked（30 通过 / 0 失败）
+```
+probe-storage 9: 迁移版本连续性、幂等重放、Python 旧库迁移后数据逐行保全+新表就位+integrity ok、
+                 备份快照一致性、open_without_migrating 不变更状态、round/时间戳原有 4 例
+probe-mihomo 8 / probe-api 5 / probe-config 6 / probe-domain 2（与 R1 相同，回归通过）
+```
+
+### db 子命令端到端演练（Python 形态 legacy 库，数据为占位符）
+```
+db check   → applied 0, pending 2, integrity ok, required tables missing
+db migrate → backup written: state.db.bak-<ts>；2 applied；counts: nodes 1 / rounds 1 / results 1（legacy 数据保全）
+db verify  → integrity ok + 全表计数
+Python 复读 → nodes/rounds/results 原值不变，export_snapshots 可见
+db rollback → 缺文件 rc=1；无 --yes rc=2；--yes 恢复迁移前快照，check 如实报“缺表”（备份早于迁移，语义正确）
+```

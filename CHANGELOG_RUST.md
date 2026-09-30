@@ -93,3 +93,42 @@ Rust 全量重构的变更台账。每批含影响范围与回滚方法；总控
 
 ### 回滚
 - 删除 `crates/`、`Cargo.toml`、`Cargo.lock`、`TEST_REPORT_RUST.md`（后续批次按同法）。
+
+---
+
+## R2 — SQLite schema 与兼容迁移（2026-09-30）
+
+### 新增
+- `migrations/0001_python_compat.sql`：Python 兼容基础 schema（nodes/rounds/results/events/
+  ip_geo/domain_views + 全部索引，与 db.py 逐字段一致，全部 IF NOT EXISTS——Python 写的库直接
+  打开，Rust 建的库 Python 也能读）。
+- `migrations/0002_probe_ledger.sql`：Rust 侧增量表（node_state_history / export_snapshots /
+  config_audit / security_audit），纯 additive，不动 Python 写的任何表。
+- `crates/probe-storage/src/migrations.rs`：版本化迁移运行器（`schema_migrations` 登记、
+  逐版本事务、`include_str!` 编译期内嵌防漂移、`applied()` 只读）。
+- `probe-cli db check|migrate|verify|backup|rollback`：
+  - migrate = 自动在线备份（SQLite backup API，WAL 一致性快照）→ 应用 → verify；
+  - rollback --from --yes = 恢复备份（存在 `-wal` 时拒绝——防止活写入者下恢复主文件造成损坏）；
+  - check = 只读报告（已应用版本/pending/integrity/表计数），绝不顺手迁移。
+- ADR-0003（workstreams/08）：`sources` 表与 `observations` 改名推迟到 R10 双跑决策——
+  兼容期 config.json 仍是源注册表、`results` 仍是共享逐轮表，Python 读取方不受影响。
+
+### 测试（cargo test --workspace --locked，30 通过）
+- 全新库：两条迁移依序应用、幂等重放不重复。
+- Python 旧库（legacy nodes/rounds/results 数据）迁移后：数据逐行保全、新表就位、
+  integrity ok、Python sqlite3 仍可读。
+- 备份一致性：备份后写入不进快照。
+- open_without_migrating 对缺表库如实报错而非编造零。
+
+### 端到端演练（本机，Python 形态 legacy 库 → Rust CLI）
+`db check`(0 applied/2 pending) → `db migrate`(自动备份→2 applied→counts 含 legacy 数据)
+→ `db verify` ok → Python sqlite3 读回 nodes/rounds/results 原值 → rollback 守卫
+（缺文件 rc=1 / 缺 --yes rc=2 / --yes 恢复到迁移前快照）。
+
+### 影响范围
+- 仅 Rust 侧新增；Python 服务、现有部署数据零改动。`Storage::open` 现在自动迁移
+  （对 Python 建的库即补 Rust 增量表）。
+
+### 回滚
+- `git revert` 本提交；已迁移的数据库无需回滚（增量表对 Python 无害），
+  如需彻底还原用 `db migrate` 产出的 `.bak-*` 快照。

@@ -725,6 +725,7 @@ dependencies = [
  "probe-mihomo",
  "probe-storage",
  "serde_json",
+ "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -771,6 +772,7 @@ dependencies = [
  "probe-domain",
  "rusqlite",
  "serde",
+ "tempfile",
  "thiserror",
  "time",
 ]
