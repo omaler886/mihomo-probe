@@ -706,8 +706,8 @@ docker logs --tail 50 cloudflared-probe                        # Tunnel 日志
 - 内核配置校验会剔除内核拒绝的节点；如果一个源整体不可用，会记事件并继续处理其它源，
   而不是让整轮失败；
 - v6-only 测活要求宿主机有 IPv6 出口且容器用 host 网络（见 ipmap 一节）；
-- `core.mixed_port` 首次部署需在 `data/config.json` 显式给出（`config.DEFAULTS` 无此
-  键，详见 `MIGRATION_GUIDE.md` §4 的部署陷阱清单）。
+- `core.mixed_port` 自 2026-09-30（R0）起在 `config.DEFAULTS` 有默认值 19194（可用
+  `MIHOMO_TEST_MIXED_PORT` 覆盖），新装环境无需再手工补键；旧部署的显式值优先生效。
 
 ---
 

@@ -207,6 +207,13 @@ DEFAULTS = {
         # binds 19090 on its own 30-minute cron, and squatting on that port
         # makes its container fail to start and leaves it probing our core.
         "api": "http://127.0.0.1:19190",
+        # The kernel's HTTP inbound. This key deliberately lived only in the
+        # deployed config.json until 2026-09-30 -- DEFAULTS had none and
+        # `core.build_config` read it with a direct subscript -- so a fresh
+        # install died on its first round with a bare KeyError before any node
+        # was tested (ARCHITECTURE §mixed_port 陷阱). 19194 is the value the
+        # deployment docs standardise on; MIHOMO_TEST_MIXED_PORT overrides.
+        "mixed_port": int(os.environ.get("MIHOMO_TEST_MIXED_PORT", "19194")),
         # Parallel egress-verification lanes: one select group and one loopback
         # inbound each, on base_port..base_port+lanes-1. The lane groups are
         # named "__LANE<i>__" by core.lane_group(); the single probe group this
@@ -387,6 +394,16 @@ DEAD_KEYS = ("core.probe_group", "core.config_path")
 # editable any more.
 IMMUTABLE_PATHS = ("core.container",)
 
+# The mask server.redacted_config writes for these paths in the /api/status
+# payload. A patch carrying the mask back means "unchanged": validate_patch
+# drops the key instead of writing it, so a settings save that round-trips the
+# redacted payload cannot overwrite a real credential with the mask. Without
+# this, masking the polling payload would have corrupted the values on the
+# first settings save (the form reads the redacted copy back).
+MASKABLE_PATHS = ("auth.token", "publish.token", "alert.telegram.token",
+                  "alert.webhook.url", "substore.backend")
+SECRET_MASK = "***"
+
 # Keys discarded by the most recent load(), for the round to report.
 _last_dropped = []
 
@@ -552,6 +569,9 @@ NUMERIC_BOUNDS = {
     # round as "aborted".
     "alert.cooldown_minutes": (1, 10080),
     "alert.alive_floor": (0, 100000),
+    # The kernel's inbound is a network listener: a typo like 191940 or a
+    # negative value must clamp, not wedge `build_config`.
+    "core.mixed_port": (1024, 65535),
 }
 
 # `auth_ok` now *denies* on a falsy token (it used to pass, which turned an
@@ -575,6 +595,18 @@ def _set_path(cfg, path, value):
     for part in parts[:-1]:
         node = node.setdefault(part, {})
     node[parts[-1]] = value
+
+
+def _pop_path(cfg, path):
+    """Remove one dotted path, tolerating absent sections."""
+    parts = path.split(".")
+    node = cfg
+    for part in parts[:-1]:
+        if not isinstance(node, dict) or part not in node:
+            return
+        node = node[part]
+    if isinstance(node, dict):
+        node.pop(parts[-1], None)
 
 
 def validate_patch(patch):
@@ -604,6 +636,13 @@ def validate_patch(patch):
                 del clean[head]
             notes.append(f"忽略不可远程修改的配置项: {path}"
                          "（改用环境变量 MIHOMO_TEST_CORE_CONTAINER）")
+    for path in MASKABLE_PATHS:
+        # The settings form round-trips the redacted /api/status payload; a
+        # mask arriving here is the form saying "this field was not edited",
+        # so the stored value must survive the save untouched.
+        if _get_path(clean, path) == SECRET_MASK:
+            _pop_path(clean, path)
+            notes.append(f"{path} 为掩码占位，已按未改动处理")
     for path, (low, high) in NUMERIC_BOUNDS.items():
         value = _get_path(clean, path)
         if value is None:

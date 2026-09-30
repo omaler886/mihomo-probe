@@ -28,16 +28,26 @@ else
 fi
 
 echo
-echo "== build + start the stack =="
+echo "== build (the running stack is not touched until the tests pass) =="
 docker compose build mihomo-test
+echo
+echo "== test suite (one-off container; failure ABORTS the deploy) =="
+# Gate, not decoration. The old shape ran the suite against the *already
+# replaced* stack through `docker exec ... | tail -3 || true`: the pipe handed
+# the exit status of tail (always 0) to the shell and `|| true` swallowed the
+# rest, so a red suite changed nothing. Now the suite runs in a one-off
+# container before anything is recreated, and the rc is captured POSIX-safely
+# (no `set -o pipefail` reliance in the image's /bin/sh).
+if ! docker compose run --rm --no-deps mihomo-test sh -c \
+    'cd /srv/mihomo-test && python3 -m unittest discover -s tests > /tmp/tests.log 2>&1; rc=$?; tail -5 /tmp/tests.log; exit $rc'; then
+  echo "  test suite FAILED -- deploy aborted, running stack left untouched"
+  exit 1
+fi
 docker compose up -d --force-recreate mihomo-probe mihomo-test
 echo
 echo "== dependencies (declared in requirements.txt) =="
 docker exec mihomo-test python3 -c \
   'import yaml; print("  pyyaml", yaml.__version__)'
-echo
-echo "== test suite (inside the container; the host has no pyyaml) =="
-docker exec mihomo-test sh -c   'cd /srv/mihomo-test && python3 -m unittest discover -s tests 2>&1 | tail -3' || true
 docker compose up -d cloudflared-probe
 sleep 4
 docker ps --format '{{.Names}} | {{.Status}}' | grep -E 'mihomo|cloudflared' | sed 's/^/  /'

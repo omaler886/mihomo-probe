@@ -403,8 +403,10 @@ async function operator(proxies, targetPlatform, context) {
    读内核入站端口，而 `config.DEFAULTS` **没有**这个键——它是部署特有覆盖（现部署 config.json 里有，
    FEATURE_INVENTORY 附录 B 显式标注「DEFAULTS 没有！」）。2026-09-20 的 round 99 就是 prune「未知键」把它
    删掉导致整轮 KeyError 中止，`DEAD_KEYS` 因此是显式清单而非「不在 DEFAULTS 即死」（config.py:348-356）。
-   迁移含义：新环境 config.json **必须带 `core.mixed_port`**（MIGRATION_GUIDE checklist 项）；本批**不得**
-   顺手把它加进 DEFAULTS 或改成 `.get()`（超出白名单），也不得把 `validate_patch` 改成 DEFAULTS 白名单。
+   迁移含义（2026-09-30 更新）：**R0 已把 `core.mixed_port` 加入 DEFAULTS**（默认 19194，
+   `MIHOMO_TEST_MIXED_PORT` 覆盖，`NUMERIC_BOUNDS` 夹取）——新环境不再必须手工补键；
+   `DEAD_KEYS` 仍保持显式清单、`validate_patch` 仍不做 DEFAULTS 白名单（结论不变）。
+   历史约束「本批不得顺手加进 DEFAULTS」针对当时批次，由 R0 按总控文档 §2.3 解除并带测试。
 2. **SECURITY_REVIEW 携带项**（本批不修、不得恶化）：
    - S-09（P2，ipmap 产物设计上携带订阅 URL 与 `orig_proxy` 凭据）——ipmap 整域 deprecate 保留私有，产物不外发；
    - S-12（P2，`/api/status` 轮询载荷携带 TG bot token/webhook/backend URL）——留待后续批次；新端点已按

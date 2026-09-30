@@ -72,10 +72,11 @@ probe 每轮把收敛后的活节点写到 `data/exports/<key>.yaml`，官方把
 
 ## 4. 部署与环境陷阱（新环境第一次起服务前必读）
 
-- **`core.mixed_port` 不在 config.DEFAULTS**（`core.py:236` 直接下标读取；vps 是靠已部署 config.json 里的
-  该键才能跑）。新环境按默认配置启动会在 `build_config` KeyError——部署时在 `data/config.json` 补
-  `"core.mixed_port": <内核 HTTP 入站端口>`（vps 用 19194），或把 core.py 的读取改成 `cfg.get(..., 默认值)`
-  （后者超出本批范围，见 REVIEW 建议节）。
+- **`core.mixed_port` 缺省陷阱 —— 已于 2026-09-30（R0）修复**：`config.DEFAULTS["core"]
+  ["mixed_port"]` 现有默认值 19194（`MIHOMO_TEST_MIXED_PORT` 可覆盖），并加入 `NUMERIC_BOUNDS`
+  夹取 (1024, 65535)。新环境不再需要手工补键；以下保留原始陷阱描述以留档成因：`core.py:236` 直接下标
+  读取；2026-09-30 前新环境按默认配置启动会在 `build_config` KeyError，需在 config.json 补
+  `"core.mixed_port": 19194`。
 - 三容器全 host 网络 + `MIHOMO_TEST_ROOT` 与宿主路径同位（`mihomo -t` 的 bind-mount 由宿主 daemon 解析），
   见 FEATURE_INVENTORY「移植决策最重要的 5 条架构事实」第 5 条。
 - 已知遗留安全项：S-12（`/api/status` 轮询载荷携带 bot token/webhook URL，建议后续单独端点+打码）、

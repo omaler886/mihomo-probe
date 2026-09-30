@@ -1350,5 +1350,163 @@ class ExportTokenTest(unittest.TestCase):
             self.assertNotIn("a" * 32, json.dumps(payload))
 
 
+class StatusRedactionTest(unittest.TestCase):
+    """The five-second poll must not carry live sender credentials (S-12 → P0).
+
+    `redacted_config` used to mask only the two panel tokens, so every
+    /api/status response carried the Telegram bot token, the webhook URL and
+    the Sub-Store backend URL -- whose path segment is an auth bypass on the
+    backend. One screenshot of the panel's network tab leaked all three.
+    """
+
+    def setUp(self):
+        self.cfg = {
+            "auth": {"token": "a" * 32},
+            "publish": {"token": "p" * 32},
+            "substore": {"backend": "https://sub.example.invalid/UNGUESSABLEPATH123"},
+            "alert": {"telegram": {"token": "123456789:" + "T" * 35, "chat_id": "42"},
+                      "webhook": {"url": "https://hooks.example.invalid/TOKENPART"}},
+        }
+        self.out = server.redacted_config(self.cfg)
+
+    def test_the_telegram_bot_token_is_masked(self):
+        self.assertEqual(self.out["alert"]["telegram"]["token"], cfgmod.SECRET_MASK)
+        self.assertNotIn("T" * 35, json.dumps(self.out))
+
+    def test_the_webhook_url_is_masked(self):
+        self.assertEqual(self.out["alert"]["webhook"]["url"], cfgmod.SECRET_MASK)
+        self.assertNotIn("TOKENPART", json.dumps(self.out))
+
+    def test_the_backend_path_is_masked_but_the_host_is_kept(self):
+        """The operator must still see *which* backend is configured."""
+        masked = self.out["substore"]["backend"]
+        self.assertEqual(masked, "https://sub.example.invalid/***")
+        self.assertNotIn("UNGUESSABLEPATH123", json.dumps(self.out))
+
+    def test_a_backend_without_a_secret_path_is_left_readable(self):
+        self.cfg["substore"]["backend"] = "http://127.0.0.1:3000"
+        out = server.redacted_config(self.cfg)
+        self.assertEqual(out["substore"]["backend"], "http://127.0.0.1:3000")
+
+
+class MaskablePatchTest(unittest.TestCase):
+    """A save that round-trips the masked payload must not write the mask.
+
+    The settings form reads the redacted /api/status config back and posts it
+    on save. Without sentinel dropping, the first save after the S-12 fix
+    would have replaced every real credential with "***" -- breaking alert
+    delivery and the Sub-Store integration while reporting a successful save.
+    """
+
+    def test_a_masked_admin_token_is_dropped_not_written(self):
+        clean, notes = cfgmod.validate_patch({"auth": {"token": cfgmod.SECRET_MASK}})
+        self.assertNotIn("token", clean.get("auth", {}))
+        self.assertTrue(any("auth.token" in n for n in notes), notes)
+
+    def test_a_masked_alert_token_is_dropped_and_siblings_survive(self):
+        clean, _ = cfgmod.validate_patch(
+            {"alert": {"telegram": {"token": cfgmod.SECRET_MASK,
+                                    "chat_id": "42"}}})
+        self.assertNotIn("token", clean["alert"]["telegram"])
+        self.assertEqual(clean["alert"]["telegram"]["chat_id"], "42")
+
+    def test_real_values_still_pass_through(self):
+        clean, notes = cfgmod.validate_patch(
+            {"alert": {"webhook": {"url": "https://hooks.example.invalid/real"}}})
+        self.assertEqual(clean["alert"]["webhook"]["url"],
+                         "https://hooks.example.invalid/real")
+        self.assertEqual(notes, [])
+
+    def test_the_masked_backend_is_dropped(self):
+        clean, notes = cfgmod.validate_patch(
+            {"substore": {"backend": cfgmod.SECRET_MASK}})
+        self.assertNotIn("backend", clean.get("substore", {}))
+        self.assertTrue(any("substore.backend" in n for n in notes), notes)
+
+    def test_a_settings_round_trip_preserves_the_stored_credentials(self):
+        """The end-to-end shape of the bug: form read → save → file intact."""
+        with _TempRoot() as tmp:
+            cfg = cfgmod.load()
+            real_admin = cfg["auth"]["token"]
+            # The patch a form built from the *redacted* payload would send.
+            clean, _ = cfgmod.validate_patch({"auth": {"token": cfgmod.SECRET_MASK}})
+            cfgmod.update(clean)
+            stored = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["auth"]["token"], real_admin)
+
+
+class MixedPortDefaultTest(unittest.TestCase):
+    """A fresh install must be able to build a kernel config out of the box.
+
+    `core.build_config` reads `core.mixed_port` with a direct subscript, but
+    the key lived only in the deployed config.json -- DEFAULTS had none -- so
+    a new environment died on its first round with a bare KeyError before a
+    single node was tested (ARCHITECTURE §mixed_port 陷阱).
+    """
+
+    def test_the_default_is_present_and_documented(self):
+        port = cfgmod.DEFAULTS["core"]["mixed_port"]
+        self.assertIsInstance(port, int)
+        low, high = cfgmod.NUMERIC_BOUNDS["core.mixed_port"]
+        self.assertTrue(low <= port <= high)
+
+    def test_build_config_works_with_defaults_alone(self):
+        with _TempRoot() as tmp:
+            # `out_dir` is required: build_config's default is cfgmod.CORE_DIR,
+            # which lives under ROOT and is *not* isolated by _TempRoot.
+            path = coremod.build_config(
+                [{"name": "n1", "type": "socks5", "server": "203.0.113.10",
+                  "port": 1080}],
+                dict(cfgmod.DEFAULTS["core"]), "secret",
+                out_dir=tmp / "core")
+            # Read inside the block: the temp root is deleted on exit.
+            text = path.read_text(encoding="utf-8")
+        self.assertIn(f"mixed-port: {cfgmod.DEFAULTS['core']['mixed_port']}", text)
+        self.assertIn("external-controller: 127.0.0.1:19190", text)
+
+
+class QueryTokenCompatTest(unittest.TestCase):
+    """Query tokens are compat, header tokens are the recommendation.
+
+    The channel matters: a token in the URL lands in access logs and browser
+    history. `auth_kind` reports which (channel, scope) authenticated so the
+    handler can warn once about the legacy form without spamming the 5s poll.
+    """
+
+    def cfg(self):
+        return {"auth": {"token": "a" * 32}, "publish": {"token": "p" * 32}}
+
+    def test_query_header_and_bearer_report_their_channel(self):
+        stub_query = _HandlerStub(f"/api/status?token={'a' * 32}")
+        self.assertEqual(server.auth_kind(stub_query, self.cfg(), "/api/status"),
+                         ("query", "admin"))
+        stub_header = _HandlerStub("/api/status", {"X-Auth-Token": "a" * 32})
+        self.assertEqual(server.auth_kind(stub_header, self.cfg(), "/api/status"),
+                         ("header", "admin"))
+        stub_bearer = _HandlerStub("/api/status",
+                                   {"Authorization": "Bearer " + "a" * 32})
+        self.assertEqual(server.auth_kind(stub_bearer, self.cfg(), "/api/status"),
+                         ("header", "admin"))
+
+    def test_the_publish_scope_is_reported_not_the_admin_one(self):
+        stub = _HandlerStub(f"/api/export/air.yaml?token={'p' * 32}")
+        self.assertEqual(server.auth_kind(stub, self.cfg(), "/api/export/air.yaml"),
+                         ("query", "publish"))
+        # The publish token still does not grant admin paths.
+        stub = _HandlerStub(f"/api/status?token={'p' * 32}")
+        self.assertIsNone(server.auth_kind(stub, self.cfg(), "/api/status"))
+
+    def test_auth_ok_still_accepts_all_three_forms(self):
+        cfg = self.cfg()
+        self.assertTrue(server.auth_ok(_HandlerStub(f"/api/status?token={'a' * 32}"),
+                                       cfg, "/api/status"))
+        self.assertTrue(server.auth_ok(_HandlerStub("/api/status",
+                                                    {"X-Auth-Token": "a" * 32}),
+                                       cfg, "/api/status"))
+        self.assertTrue(server.auth_ok(_HandlerStub(
+            "/api/status", {"Authorization": "Bearer " + "a" * 32}),
+            cfg, "/api/status"))
+
+
 if __name__ == "__main__":
     unittest.main()

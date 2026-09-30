@@ -117,12 +117,41 @@ def _matches(candidate, expected):
 
 
 def _presented_tokens(handler):
+    """Every (token, channel) the request presents; channel is query|header.
+
+    The channel matters since query-token compat marking: a token in the URL
+    ends up in access logs, browser history and referral headers, so it is
+    legacy -- header forms are what new integrations should use. Which channel
+    authenticated is reported by `auth_kind`.
+    """
     query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
-    out = [query.get("token", [""])[0], handler.headers.get("X-Auth-Token") or ""]
+    out = []
+    if query.get("token", [""])[0]:
+        out.append((query["token"][0], "query"))
+    if handler.headers.get("X-Auth-Token"):
+        out.append((handler.headers.get("X-Auth-Token"), "header"))
     auth = handler.headers.get("Authorization") or ""
     if auth.startswith("Bearer "):
-        out.append(auth[len("Bearer "):])
+        out.append((auth[len("Bearer "):], "header"))
     return out
+
+
+def auth_kind(handler, cfg, path=None):
+    """(channel, scope) when the request carries an accepted token, else None.
+
+    scope is "admin" or "publish" -- the publish scope only exists on the
+    paths `_publish_scoped` names, exactly as `auth_ok` allowed before. The
+    first matching (token, channel) pair wins, header order after query order
+    as `_presented_tokens` lists them.
+    """
+    accepted = [("admin", str(cfg.get("auth", {}).get("token") or ""))]
+    if path and _publish_scoped(path):
+        accepted.append(("publish", str(cfg.get("publish", {}).get("token") or "")))
+    for presented, channel in _presented_tokens(handler):
+        for scope, token in accepted:
+            if _matches(presented, token):
+                return channel, scope
+    return None
 
 
 def auth_ok(handler, cfg, path=None):
@@ -141,11 +170,29 @@ def auth_ok(handler, cfg, path=None):
     (`GET /api/probe/nodes`) shares that publish scope: it is the metadata-only
     readout Sub-Store consumes alongside the exports (ARCHITECTURE §5).
     """
-    accepted = [str(cfg.get("auth", {}).get("token") or "")]
-    if path and _publish_scoped(path):
-        accepted.append(str(cfg.get("publish", {}).get("token") or ""))
-    presented = _presented_tokens(handler)
-    return any(_matches(c, t) for t in accepted for c in presented)
+    return auth_kind(handler, cfg, path) is not None
+
+
+_query_token_admin_warned = False
+
+
+def _note_query_token_admin(kind):
+    """Once per process: a query token just granted *admin* scope.
+
+    Query tokens are compat: they land in access logs and browser history, so
+    every authenticated-by-URL admin request is a leak waiting for a log to
+    happen. The publish scope keeps its query token on purpose -- export URLs
+    pasted into Sub-Store are the documented integration and carry only the
+    read-only credential. Warn once, not per poll: /api/status is fetched every
+    five seconds and one line per poll would be noise, not signal.
+    """
+    global _query_token_admin_warned
+    if kind != ("query", "admin") or _query_token_admin_warned:
+        return
+    _query_token_admin_warned = True
+    db.log("warn", "检测到 query token 认证（?token=），已按兼容模式放行；"
+                   "请改用 X-Auth-Token 或 Authorization: Bearer 头。"
+                   "/api/export/* 等只读发布面的 query token 不受影响")
 
 
 def store_client(cfg):
@@ -182,6 +229,26 @@ def exports_summary(cfg):
     return out
 
 
+def _mask_backend(url):
+    """The Sub-Store backend URL with its path hidden, scheme and host kept.
+
+    The path is where deployments embed the secret (an unguessable segment in
+    lieu of auth), so that is what must not ride along on a five-second poll;
+    the host is what the operator needs to recognise which backend this is.
+    A URL with no path carries nothing to hide and is returned unchanged.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(str(url or ""))
+    except ValueError:
+        return cfgmod.SECRET_MASK
+    if not parsed.netloc:
+        return cfgmod.SECRET_MASK
+    if parsed.path in ("", "/") and not parsed.query:
+        return str(url)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc,
+                                    cfgmod.SECRET_MASK, "", ""))
+
+
 def redacted_config(cfg):
     """A copy of cfg with the credentials masked.
 
@@ -194,15 +261,27 @@ def redacted_config(cfg):
     `publish.token` is masked for a narrower reason: it is not the same class of
     secret (it only reads `/api/export/*`, and it is handed to Sub-Store on
     purpose), but the settings form does **not** read it back, so exposing it in
-    a five-second poll buys nothing. Everything else is left in place because
-    the form *does* read those back for editing; masking them would silently
-    overwrite them with the mask on save.
+    a five-second poll buys nothing.
+
+    The alert credentials and the Sub-Store backend URL are masked for the
+    reason S-12 was upgraded to P0: the Telegram bot token and the webhook URL
+    are live senders, and the backend path is an auth bypass on another system.
+    The form *does* read the alert fields back -- so every masked field is in
+    config.MASKABLE_PATHS, and `validate_patch` drops the mask on save instead
+    of writing it over the real value.
     """
     out = json.loads(json.dumps(cfg, default=str))
-    for section, key in (("auth", "token"), ("publish", "token")):
-        block = out.get(section)
-        if isinstance(block, dict) and block.get(key):
-            block[key] = "***"
+    for path in ("auth.token", "publish.token",
+                 "alert.telegram.token", "alert.webhook.url"):
+        parts = path.split(".")
+        block = out
+        for part in parts[:-1]:
+            block = block.get(part) if isinstance(block, dict) else None
+        if isinstance(block, dict) and block.get(parts[-1]):
+            block[parts[-1]] = cfgmod.SECRET_MASK
+    backend = out.get("substore")
+    if isinstance(backend, dict) and backend.get("backend"):
+        backend["backend"] = _mask_backend(backend["backend"])
     return out
 
 
@@ -338,9 +417,13 @@ class Handler(BaseHTTPRequestHandler):
             if asset in ui.ASSET_TYPES:
                 return self._send(200, ui.asset_bytes(asset), ui.ASSET_TYPES[asset],
                                   cache=ui.ASSET_CACHE)
-            if not auth_ok(self, cfg, path):
+            kind = auth_kind(self, cfg, path)
+            if kind is None:
                 return self._send(401, {"error": "unauthorized",
-                                        "hint": "append ?token=<your token>"})
+                                        "hint": "send header X-Auth-Token: <token> "
+                                                "(Authorization: Bearer also works; "
+                                                "query ?token= is legacy compat)"})
+            _note_query_token_admin(kind)
             if path in ("/", "/ui"):
                 return self._send(200, ui.render(cfg["ui"]["title"], cfg["auth"]["token"]),
                                   "text/html; charset=utf-8")
@@ -446,8 +529,10 @@ class Handler(BaseHTTPRequestHandler):
         cfg = _State.cfg
         path = self._path()
         try:
-            if not auth_ok(self, cfg, path):
+            kind = auth_kind(self, cfg, path)
+            if kind is None:
                 return self._send(401, {"error": "unauthorized"})
+            _note_query_token_admin(kind)
             body = self._json_body()
             if path == "/api/run":
                 # Whitelist, the same two values argparse allows for `--mode`.
