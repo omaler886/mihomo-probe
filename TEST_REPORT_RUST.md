@@ -85,3 +85,24 @@ db verify  → integrity ok + 全表计数
 Python 复读 → nodes/rounds/results 原值不变，export_snapshots 可见
 db rollback → 缺文件 rc=1；无 --yes rc=2；--yes 恢复迁移前快照，check 如实报“缺表”（备份早于迁移，语义正确）
 ```
+
+---
+
+## R3 — 2026-10-01
+
+### fmt / clippy
+```
+cargo fmt --all -- --check   # 通过
+cargo clippy --workspace --all-targets -- -D warnings   # Finished（校验器补 120s 超时+kill）
+```
+
+### cargo test --workspace --locked（45 通过 / 0 失败，新增 15）
+- lanes(3)：端口区间、lane_count 夹取(0→1/99→32)、组名/监听名与 Python 逐字符一致
+- exit(6)：trace 解析（ip/loc/colo、垃圾行、空键）、经车道读出口身份（reqwest+Proxy::all 对 axum mock 代理，
+  绝对 URI 代理形态即真实 mihomo 入站所见）、空 trace 判失败、fetch 字节上限（1MiB 体 64KiB 帽，提前停）、
+  拨号失败有界错误（≤160 字符）
+- config_check(6)：退出码→Passed/Failed、无 MIHOMO_BIN 且无 docker → Degraded（显式降级，绝不读作通过）、
+  culprit 定位（引号名优先/短名永不 token 匹配——"jp" 历史 bug/长名边界匹配（BageVM-Tokyo 不匹配
+  BageVM-Tokyo-2）/server 兜底）
+- controller 新增 select：PUT /proxies/{group}（200/204 ok，非 2xx 带正文报错）
+- 回归：R1/R2 全部用例通过

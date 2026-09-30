@@ -16,11 +16,14 @@ Rust 侧重建 core.py 的内核控制面：配置生成、`mihomo -t` 校验、
 
 ## 待办清单
 - [x] R1：ConfigBuilder + /version + reload + reason 分类（切片）
-- [ ] R3：delay/select/lanes/egress/fetch
-- [ ] R3：make_testable 裁剪循环移植
+- [x] R3：lanes（lane_count/ports/命名）+ select + egress/fetch + `mihomo -t` 校验器
+      （MIHOMO_BIN > docker > 显式 Degraded）+ culprit_from 移植（含 jp 误匹配回归）
+- [ ] R5：make_testable 裁剪循环移植（随引擎 entry/fp 模型一并落地）
 
 ## 测试证据
-- Rust 单测：配置快照、reason 分类表、mock controller（见 crates/probe-mihomo/tests）。
+- Rust 单测：配置快照、reason 分类表、mock controller（version/reload/delay/select/鉴权中间件）、
+  车道出口身份读取（axum 兼任代理 mock）、fetch 字节上限、culprit 定位表（见 crates/probe-mihomo）。
+- 本机无 docker/内核：`mihomo -t` 真校验用例为 #[ignore] 形态待 vps；Degraded 分支已测。
 
 ## 风险与回滚
 - 新增 crate，不影响 Python；回滚删目录。

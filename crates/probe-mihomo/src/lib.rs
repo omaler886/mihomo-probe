@@ -13,9 +13,15 @@ use std::path::Path;
 use probe_config::CoreConfig;
 use serde_json::Value;
 
+pub mod config_check;
 pub mod controller;
+pub mod exit;
+pub mod lanes;
 
+pub use config_check::{culprit_from, validate, ConfigCheck, ProxyRef};
 pub use controller::{Controller, DelayOutcome, KernelError};
+pub use exit::{egress, fetch, parse_trace, ExitIdentity};
+pub use lanes::{lane_count, lane_group, lane_name, lane_ports};
 
 /// Loopback-only kernel config, field-for-field the Python `build_config`
 /// output (same key order, same quoting style, inline-JSON proxies).
@@ -106,14 +112,6 @@ pub fn write_config(
     let path = dir.join("config.yaml");
     std::fs::write(&path, build_config(core, secret, proxies))?;
     Ok(path)
-}
-
-pub fn lane_group(i: u16) -> String {
-    format!("__LANE{i}__")
-}
-
-pub fn lane_name(i: u16) -> String {
-    format!("lane{i}")
 }
 
 /// YAML flow-scalar quoting for group member names: only names that would be

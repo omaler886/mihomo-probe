@@ -103,6 +103,34 @@ impl Controller {
         }
     }
 
+    /// PUT /proxies/{group} -- pin one proxy onto a selector group. This is
+    /// how a verification lane holds a node while traffic flows through it
+    /// (Python `core.Core.select`).
+    pub async fn select(&self, group: &str, name: &str) -> Result<(), KernelError> {
+        let quoted = urlencode_component(group);
+        let url = format!("{}/proxies/{quoted}", self.api);
+        let payload = serde_json::json!({ "name": name });
+        let req = self
+            .auth(self.http.put(&url))
+            .json(&payload)
+            .timeout(std::time::Duration::from_secs(20));
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if status == 200 || status == 204 {
+                    Ok(())
+                } else {
+                    let body = resp.text().await.unwrap_or_default();
+                    Err(KernelError::Controller(format!(
+                        "could not select {name}: HTTP {status} {}",
+                        body.chars().take(120).collect::<String>()
+                    )))
+                }
+            }
+            Err(err) => Err(KernelError::Controller(err.to_string())),
+        }
+    }
+
     /// GET /proxies/{name}/delay -- one real traffic test through the kernel.
     pub async fn delay(
         &self,

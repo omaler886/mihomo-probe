@@ -132,3 +132,31 @@ Rust 全量重构的变更台账。每批含影响范围与回滚方法；总控
 ### 回滚
 - `git revert` 本提交；已迁移的数据库无需回滚（增量表对 Python 无害），
   如需彻底还原用 `db migrate` 产出的 `.bak-*` 快照。
+
+---
+
+## R3 — Mihomo 控制器补全（2026-10-01）
+
+### 新增（全部在 crates/probe-mihomo）
+- `lanes` 模块：lane_count/lane_ports（夹取 1..=32、base_port+i）、组名 `__LANE<i>__`、
+  监听名 `lane<i>` 与 Python 逐字符一致（shadow diff 可读性）。
+- `exit` 模块：`egress(port, trace_url)` 经车道 loopback 入站拉 Cloudflare trace
+  （reqwest Proxy::all，任何完整 HTTP 响应算过；空 trace 判失败）；
+  `fetch(port, url, cap)` 真拉流（读上限防下载，拨号错/超时/TLS reset 为 Err ≤160 字符）；
+  `parse_trace` 纯函数。这组能力是 R5 链式真实拉流校验与 R6 出口验证的地基。
+- `config_check` 模块：`mihomo -t` 校验器——优先 `MIHOMO_BIN`（固定 argv、120s 超时+kill），
+  其次 docker run 固定镜像（CLI 探测缓存 60s），都没有时返回 **Degraded**（与 Python 的
+  "无 docker 静默跳过" 相反：降级必须显式记录，workstreams/04 既定语义）；
+  `culprit_from` 移植 `_culprit_from`（引号名 > 长名边界匹配 > server 兜底），含 "jp" 误匹配
+  回归测试；`find_word` 手写边界检查，零 regex 依赖。
+- Controller 增 `select(group, name)`（PUT /proxies/{group}，R5 车道钉扎用）。
+
+### 范围说明（如实记录）
+- `make_testable` 完整裁剪循环**不在本批**：它依赖引擎的 entry/fp 数据模型（R5 一并落地）；
+  本批交付其全部内核侧原语（config build/check、culprit 定位、delay、select）。
+
+### 影响范围
+- 仅 probe-mihomo 新增模块；Python 侧零改动。
+
+### 回滚
+- `git revert` 本提交（probe-mihomo 回到 R2 形态，切片功能不受影响）。
