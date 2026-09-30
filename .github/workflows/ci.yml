@@ -1,0 +1,43 @@
+name: ci
+
+# Quality gate (GLM_5.3_Flash §17): formatting, static checks, tests and the
+# secret scan must pass before anything builds a release artifact. The Python
+# suite stays the compatibility baseline until the full migration lands.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install runtime deps
+        run: pip install PyYAML==6.0.3
+      - name: Syntax check
+        run: python -m py_compile mihomo_test/*.py tools/scan_secrets.py
+      - name: Test suite (baseline)
+        run: python -m unittest discover -s tests -v
+      - name: Secret scan
+        run: python tools/scan_secrets.py
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests (locked)
+        run: cargo test --workspace --locked
+      - name: Secret scan
+        run: python tools/scan_secrets.py

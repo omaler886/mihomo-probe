@@ -1,0 +1,11 @@
+[package]
+name = "probe-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+probe-domain = { path = "../probe-domain" }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }

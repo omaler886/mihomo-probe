@@ -1,0 +1,15 @@
+[package]
+name = "probe-mihomo"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+probe-domain = { path = "../probe-domain" }
+probe-config = { path = "../probe-config" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }

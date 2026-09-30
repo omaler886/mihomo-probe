@@ -1,0 +1,20 @@
+[package]
+name = "probe-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+probe-domain = { path = "../probe-domain" }
+probe-config = { path = "../probe-config" }
+probe-storage = { path = "../probe-storage" }
+probe-mihomo = { path = "../probe-mihomo" }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tempfile = "3"

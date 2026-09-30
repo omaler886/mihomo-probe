@@ -76,7 +76,17 @@ Rust 全量重构的变更台账。每批含影响范围与回滚方法；总控
 - `crates/probe-api`：axum `/healthz` `/readyz` `/api/v1/status`（零秘密）`POST /api/v1/rounds`；
   Bearer 鉴权；loopback 默认。
 - `crates/probe-cli`：`serve` / `round` / `status` 子命令。
+- `.github/workflows/ci.yml`：python（py_compile + unittest + secret scan）与 rust
+  （fmt --check / clippy -D warnings / test --locked / secret scan）双 job 门禁。
 - `TEST_REPORT_RUST.md`：cargo fmt/clippy/test 真实输出留档。
+
+### 本机环境注记（如实记录）
+- 本机默认工具链 x86_64-pc-windows-gnu 缺 C 编译器，rusqlite bundled 无法构建；
+  本机构建用 `cargo +stable-x86_64-pc-windows-msvc`（VS 2022 在位）。CI（ubuntu）不受影响。
+- serde_json 启用 `preserve_order`：Python `json.dumps` 按文档序输出 proxy 字段，
+  生成的内核配置须与 Python 逐字节可比（快照测试锚定）。
+- 冒烟：临时根上 `probe-cli status/round/serve` 全链路通过（round 行如实闭合、
+  /api/v1/status 零秘密、401/202、WAL、core.secret 自动生成），详见 TEST_REPORT_RUST.md。
 
 ### 影响范围
 - 全部为新增目录；不修改任何 Python 文件、不改动 compose。Python 服务照常部署运行。

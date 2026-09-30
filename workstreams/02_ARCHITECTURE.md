@@ -31,6 +31,12 @@
 |---|---|---|---|
 | 2026-09-30 | Cargo.toml, crates/* | R1 workspace | 纵向切片 |
 
+## 本机工具链注记
+- 默认工具链 x86_64-pc-windows-gnu 缺 gcc/dlltool（rusqlite bundled、windows-sys 构建失败）；
+  本机构建用 `cargo +stable-x86_64-pc-windows-msvc`（VS 2022 在位）。CI（ubuntu）无此问题。
+- serde_json 启用 preserve_order：Python json.dumps 按文档序输出 proxy 字段，
+  内核配置需与 Python 逐字节可比（快照测试锚定）。
+
 ## 执行命令与输出摘要
 - `cargo test --workspace --locked`：见 R1 提交与 TEST_REPORT_RUST.md。
 

@@ -1,0 +1,19 @@
+[package]
+name = "probe-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "probe-cli"
+path = "src/main.rs"
+
+[dependencies]
+probe-api = { path = "../probe-api" }
+probe-config = { path = "../probe-config" }
+probe-domain = { path = "../probe-domain" }
+probe-mihomo = { path = "../probe-mihomo" }
+probe-storage = { path = "../probe-storage" }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

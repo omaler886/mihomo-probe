@@ -66,3 +66,8 @@ reports/
 dom_*.html
 console_*.txt
 chain-alive-*.md
+
+# ---------------------------------------------------------------------------
+# Rust workspace build output (Cargo.lock IS committed; /target is not)
+# ---------------------------------------------------------------------------
+/target/

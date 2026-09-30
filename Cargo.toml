@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/probe-domain",
+    "crates/probe-config",
+    "crates/probe-storage",
+    "crates/probe-mihomo",
+    "crates/probe-api",
+    "crates/probe-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+# The dependency direction is one-way (GLM_5.3_Flash §3):
+#   probe-domain <- config/dns/mihomo/substore/storage <- engine <- api/scheduler/cli
+# probe-domain must never depend on web, database or network-client crates.
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+# preserve_order: Python's json.dumps emits proxy dicts in document order,
+# and the generated kernel config must diff byte-for-byte against it during
+# shadow runs -- sorted keys would make every line differ for no reason.
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+# ADR-0001 (workstreams/08): bundled so the build is reproducible on hosts
+# without a system libsqlite (this repo's dev machine is Windows); sqlx is
+# re-evaluated when the R2 migration framework lands.
+rusqlite = { version = "0.32", features = ["bundled"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+time = { version = "0.3", features = ["formatting", "macros"] }
+getrandom = "0.3"
+
+[profile.test]
+# sqlite3.c is the slow part of a cold build; keep it out of debug bloat.
+opt-level = 0

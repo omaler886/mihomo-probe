@@ -23,8 +23,8 @@
 
 ## 待办清单
 - [x] R0：基线记录
-- [x] R0：P0 修复回归测试（4+2 例）
-- [ ] R1：Rust 侧对应单测（切片）
+- [x] R0：P0 修复回归测试（14 例）
+- [x] R1：Rust 侧切片单测（config/storage/mihomo/api，见 TEST_REPORT_RUST.md）
 - [ ] R2：fixtures 目录与首批共享夹具
 - [ ] R10：双跑差异报告
 
