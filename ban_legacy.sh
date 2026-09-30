@@ -67,9 +67,9 @@ from mihomo_test.store import Client, StoreError
 backup = sys.argv[1]
 cfg = cfgmod.load()
 c = Client(cfg["substore"]["backend"])
-# "legacy-alive" is the output collection of the banned per-subscription pipeline:
+TARGET_NAME: the output collection of the pipeline being banned (edit for your deployment):
 # empty, owned by it, and referenced by nothing.
-target = "legacy-alive"
+target = "<旧产物集合>"
 record = c.collection(target)
 if record is None:
     print(f"  {target}: already absent")
@@ -96,7 +96,7 @@ cat > "$BK/RESTORE.md" <<EOF
 1. host cron
    crontab $BK/crontab.before
 
-2. systemd timer (机场 per-subscription 管线)
+2. systemd timer (旧逐订阅管线)
    systemctl enable --now mihomo-healthcheck.timer
 
 3. 旧探测容器
@@ -107,11 +107,11 @@ cat > "$BK/RESTORE.md" <<EOF
    cp -a $BK/sub-store.vhost.before /etc/nginx/sites-available/sub-store
    nginx -t && systemctl reload nginx
 
-5. Sub-Store 孤儿集合 legacy-alive
-   见 $BK/substore-collection-legacy-alive.json（若已删除）
+5. Sub-Store 孤儿集合
+   见 $BK/substore-collection.json（若已删除）
 
 被禁用的东西仍在磁盘上：/srv/mihomo-health, /srv/healthcheck
-未改动：devcloud-healthcheck.timer, node-engine 容器, air/legacy-sub-c/legacy-sub-d 等上游订阅,
-       Sub-Store 的 SUB_STORE_PRODUCE_CRON (仍在刷新 air 集合)
+未改动：devcloud-healthcheck.timer, node-engine 容器, <各上游订阅>,
+       Sub-Store 的 SUB_STORE_PRODUCE_CRON (仍在刷新上游集合)
 EOF
 echo "  restore notes: $BK/RESTORE.md"

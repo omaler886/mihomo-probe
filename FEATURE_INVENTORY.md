@@ -285,7 +285,7 @@
 
 ### F-43 测试告警（金丝雀）与冷却重置
 - 入口：`notifier.py:159 test_channels`、`notifier.py:180 reset_cooldown`（仅测试引用）；面板按钮 → `POST /api/alert-test`（server.py:471）
-- 配置凭据来源：`tools/wire_telegram.py` 从 acme.sh/selfhost-watcher 提取写入（部署侧一次性动作）
+- 配置凭据来源：`tools/wire_telegram.py` 从 acme.sh/内部告警脚本 提取写入（部署侧一次性动作）
 
 ### F-44 告警触发点汇总
 - `round_failed`：run_round 兜底异常（engine.py:934-939）
@@ -502,7 +502,7 @@
 | F-77 | `tools/loop_query.py` | 只读证据查询 CLI（stats/rounds/node/history/round/reasons/dupes/rows 等子命令） | 同上 |
 | F-78 | `tools/loop_scan.py` | 自治循环工作生成器：扫仓库+活账本输出排名 backlog（LIVE/VERDICT/CONFIG/SILENT/TESTS/DOC/SIZE） | 本地即可；--live 需 ssh vps |
 | F-79 | `tools/fix_round_times.py` | 修复 TZ bug 造成的 finished_at<started_at 倒挂行；默认 dry-run，`--apply` 才写并先备份 | 生产 state.db；一次性（已用过） |
-| F-80 | `tools/wire_telegram.py` | 从 /root/.acme.sh + selfhost-watcher/watcher.py 提取 Telegram bot/chat，getMe 校验后写入应用配置并发金丝雀 | vps root、acme.sh 凭据 |
+| F-80 | `tools/wire_telegram.py` | 从 /root/.acme.sh 或 TG_WATCHER_FILE 指定的自有通知脚本提取 Telegram bot/chat，getMe 校验后写入应用配置并发金丝雀 | vps root、acme.sh 凭据 |
 | F-81 | `tools/deploy_files.py` / `pull_file.py` / `push_run.py` | 本地→vps base64+stdin 上传指定文件（可 --rebuild 重建容器）/ 远端小文件拉回 / 推脚本到 /tmp nohup 后台跑 | ssh vps 免密 |
 | F-82 | `tools/chain_ab.py`、`chain_verify.py`、`chain_diagnose.py`、`chain_test2.py`、`front_ablation.py`、`front_debug.py` | 链式诊断族：直连 vs 链式 A/B、真内核验证 dialer-proxy 钉扎与 front_dead 落账、内核拨号错误捕获、字段消融（ech/x-padding）定位、单个前置可用性 | vps、docker、/srv/mihomo-test 代码；各自用独立 MIHOMO_TEST_ROOT/容器/端口，不动生产 |
 | F-83 | `tools/v6_debug.py`、`v6_ab_test.py`、`v6_fix_verify.py`、`v6_host_verify.py`、`v6_front_scan.py`、`v6_chain_cause.py` | IPv6 诊断族：内核 debug 日志取因、dns.ipv6 A/B、bridge vs host 网络验证、扫描可作为 v6 前置的节点、链式 v6 失败归因 | vps（有 v6 出口）、docker |
@@ -540,7 +540,7 @@
 - 依赖：Cloudflare API v4；幂等可重跑
 
 ### F-92 ban_legacy.sh
-- 一次性停用旧测活管线：删 root cron `/srv/mihomo-health` 行、disable `mihomo-healthcheck.timer`、stop mihomo-air 容器、注释 nginx `include mihomo-health.conf`（nginx -t 失败自动回滚）、删 Sub-Store 集合「legacy-alive」；全程备份到 /srv/legacy-ban-backup/<ts>/
+- 一次性停用旧测活管线：删 root cron `/srv/mihomo-health` 行、disable `mihomo-healthcheck.timer`、stop mihomo-air 容器、注释 nginx `include mihomo-health.conf`（nginx -t 失败自动回滚）、删旧产物集合；全程备份到 /srv/legacy-ban-backup/<ts>/
 - 已执行过（README「已禁用的旧管线」节），保留作迁移时的同类清理参考
 
 ### F-93 CDN 前端：tools/build_web.py + deploy_pages.py + verify_cdn.py
@@ -643,7 +643,7 @@
 - 本部署主机名/域名默认值：`mihomo_test/config.py:300`（publish.hostname）、`setup_tunnel.py:7,109,112`、`tools/build_web.py:38`、`tools/verify_measure_switch.py:27`。
 - **真实节点凭据（uuid/server/x-padding key）硬编码**在诊断脚本：`tools/chain_diagnose.py:36-41`、`tools/chain_test2.py:26-39`、`tools/front_ablation.py:22-33`、`tools/front_debug.py:22-25`、`tools/chain_ab.py`（SOURCES 列表）、`tools/lanes_verify.py`。
 - 本机（Windows）凭证文件路径：`tools/deploy_pages.py:39-40`。
-- 宿主 root 凭据文件路径：`setup_tunnel.py:21`（/root/.acme.sh/account.conf）、`tools/wire_telegram.py:18-19,26`（acme.sh + selfhost-watcher/watcher.py）。
+- 宿主 root 凭据文件路径：`setup_tunnel.py:21`（/root/.acme.sh/account.conf）、`tools/wire_telegram.py`（acme.sh 或 TG_WATCHER_FILE 指定的自有通知脚本）。
 - 固定 UA：`ipmap.py:62`（clash-verge/v1.7.7）、`store.py:17`。
 - 端口约定：`config.py:206-209`（19190/19200，避让 19090 的注释）、ipmap.py:56-58（19191/19300/19494）。
 - **运行时数据文件含敏感信息且留在工作区**（.gitignore 已挡但磁盘上有）：`reports/ipmap-demo-v6.{json,md}`（实测节点+出口 IP）、`chain-alive-r365.md`、`console_live.txt`、`dom_live.html`/`dom_offline.html`（面板 DOM 快照，可能含 token 渲染）、`.local/`（诊断快照含面板 token，.gitignore 注释明言）、`.tmp_diag/`（含 deployed.tgz/vpscode.tgz 打包件）。

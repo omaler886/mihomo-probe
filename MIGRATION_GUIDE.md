@@ -12,8 +12,8 @@
 
 1. **凭据轮换**（这些值已进 git 历史，视同泄露）：
    - `tools/chain_diagnose.py` / `chain_test2.py` / `front_debug.py` / `front_ablation.py` 内嵌的真实节点
-     UUID（`<UUID 片段>`、`<UUID 片段>`、`<UUID 片段>`）、REALITY 公钥/short-id（`pbk=<公钥片段>` 等）、自建前置域名；
-   - `dom_live.html` / `dom_offline.html` 快照中的真实 publish token（`<token 片段>`，已在 vps 侧明文留存，**在面板
+     UUID（`<UUID 片段A>`、`<UUID 片段B>`、`<UUID 片段>`）、REALITY 公钥/short-id（`pbk=<公钥片段>` 等）、自建前置域名；
+   - `dom_live.html` / `dom_offline.html` 快照中的真实 publish token（`<token 片段>`，已在部署侧明文留存，**在面板
      设置里换掉 publish.token**）。
 2. **历史清洗**：`git filter-repo`（或 BFG）清洗上述四个文件后强推（如有远端）。
 3. 工作区遗留敏感文件（`.tmp_diag/`、`reports/`、`dom_*.html`、`chain-alive-*.md`、`console_*.txt`）已被

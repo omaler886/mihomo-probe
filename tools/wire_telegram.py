@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-"""Wire mihomo-test alerts to the Telegram credentials acme.sh already stores.
+"""Wire mihomo-test alerts to a Telegram bot + chat pair you already have.
 
-Reads the bot token / chat id from /root/.acme.sh, verifies them against the
-Telegram API (getMe), and writes them into the app config. Secrets are never
-printed -- only the bot's public username and success/failure.
+Two credential sources, tried in order:
+
+1. An existing notifier script of yours that stores ``BOT =`` / ``CHAT =`` at
+   the top level -- point ``TG_WATCHER_FILE`` at it. Reusing its proven pair
+   means the canary message lands in a chat that already receives from it.
+2. ``/root/.acme.sh/account.conf`` (``SAVED_TELEGRAM_BOT_APITOKEN`` /
+   ``SAVED_TELEGRAM_BOT_CHATID``), the keys acme.sh's Telegram hook writes.
+
+Either way the credentials are verified against the Telegram API (getMe) and
+written into the app config. Secrets are never printed -- only the bot's
+public username and success/failure. You can also skip this script entirely
+and fill bot token + chat id in the panel's settings page.
 """
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -14,10 +24,8 @@ import urllib.request
 sys.path.insert(0, "/srv/mihomo-test")
 from mihomo_test import config as cfgmod  # noqa: E402
 
-ACME_CONF = "/root/.acme.sh/account.conf"
-# The user's own Telegram notifier: a whisper-job watcher that already sends
-# progress messages to their chat. Reusing its proven bot + chat pair.
-WHISPER_WATCHER = "/root/selfhost-watcher/watcher.py"
+ACME_CONF = os.environ.get("ACME_CONF", "/root/.acme.sh/account.conf")
+WATCHER_FILE = os.environ.get("TG_WATCHER_FILE", "")
 
 
 def read_pairs(path):
@@ -46,13 +54,14 @@ def mask(value):
 
 def main():
     token = chat_id = None
-    try:
-        text = open(WHISPER_WATCHER, encoding="utf-8", errors="replace").read()
-        m = re.search(r"^BOT\s*=\s*['\"]([^'\"]+)['\"]", text, re.M)
-        n = re.search(r"^CHAT\s*=\s*['\"]([^'\"]+)['\"]", text, re.M)
-        token, chat_id = (m.group(1) if m else None), (n.group(1) if n else None)
-    except OSError as exc:
-        print(f"  cannot read {WHISPER_WATCHER}: {exc}")
+    if WATCHER_FILE:
+        try:
+            text = open(WATCHER_FILE, encoding="utf-8", errors="replace").read()
+            m = re.search(r"^BOT\s*=\s*['\"]([^'\"]+)['\"]", text, re.M)
+            n = re.search(r"^CHAT\s*=\s*['\"]([^'\"]+)['\"]", text, re.M)
+            token, chat_id = (m.group(1) if m else None), (n.group(1) if n else None)
+        except OSError as exc:
+            print(f"  cannot read {WATCHER_FILE}: {exc}")
 
     print("提取结果:")
     print(f"  token   : {'找到 ' + mask(token) if token else '未找到'}")

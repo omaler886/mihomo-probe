@@ -13,7 +13,7 @@
 ## 一、发现清单
 
 ### S-01（P0）已提交文件含真实节点凭据（vless 分享链接）
-- 证据：`tools/chain_diagnose.py:31-36` —— `TARGET_URIS` 内含 4 条真实 vless 分享链接：真实 UUID（分别以 `<UUID 片段>`、`<UUID 片段>` 开头）、REALITY 公钥/short-id（`pbk=<公钥片段>`、`pbk=<公钥片段>`）、真实服务器域名/IP；`FRONT_URI` 含自建前置节点真实 UUID（`<UUID 片段>`）及自建前置域名（`<前置域名>`）。
+- 证据：`tools/chain_diagnose.py:31-36` —— `TARGET_URIS` 内含 4 条真实 vless 分享链接：真实 UUID（分别以 `<UUID 片段A>`、`<UUID 片段B>` 开头）、REALITY 公钥/short-id（`pbk=<公钥片段×2>`）、真实服务器域名/IP；`FRONT_URI` 含自建前置节点真实 UUID（`<UUID 片段>`）及自建前置域名（`<前置域名>`）。
 - 状态：**该文件已被 git 跟踪，内容已进入历史提交，即 git 历史中已存在这些凭据**（`git log -p --all` 可见）。
 - 建议：
   1. 视这些 UUID/REALITY 参数已泄露，**先在订阅侧/节点侧换发凭据（轮换 UUID、更换 pbk/sid）**；
@@ -21,7 +21,7 @@
   3. 若基线要推到公开/共享远端，必须改写历史（`git filter-repo` / BFG 清洗）。
 
 ### S-02（P0）已提交文件以 proxy 字典形式重复同一批真实凭据
-- 证据：`tools/chain_test2.py:26-59` —— `EDGETUNNEL`/`T2/T3/T4` 节点字典内嵌与 S-01 相同的真实 UUID（`<UUID 片段>`、`<UUID 片段>`、`<UUID 片段>`）、自建前置域名与 REALITY 参数。
+- 证据：`tools/chain_test2.py:26-59` —— `EDGETUNNEL`/`T2/T3/T4` 节点字典内嵌与 S-01 相同的真实 UUID（`<UUID 片段>`、`<UUID 片段A>`、`<UUID 片段B>`）、自建前置域名与 REALITY 参数。
 - 状态：已跟踪、已在 HEAD/历史中。
 - 建议：同 S-01；即使 S-01 改掉，此文件不改则历史与工作区仍含泄露源。
 
@@ -31,7 +31,7 @@
 - 建议：同 S-01，前置节点凭据一并轮换。
 
 ### S-04（P0）DOM 快照含真实发布令牌（publish token）
-- 证据：`dom_live.html`（约第 5000+ 行的导出地址区）与 `dom_offline.html`（约 8800+ 行）—— 多处 `?token=<token 片段>` 的导出 URL（/api/export/alphasub.yaml、betasub.yaml、gammasub.yaml、deltasub.yaml）。这是面板真实 publish token 的明文快照。
+- 证据：`dom_live.html`（约第 5000+ 行的导出地址区）与 `dom_offline.html`（约 8800+ 行）—— 多处 `?token=<token 片段>` 的导出 URL（/api/export/<各来源>.yaml）。这是面板真实 publish token 的明文快照。
 - 状态：未跟踪、未入历史；但 `reports/`、`dom_*.html` 均不在 .gitignore 覆盖范围内。
 - 缓解事实：经比对，快照未包含 admin token（bootstrap 块未捕获），泄露面为只读发布令牌。
 - 建议：
@@ -49,7 +49,7 @@
 
 ### S-07（P0）reports/ 目录含订阅 URL 与节点完整凭据
 - 证据：
-  - `reports/ipmap-demo-v6.md:1` —— 标题即真实订阅地址（`https://sub.example.com/a9K2…/291a…`，密钥路径明文）；
+  - `reports/ipmap-demo-v6.md:1` —— 标题即真实订阅地址（`https://<订阅域名>/<密钥路径>`，密钥路径明文）；
   - `reports/ipmap-demo-v6.json` —— 12 个节点的 `orig_proxy` 完整凭据（uuid、reality-opts、cipher、server），且 `title` 字段同为该订阅地址。
 - 状态：`reports/` 未跟踪且**不在 .gitignore**，极易随基线提交泄露。
 - 建议：`reports/` 加入 .gitignore；已生成的两份 ipmap 报告先脱敏（去掉 title 的订阅 URL、JSON 去掉 orig_proxy）再留存。

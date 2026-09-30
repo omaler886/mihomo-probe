@@ -1905,8 +1905,8 @@ def _record_rejected_nodes(cfg, round_id, entries, log):
         configuration file test failed
 
     That is the same class of defect as a dangling `dialer-proxy`: the round
-    tested fine, and the export was unloadable. Measured live, one `gammasub`
-    node (`short-id: 123456e2`) was published as alive this way.
+    tested fine, and the export was unloadable. Measured live, one `<源>`
+    node (`short-id: <sid>片段`) was published as alive this way.
 
     The verdict is a real `fail` -- an entry the kernel will not accept is not
     usable, so it must converge out of the export the normal way, through

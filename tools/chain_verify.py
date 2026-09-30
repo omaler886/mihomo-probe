@@ -52,7 +52,7 @@ from mihomo_test.store import Client              # noqa: E402
 RUNNER = "chainverify-core"
 PORT = 19302
 SECRET = ["chainverify"]        # replaced with the real one once the root is set
-TARGET_SOURCE = "betasub"
+TARGET_SOURCE = os.environ.get("CHAIN_VERIFY_SOURCE", "demo-source")
 CHAIN_SOURCE = "chain-test"
 DIRECT_SOURCE = "direct-test"
 # Names upstream uses for placeholder rows that are not proxies at all. The

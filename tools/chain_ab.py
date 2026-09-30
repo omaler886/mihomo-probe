@@ -33,8 +33,10 @@ PLACEHOLDER = ("剩余流量", "到期", "过期", "官网", "订阅", "重置",
                "公告", "客服", "流量", "Traffic", "Expire", "防失联", "网址")
 WANT = [("hysteria2", 12), ("vless", 14), ("ss", 8), ("vmess", 4),
         ("trojan", 4), ("anytls", 3), ("tuic", 1)]
-SOURCES = [("gammasub", "sub"), ("deltasub", "sub"),
-           ("legacy-sub-c", "sub"), ("betasub", "sub")]
+# Upstream sources to draw nodes from: (name, kind). Edit to your real
+# resource names, or export CHAIN_AB_SOURCES="a,b,c" (all kind=sub).
+SOURCES = [(name.strip(), "sub") for name in os.environ.get(
+    "CHAIN_AB_SOURCES", "demo-a,demo-b,demo-c,demo-d").split(",") if name.strip()]
 
 
 def log(level, message):
