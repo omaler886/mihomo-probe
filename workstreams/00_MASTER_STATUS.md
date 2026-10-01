@@ -1,7 +1,8 @@
 # 主控状态（Master Status）
 
 ## 当前阶段与总体状态
-- 阶段：R0~R3 已交付（R3=Mihomo 控制器补全：lanes/select/egress/fetch/校验器/culprit）；R4（DNS/ECS）未开始。
+- 阶段：R0~R3 已交付（R3=Mihomo 控制器补全）；**R5 的分层并发闸门已交付**
+  （`crates/probe-engine`，未接入流水线）；R4（DNS/ECS）、R5 其余部分未开始。
 - 原则：Python 实现保持为默认运行路径；Rust 以 shadow 双跑方式逐步逼近门禁。
 - 总控需求文档：`GLM_5.3_Flash_mihomo_probe_Rust_full_rewrite.md`（已入库）。
 
@@ -43,9 +44,11 @@
 - R1：Rust workspace + 纵向切片。
 - R2：SQLite 迁移体系（migrations/ + probe-cli db 五子命令 + Python 兼容保证）。
 - R3：Mihomo 控制器补全（lanes/select/egress/fetch/`mihomo -t` 校验器/culprit 定位）。
+- R5（部分）：`probe-engine` 分层并发闸门（global/per_source/per_server_ip/diagnose
+  + RoundCtx 取消语义）；13 个新测试；**未接入流水线**。
 
 ## 当前失败测试
-- 无。Python 568 通过 / 2 跳过；Rust 45 通过（R3 新增 15）。
+- 无。Python 568 通过 / 2 跳过；Rust **58 通过**（R3 后 45，R5 新增 13）。
 
 ## ADR 索引
 - ADR-0001 存储驱动：切片用 rusqlite(bundled)，R2 迁移落地时复评 sqlx（理由见 08）。
@@ -56,6 +59,7 @@
 
 ## 下一批可并行任务
 - R4：probe-dns（DoH + ECS + 二进制 fixture + fuzz，依赖 05）。
-- R5：delay 引擎 + 失败归类 + 分层并发 Limits（依赖 06）。
+- R5：把 `RoundCtx` 接进轮次流水线 + delay 引擎 + 失败归类（依赖 06）。
+- R5：用真机轮次数据复核四层并发阈值（现为比例初值）。
 - R7：整轮保护 GuardDecision/PublishDecision（依赖 03）。
 - 前端适配 /api/v1（依赖 10 契约冻结）。

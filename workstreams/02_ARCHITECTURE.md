@@ -8,10 +8,16 @@
 
 ## 设计决策
 - Workspace 布局（R1 已建立，见 crates/）：probe-domain / probe-config / probe-storage / probe-mihomo / probe-dns / probe-substore / probe-engine / probe-api / probe-scheduler / probe-observability / probe-supervisor / probe-cli。
+  - **已存在（R5 后）**：probe-domain / probe-config / probe-storage / probe-mihomo /
+    probe-engine / probe-api / probe-cli。其余仍为计划中，建 crate 时再落地（不建空壳）。
 - 依赖方向：domain ← config/dns/mihomo/substore/storage ← engine ← api/scheduler/cli。domain 不依赖 web/db/网络客户端。
+  - probe-engine 目前只依赖 tokio / tokio-util / thiserror —— 它决定"何时允许 IO"，
+    本身不做 IO；接流水线后才引入 mihomo/storage。
 - 技术栈（R1 锁定于 Cargo.lock）：tokio / axum / reqwest / serde+serde_json+serde_yaml / rusqlite(bundled) / tracing+tracing-subscriber / thiserror / sha2 / uuid / time / tokio-util。
   - 偏离说明：切片阶段用 rusqlite(bundled) 而非 sqlx——Windows 无系统 libsqlite，bundled 可复现构建；R2 迁移落地时复评（ADR-0001）。
   - hickory/prometheus client 在对应批次（R4/R9）引入，避免空壳依赖。
+  - **tokio-util 0.7.19（R5 引入）**：只用 `sync::CancellationToken`。注意 0.7 的 `sync`
+    模块**不受 feature 门控**，写 `features = ["sync"]` 会让依赖解析直接失败。
 - 容器最终形态：mihomo-probe-rs（控制面）+ mihomo（独立内核）+ cloudflared（可选）+ probe-supervisor（可选，最小权限容器操作）。
 - 配置合法性一律以 `mihomo -t` 为准；Rust YAML 反序列化成功不算数（R3 落地）。
 - **ADR-0004（2026-10-01，R3 后）语言选型：维持 Rust，否决 Go 重写。**
@@ -29,10 +35,12 @@
 
 ## 待办清单
 - [x] R1：workspace 骨架 + 首条纵向切片（config→controller→round→API）
-- [ ] R2：SQL migration 体系（migrations/ 目录，替代 Python 的代码内迁移）
-- [ ] R3：probe-mihomo 补 delay/lanes/egress
+- [x] R2：SQL migration 体系（migrations/ 目录，替代 Python 的代码内迁移）
+- [x] R3：probe-mihomo 补 lanes/select/egress/fetch/校验器
+- [x] R5：probe-engine 建立 + 分层并发闸门（仅闸门，未接流水线）
 - [ ] R4：probe-dns（DoH+ECS+fixture fuzz）
-- [ ] R5/R6：引擎与出口验证
+- [ ] R5：引擎（delay/失败归类）+ 闸门接入流水线
+- [ ] R6：出口验证与 ipmap
 - [ ] R7：状态机/整轮保护/原子发布
 - [ ] R8：Sub-Store 兼容 API
 - [ ] R9：调度/取消/指标

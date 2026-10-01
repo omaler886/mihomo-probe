@@ -10,34 +10,53 @@
 - 整轮保护：见 07 与 policy.round_is_suspect；补前端池全死告警、控制器失联不计 streak。
 - 自适应调度：现状=固定 30 分钟 + 手动 direct/chain 模式；L1/L2/L3 分层与按状态差异化周期为新增设计（R5/R9）。
 
-## 设计决策：分层并发 Limits（R5）
-现状只有单一 `concurrency=20` 的 ThreadPoolExecutor，无分层，无法阻止
-"某一台服务器被同一批节点打满"或"诊断车道拖垮快速车道"。R5 起改为显式分层：
+## 分层并发 Limits（R5）— **已实现**（`crates/probe-engine`）
+现状（Python）只有单一 `concurrency=20` 的 ThreadPoolExecutor，无分层，无法阻止
+"某一台服务器被同一批节点打满"或"诊断车道拖垮快速车道"。Rust 侧已改为显式分层：
 
 ```
 全局测试并发（global）
 ├── 每数据源并发（per_source）
-├── 每服务器 IP 并发（per_server_ip）   ← 防同一落地被打满
-├── 每出口 lane 并发（per_lane，出口验证阶段）
-└── 失败诊断并发（diagnose，与快速车道隔离）
+└── 每服务器 IP 并发（per_server_ip）   ← 防同一落地被打满
+
+失败诊断并发（diagnose）—— 与 global 平级，不在其下
 ```
 
-- 任务类型 `Job { source_id, node_id, variant }`，全部继承本轮 `context`。
-- 实现：`tokio::sync::Semaphore`（加权）+ `JoinSet` 回收；禁止无界 spawn。
-- **本轮取消后禁止继续写账本**（取消检查点须在每次 upsert 前）。
-- 要求：goroutine/task 可回收、无泄漏；大批量节点不无限占内存。
-- 诊断车道独立配额——快车道不被慢节点阻塞（外部方案的"三级管线"语义，
-  本仓库已由 `_test_phases` → `test_one` → `_verify_chain_payload` → `_verify_egress`
-  覆盖，此处只补并发隔离，不重造管线）。
+`diagnose` **刻意不挂在 global 之下**：它是"已经知道慢"的重测车道，
+挂在 global 下就会排到它所绕开的拥塞后面，失去隔离意义。
+代价是**单轮在飞峰值 = `global + diagnose`**，配置时两层要一起算。
 
-具体数值不写死，按真机压测确定；初值沿用现网 `concurrency=20` 作 global 上界。
+落点：`crates/probe-engine/src/limits.rs`（crate 在 02 的计划里已列，本批建立）。
+
+| 类型 | 职责 |
+|---|---|
+| `Limits` | 四层上限；`effective()` 把每层夹取到 `1..=1024`（**0 会死锁**，必须降级为 1） |
+| `Job` | `source_id` / `node_id` / `variant` / `server_ip` |
+| `Gate` | 四个信号量；按 key 惰性建 `Semaphore`，超 1024 个空闲条目自动剪枝 |
+| `Permit` | RAII，`Drop` 逆序归还；**没有** `release()` 方法（防重复释放/忘记释放） |
+| `RoundCtx` | `Arc<Gate>` + `CancellationToken`；`acquire` / `acquire_diagnose` / `check` |
+
+两条必须遵守的不变量：
+
+1. **固定获取顺序**：global → source → server_ip，任务不会回头要已持有的资源 →
+   不可能成环，因此不会死锁。破坏它的唯一方式是**同一个任务对同一个 key 取两次**：
+   信号量不可重入。链式节点会碰两个地址（前置 + 落地），所以 `Job::server_ip`
+   必须传**内核从本机拨出去的那个地址（前置）**，不能两个都传。
+2. **写账本前必须调 `RoundCtx::check()`**：持有 permit ≠ 轮次还有效。
+   取消后继续写，会让一个从未完成的测试去推进节点的失败计数
+   （Python 侧"控制器失联推进全节点 streak"就是这类事故）。
+
+取消语义：`acquire` 用 `select! { biased; cancel.cancelled() ... }`，
+取消优先于获取 —— 被取消的轮次不允许排队的任务再溜进来。
 
 ## 待办清单
+- [x] R5：分层并发 Limits（global/per_source/per_server_ip/diagnose）— 见上
+- [ ] R5：把 `RoundCtx` 接进实际轮次流水线（现在只有闸门本身，无调用方）
+- [ ] R5：用真机轮次数据复核四层阈值（当前 `from_concurrency(20)` 的比例值是初值，**不是调优结果**）
 - [ ] R5：delay 引擎+失败归类（对拍 test_one）
-- [ ] R5：分层并发 Limits（global/per_source/per_server_ip/diagnose）
 - [ ] R6：出口验证+ipmap 落地映射
 - [ ] R5/R9：L1/L2/L3 与自适应周期（ADR 先行）
-- [ ] R9：CancellationToken 取消/优雅停机
+- [ ] R9：CancellationToken 取消/优雅停机（闸门侧已具备，待接调度）
 
 ## 测试证据
 - Python 锚点：RetryTest/HttpsVerdictTest/ChainPayloadVerifyTest/ChainRoundTest/RoundBudgetTest 等（tests/test_logic.py）。

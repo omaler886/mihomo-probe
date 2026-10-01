@@ -5,6 +5,7 @@ members = [
     "crates/probe-config",
     "crates/probe-storage",
     "crates/probe-mihomo",
+    "crates/probe-engine",
     "crates/probe-api",
     "crates/probe-cli",
 ]
@@ -24,7 +25,19 @@ serde = { version = "1", features = ["derive"] }
 # shadow runs -- sorted keys would make every line differ for no reason.
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    # probe-engine's layered gate needs Semaphore; tests need time::timeout
+    # and time::sleep to prove the gate is not deadlocking.
+    "sync",
+    "time",
+] }
+# CancellationToken is the maintained answer to "stop this round"; hand-rolling
+# an AtomicBool would lose the wake-on-cancel that a blocked acquire needs.
+# `tokio_util::sync` is not feature-gated in 0.7, so no features are enabled.
+tokio-util = "0.7"
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",

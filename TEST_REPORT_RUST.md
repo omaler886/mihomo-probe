@@ -106,3 +106,70 @@ cargo clippy --workspace --all-targets -- -D warnings   # Finished（校验器�
   BageVM-Tokyo-2）/server 兜底）
 - controller 新增 select：PUT /proxies/{group}（200/204 ok，非 2xx 带正文报错）
 - 回归：R1/R2 全部用例通过
+
+---
+
+## R5（并发部分）— 2026-10-01
+
+新 crate `probe-engine`，本批只含分层并发闸门（`src/limits.rs`）。
+新增依赖：`tokio` 补 `sync`/`time` 特性、`tokio-util 0.7.19`（CancellationToken）。
+`tokio-util` 的 `sync` 模块在 0.7 中**不受 feature 门控**——写 `features = ["sync"]`
+会报 `tokio-util does not have that feature` 并中止解析（实测踩过）。
+
+### fmt / clippy
+```
+cargo fmt --all -- --check                                  # 通过
+cargo clippy --workspace --all-targets -- -D warnings       # Finished（零 lint；仅 Windows
+                                                            # 增量目录 os error 5 噪声）
+```
+
+### cargo test --workspace --locked（**58 通过 / 0 失败**，新增 13）
+```
+probe-engine 13:
+  global_limit_is_enforced                      global=2 / 8 个独立源与地址，全局峰值恰为 2
+  per_source_limit_serialises_a_single_source   同源 4 任务峰值 1；另有 3 个对照组任务
+                                                （独立源+独立 IP）证明 global 确实放行了 >1
+  per_server_ip_limit_serialises_one_address    同 IP 4 任务峰值 1；同样带对照组
+  all_three_layers_hold_at_once                 3 源 × 3 IP，三层同时生效，峰值均不越界
+  permits_return_to_the_pool                    12 任务后 available_permits 复原
+  cancel_fails_a_queued_job_instead_of_waiting  取消唤醒阻塞中的 acquire，返回 Cancelled
+  check_refuses_the_ledger_write_after_cancel   check() 在取消后拒绝写账本
+  mixed_load_finishes_within_budget             60 任务 / 4 源 / 3 IP，5s 内排空（死锁哨兵；
+                                                理论下限 ~0.5s）
+  diagnose_lane_runs_while_the_fast_lane_is_saturated  快车道打满时诊断车道仍可获取
+  idle_registry_entries_are_pruned              2098 个不同 IP 后注册表 < 256（跨多轮剪枝窗口）
+  zero_limits_degrade_to_serial_instead_of_hanging  全 0 上限夹取为 1，不死锁
+  effective_limits_clamp_at_the_ceiling         usize::MAX / 0 / 99999 的夹取
+  from_concurrency_keeps_the_deployed_ceiling   concurrency=20 → global 仍为 20
+其余 crate（probe-api 5 / config 6 / domain 2 / mihomo 23 / storage 9）回归通过
+```
+
+### 时序用例稳定性
+```
+for i in 1..10: cargo test -p probe-engine   → 10/10 轮 13 passed，无抖动
+```
+
+### 独立审查（只读 subagent）发现并修正的 7 项
+1. 模块文档把 `diagnose` 画成 `global` 的子层，与实现矛盾——`acquire_diagnose` 不取
+   global，诊断车道在 global 打满时仍可并发。**已改为平级并写明峰值是 `global + diagnose`**。
+2. `Permit` 注释称"逆序归还"，实际 `Vec` 正序 drop（global 先放）。已改注释。
+3. 剪枝测试断言 `ips <= 1024` 过弱（只要剪枝跑过一次就必过）。改为 2098 个 IP + `< 256`。
+4. 死锁哨兵 20s 过松（理论下限 ~0.5s）。降到 5s。
+5. per_source / per_server_ip 两测缺正向断言，可能因上层顺带串行而假阳性。
+   **加对照组后暴露了原断言设计错误**（4 个任务同源时 global 峰值必然是 1），已修正。
+6. `REGISTRY_PRUNE_AT` 的理由写成"长生命周期进程累积"——`Gate` 随轮次建销，不成立。
+   已改为"限制单轮内的分配"。
+7. §2.4 的"节点集合每轮都变"是未实测的前提。已改写为不依赖该前提的论证。
+
+### 已知限制（如实记录）
+- 本批只交付**闸门本身**，尚无调用方：未接入实际轮次流水线，因此
+  "取消后不写账本"目前由 API 约定保证，不是由类型系统强制。
+- **`diagnose` 不在 `global` 之下**（有意为之：否则会排在它所绕开的拥塞后面）。
+  因此单轮在飞峰值为 `global + diagnose`，配置两层时要一起算。
+- `Limits::from_concurrency(20)` 的 per_source/per_server_ip/diagnose 是**比例初值**，
+  未用真机数据调优（06 已列为待办）。
+- 同一任务对同一 key 取两次会自锁（信号量不可重入）；链式节点必须传前置地址。
+  这是调用方契约，**代码层无法强制**，只能靠文档与 code review。
+- 未做 `-race` 等价检查（Rust 无 `-race`；Miri/loom 选型在 14 的 R12 批次）。
+- 单元测试全部用 `multi_thread` 运行时，但仍在单机 4 线程下跑；真机高并发未验证。
+

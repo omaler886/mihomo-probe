@@ -4,10 +4,11 @@
 按总控 §21 完成定义逐项留证；未达标项如实标注。
 
 ## 当前状态：未完成（进行中）
-R0~R3 已交付（R0=6360e31，R1=4e5c1af，R2=87a710d，R3=控制器补全）；R4~R12 未开始。逐项门禁现状：
+R0~R3 已交付（R0=6360e31，R1=4e5c1af，R2=87a710d，R3=控制器补全）；
+R5 的**分层并发闸门**已交付（`crates/probe-engine`，未接流水线）；R4 与 R5 其余部分未开始。逐项门禁现状：
 | 门禁 | 状态 | 证据 |
 |---|---|---|
-| Rust 干净环境构建/启动/健康检查 | 部分达成：本机 cargo fmt/clippy/test --locked 45 通过 + CLI 冒烟（含 /healthz /readyz）；容器化待 R12 | TEST_REPORT_RUST.md |
+| Rust 干净环境构建/启动/健康检查 | 部分达成：本机 cargo fmt/clippy/test --locked 58 通过 + CLI 冒烟（含 /healthz /readyz）；容器化待 R12 | TEST_REPORT_RUST.md |
 | 真 Mihomo 端到端测活 | 未达成（本机无内核；Rust 切片只到 controller reload，真内核待 vps） | - |
 | 旧数据无损迁移 | Python 旧库→Rust 迁移演练通过（备份/保全/Python 复读/回滚守卫）；真部署库迁移待 vps | TEST_REPORT_RUST.md R2 |
 | shadow 双跑差异 | 未开始（R10） | - |
@@ -15,7 +16,7 @@ R0~R3 已交付（R0=6360e31，R1=4e5c1af，R2=87a710d，R3=控制器补全）�
 | Sub-Store 双路径 | Python 侧达成（554 测试含契约）；Rust 待 R8 | test_substore_bridge |
 | token 不入 API/日志/指标/历史 | 本机工作区 + 新增内容已由 scanner 验证 | tools/scan_secrets.py |
 | Docker Socket 移除/supervisor | 方案 ADR-0002 已定，实施 R12 | workstreams/12 |
-| 强制测试与静态检查 | Python 568 通过 / 2 跳；Rust 45 通过 + fmt/clippy -D warnings 干净 | TEST_REPORT_RUST.md |
+| 强制测试与静态检查 | Python 568 通过 / 2 跳；Rust 58 通过 + fmt/clippy -D warnings 干净 | TEST_REPORT_RUST.md |
 | 一条命令回滚 | Python 现网回滚=git revert + compose rebuild；Rust 切换后复验 | - |
 
 ## 外部方案核对（2026-10-01）
@@ -33,7 +34,7 @@ R0~R3 已交付（R0=6360e31，R1=4e5c1af，R2=87a710d，R3=控制器补全）�
 | P1-6 模块职责混合 | 禁止巨型 `engine.go` | **已满足** | 6 个 crate 单向依赖（02） |
 | §2.2 三级测试管线 | 建议 | **已具备** | `_test_phases` → `test_one` → `_verify_chain_payload` → `_verify_egress`（06） |
 | §2.3 分层并发 | 建议 | **已并入**（R5 实现） | 06 |
-| §2.4 配置哈希跳过 reload | 建议 | **未实现**，已列 R5 待评估（收益存疑） | `core.py:519` 无条件 PUT；见 04 |
+| §2.4 配置哈希跳过 reload | 建议 | **已评估，不采纳**：每轮仅 1 次 reload，命中率 100% 也只省 1 个 PUT | `engine.py:1250` 单一调用点（不在循环内）；见 04 |
 | §2.5 SQLite PRAGMA / 索引 | 建议 | **已满足，无缺口** | `probe-storage/src/lib.rs:21-23`；`0001:31,61`；见 08 |
 | §9 整轮护栏 7 条 | 建议 | **7 条中 6 条已具备**，1 条待 ADR | 03 |
 | §10 Prometheus 指标 | 建议 | **已并入**（R9 实现） | 11 |
@@ -42,7 +43,7 @@ R0~R3 已交付（R0=6360e31，R1=4e5c1af，R2=87a710d，R3=控制器补全）�
 **已并入的 6 项**：13（Golden 夹具清单 / Shadow 差异报告 / 机器可读汇总）、06（分层并发）、
 03（护栏 7 条 + `inconclusive` 候选）、11（指标清单）、14（CI 门禁对照）。
 **核对后无可执行缺口**：§2.5（PRAGMA/索引）——含 `foreign_keys=ON` 一项，因 schema 无外键而不适用（08）。
-**列 R5 待评估**：§2.4（配置哈希跳过 reload）——先测收益，再决定是否引入（04）。
+**列 R5 待评估**：无（§2.4 已评估完毕，结论为不采纳，见 04）。
 **未并入**：语言与架构部分（Go 重写、Mihomo 源码树合并、单二进制）——ADR-0004 已否决。
 
 ## 结论
