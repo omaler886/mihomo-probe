@@ -14,11 +14,25 @@ Rust 侧重建 core.py 的内核控制面：配置生成、`mihomo -t` 校验、
 - probe-mihomo：ConfigBuilder（与 Python 逐字段一致，快照测试对拍）、Controller 客户端（reqwest，固定超时）、ReasonClassifier（对拍 Python _reason_from）。
 - `mihomo -t` 校验：默认经 supervisor；无 docker 时返回 Err 而非跳过（与 Python 行为差异，记入 13 兼容清单由双跑门禁裁决）。
 
+## 待评估：配置内容哈希跳过 reload（外部方案 §2.4）
+现状：`core.py:519 reload()` 无条件 `PUT /configs?force=true`，**没有内容比对**；
+`build_config` 每轮重写配置文件后即 reload（`core.py:423`）。
+外部方案建议：对规范化 YAML 算 SHA-256，与当前运行配置相同则跳过校验与 reload；
+并把变化分类为「节点集合 / 内核运行配置 / 测试目标 / Web 配置 / 通知配置」，
+**只有影响内核的变化才触发 reload**。
+
+先评估收益再决定实现——本仓库的配置里内嵌整轮待测节点集合，
+**节点集合每轮都变 → 哈希大概率不同 → 主要收益只落在两个场景**：
+同一轮内的重复 reload、以及仅非内核配置（告警/发布）变化时的空 reload。
+若实测这两类场景占比很低，则不值得引入哈希层（多一个失效面）。
+R5 用真实轮次数据统计 reload 次数与哈希命中率后再裁决。
+
 ## 待办清单
 - [x] R1：ConfigBuilder + /version + reload + reason 分类（切片）
 - [x] R3：lanes（lane_count/ports/命名）+ select + egress/fetch + `mihomo -t` 校验器
       （MIHOMO_BIN > docker > 显式 Degraded）+ culprit_from 移植（含 jp 误匹配回归）
 - [ ] R5：make_testable 裁剪循环移植（随引擎 entry/fp 模型一并落地）
+- [ ] R5：评估「配置内容哈希跳过 reload」收益（数据先行，见上）
 
 ## 测试证据
 - Rust 单测：配置快照、reason 分类表、mock controller（version/reload/delay/select/鉴权中间件）、

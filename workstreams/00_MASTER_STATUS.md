@@ -41,15 +41,21 @@
 ## 已合并提交
 - R0：审计工作台 + P0 整改（见 CHANGELOG_RUST.md R0 条目）。
 - R1：Rust workspace + 纵向切片。
+- R2：SQLite 迁移体系（migrations/ + probe-cli db 五子命令 + Python 兼容保证）。
+- R3：Mihomo 控制器补全（lanes/select/egress/fetch/`mihomo -t` 校验器/culprit 定位）。
 
 ## 当前失败测试
 - 无。Python 568 通过 / 2 跳过；Rust 45 通过（R3 新增 15）。
 
-## 待决策 ADR
+## ADR 索引
 - ADR-0001 存储驱动：切片用 rusqlite(bundled)，R2 迁移落地时复评 sqlx（理由见 08）。
 - ADR-0002 Docker Socket 退役路径：三步走（见 12）。
+- ADR-0003 / 0003b 迁移框架与表改名时机（R2 定稿，见 08）。
+- ADR-0004 语言选型：维持 Rust，否决 Go 重写（2026-10-01，见 02；外部 Go 合并方案已评估）。
+- ADR-0005（待写）轮次 `inconclusive` 态：引入前先落 ADR（见 03）。
 
 ## 下一批可并行任务
-- R2：SQLite schema/迁移（依赖 03 定稿）。
-- R3：Mihomo Controller Rust 侧补全 delay/lanes（切片已含 version/reload）。
+- R4：probe-dns（DoH + ECS + 二进制 fixture + fuzz，依赖 05）。
+- R5：delay 引擎 + 失败归类 + 分层并发 Limits（依赖 06）。
+- R7：整轮保护 GuardDecision/PublishDecision（依赖 03）。
 - 前端适配 /api/v1（依赖 10 契约冻结）。

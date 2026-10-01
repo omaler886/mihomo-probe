@@ -21,10 +21,42 @@
 - 新增态 degraded/quarantined/stale 暂不引入；引入前先写 ADR（总控 §4）。
 - 失败类别 FailureKind 对齐 engine 现有 14 种 reason 字符串，旧 API/库迁移提供兼容映射。
 
+## 整轮护栏（R7，来源：外部 Go 方案 §九 + 本仓库现状核对）
+目的是"测试基础设施故障不得导致全部节点被误杀"。逐条与现状核对如下——
+**多数已具备，R7 的任务是把它们收进一个显式的 `GuardDecision` 枚举，而不是新造逻辑**：
+
+| # | 规则 | 现状 |
+|---|---|---|
+| 1 | 测试目标本身不可达 → 本轮不更新死亡状态 | 部分具备：控制器失联不计 streak（06）；trace 目标故障 → 不发布（07）。R7 统一判定 |
+| 2 | Mihomo 内核异常 → 本轮标记 `inconclusive` | **未具备**，见下 |
+| 3 | 数据源返回空集合 → 不删除既有节点 | 已具备：`demote_disabled_sources` 降 unknown 而非杀 |
+| 4 | 单轮失败率突增超阈值 → 进入保护模式 | 已具备：`round_is_suspect`（ratio 0.5 / absolute 3） |
+| 5 | 保护模式下保留上一轮有效发布结果 | 已具备：suspect 轮不发布 |
+| 6 | 连续多个有效轮次失败才判死 | 已具备：`drop_after_consecutive_fails = 3` |
+| 7 | 恢复成功后清零 / 按策略递减失败计数 | 已具备：成功 → alive + `consec_fail = 0`，记 `restore` |
+
+目标形态（R7）：
+
+```rust
+enum GuardDecision { ApplyConvergence, PreservePreviousState, MarkRoundInconclusive }
+```
+
+阈值不得写死，须结合真实历史轮次数据确定（现状 0.5/3 是经验值，R7 用真数据复核）。
+
+### 关于 `inconclusive`（**ADR 前置，未定稿**）
+外部方案要求"内核异常时本轮标记 inconclusive"。但本文件既定约束是
+**新增态引入前必须先写 ADR**（总控 §4），因此此处只登记为候选：
+- 候选语义：轮次级（`rounds` 表）标记，**不是**节点级第六态。
+  节点态仍为 unknown/alive/pending/dead/excluded 五态不变。
+- 优点：把"内核坏了"与"节点真死了"分开，避免前者污染 `consec_fail`。
+- 需裁决：是否新增列、Python 读取方（shadow 期共享同一张 `rounds` 表）如何兼容。
+- 已登记为 `ADR-0005（待写）`，见 00_MASTER_STATUS。
+
 ## 待办清单
 - [ ] R1：切片内 RoundState/RoundId 最小模型
 - [ ] R2：完整 NodeState/policy.apply 移植 + 与 Python 对拍测试
-- [ ] R7：整轮保护 GuardDecision/PublishDecision
+- [ ] R7：`GuardDecision` 枚举 + 上表 7 条显式化（阈值用真数据复核）
+- [ ] R7 前：ADR-0005 `inconclusive` 轮次态裁决
 
 ## 修改记录
 | 时间 | 文件 | 变更 | 原因 |

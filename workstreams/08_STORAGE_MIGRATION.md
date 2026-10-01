@@ -18,9 +18,26 @@ SQL migration 体系 + Python SQLite 无损迁移（总控 §11）。
 - migrations/ 目录 + schema_migrations 表；迁移前自动备份；probe-cli db check/migrate。
 - Rust 表结构在 Python 现有 schema 上扩展（rounds/observations/node_state_history/exports/export_snapshots/config_audit/security_audit 等），不删历史数据。
 
+## 外部方案 §2.5（PRAGMA / 索引）核对 — 2026-10-01
+外部 Go 方案给了三条 PRAGMA 与三条索引建议。逐条核对结果：**基本已满足，无可执行缺口**。
+
+| 方案建议 | 核对结果 | 证据 |
+|---|---|---|
+| `journal_mode=WAL` | ✅ 已有 | `crates/probe-storage/src/lib.rs:21` |
+| `synchronous=NORMAL` | ✅ 已有 | `lib.rs:23` |
+| `busy_timeout=5000` | ✅ 已有且更宽（30000） | `lib.rs:22`；与 Python `db.py` 一致 |
+| `foreign_keys=ON` | ⚠️ **不适用** | `migrations/*.sql` 中**没有任何 `REFERENCES` / `FOREIGN KEY`**——schema 不靠外键约束，开了也无对象可约束。**不加**（加了只是徒增一次 PRAGMA） |
+| `UNIQUE INDEX (source_id, fingerprint)` | ✅ 已是主键 | `0001_python_compat.sql:31` `PRIMARY KEY (source, fingerprint)` |
+| `INDEX (round_id, node_id)` | ✅ 实质覆盖 | `0001:61` `idx_results_round ON results(round_id)`；另有 `idx_results_node(source, fingerprint)`、`idx_results_source_round(source, round_id DESC)`。复合 `(round_id, node_id)` 仅在「同时按两者等值查」时更优，当前无此查询模式 → **不加** |
+| `INDEX (status, consecutive_failures)` | ✅ 已有等价 | `idx_nodes_source(source)`；节点表规模为数百行，全表扫描成本可忽略 → **不加** |
+
+结论：**R2 的 schema 无需因外部方案改动**。若 R10 双跑后发现真实慢查询，再按实测加索引
+（索引不是越多越好，写路径要为每个索引付代价）。
+
 ## 待办清单
 - [x] R1：切片 round 表读写（兼容现有列）
 - [x] R2：migrations + 迁移 CLI（db check/migrate/verify/backup/rollback）+ 回滚演练
+- [x] R2：核对外部方案 §2.5 的 PRAGMA/索引建议（结论：无缺口，见上）
 - [ ] R10：Python↔Rust 双跑数据比对工具（读同库，校验计数与语义）
 
 ## 测试证据
