@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+probe-domain = { path = "../probe-domain" }
+probe-config = { path = "../probe-config" }
+# workstreams/02 dependency order: domain <- mihomo/storage <- engine <- api/cli.
+# The engine decides *what* runs and *how much at once*; the kernel adapter and
+# the ledger arrive through traits, so tests need neither a kernel nor a file.
+probe-mihomo = { path = "../probe-mihomo" }
+probe-storage = { path = "../probe-storage" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }

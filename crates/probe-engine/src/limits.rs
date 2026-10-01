@@ -115,14 +115,20 @@ impl Limits {
     }
 }
 
-/// One unit of work, identified by the three keys the layers limit on.
+/// One unit of work, identified by the keys each consumer needs.
 ///
-/// `node_id` and `variant` are carried for the ledger and metrics, not for
-/// admission control -- the gate only reads `source_id` and `server_ip`.
+/// The gate only reads `source_id` and `server_ip`; the other three travel
+/// with the job so the result can be attributed without a side lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub source_id: String,
-    pub node_id: String,
+    /// Ledger identity -- lands in `results.fingerprint`.
+    pub fingerprint: String,
+    /// Kernel proxy name -- what `GET /proxies/{name}/delay` addresses. Unique
+    /// within one generated config because `prepare()` de-duplicates, but it is
+    /// a display name and not stable across rounds: never key on it.
+    pub proxy_name: String,
+    /// `direct` / `chain`; lands in `results.category`.
     pub variant: String,
     /// The address the kernel dials from this host. For a chain node that is
     /// the *front*, not the landing -- see the module docs.
@@ -132,13 +138,15 @@ pub struct Job {
 impl Job {
     pub fn new(
         source_id: impl Into<String>,
-        node_id: impl Into<String>,
+        fingerprint: impl Into<String>,
+        proxy_name: impl Into<String>,
         variant: impl Into<String>,
         server_ip: impl Into<String>,
     ) -> Self {
         Self {
             source_id: source_id.into(),
-            node_id: node_id.into(),
+            fingerprint: fingerprint.into(),
+            proxy_name: proxy_name.into(),
             variant: variant.into(),
             server_ip: server_ip.into(),
         }
@@ -193,6 +201,19 @@ impl Gate {
     /// The limits actually in force (after clamping).
     pub fn limits(&self) -> Limits {
         self.limits
+    }
+
+    /// Free slots on the fast-lane and diagnostic pools.
+    ///
+    /// The fast-lane figure is the `global` pool only: the per-source and
+    /// per-address pools are created lazily and are meaningless when empty.
+    /// After a round has drained this must read back as the configured widths
+    /// -- that is the leak check, and it is what R9 will export as a gauge.
+    pub fn available_permits(&self) -> (usize, usize) {
+        (
+            self.global.available_permits(),
+            self.diagnose.available_permits(),
+        )
     }
 
     /// Take a slot on all three fast-lane layers.
@@ -407,7 +428,13 @@ mod tests {
     }
 
     fn job(source: &str, ip: &str) -> Job {
-        Job::new(source, format!("{source}-{ip}"), "direct", ip)
+        Job::new(
+            source,
+            format!("{source}-{ip}-fp"),
+            format!("{source}-{ip}"),
+            "direct",
+            ip,
+        )
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

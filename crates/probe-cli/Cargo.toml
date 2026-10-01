@@ -11,6 +11,7 @@ path = "src/main.rs"
 probe-api = { path = "../probe-api" }
 probe-config = { path = "../probe-config" }
 probe-domain = { path = "../probe-domain" }
+probe-engine = { path = "../probe-engine" }
 probe-mihomo = { path = "../probe-mihomo" }
 probe-storage = { path = "../probe-storage" }
 serde_json = { workspace = true }

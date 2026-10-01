@@ -19,6 +19,11 @@ GET /healthz, /readyz, /metrics, /api/v1/status, /api/v1/nodes, /api/v1/nodes/{f
 ## 待办清单
 - [x] R0：P0 泄密/兼容标记修复（本文件"泄密/鉴权"节）
 - [x] R1：axum /healthz /readyz /api/v1/status POST /api/v1/rounds（切片；鉴权 Bearer/X-Auth-Token，无 query 通道；401/409/202；单测 5 例 + 冒烟）
+- [x] R5：`POST /api/v1/rounds` 改为驱动 `probe-engine::run_round`
+      （轮次行由 handler 同步开启以便在响应里返回 `round_id`，由 runner 关闭；
+      响应体形状不变，仍是 `{"round_id": <id>, "started": true}`）
+- [ ] R9：`POST /api/v1/rounds/{id}/cancel`（runner 与闸门的取消语义已具备并已测，
+      缺的只是对外入口）
 - [ ] R8：补全 v1 其余端点 + OpenAPI schema
 - [ ] R8+：UI 适配（先复用静态页）
 

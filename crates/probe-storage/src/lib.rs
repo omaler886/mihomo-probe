@@ -27,6 +27,29 @@ pub struct Storage {
     conn: Connection,
 }
 
+/// The `results.verdict` vocabulary, copied from Python `engine.py`
+/// (`"ok" if ok else "fail"`, plus `"excluded"` for a node skipped because its
+/// entry sits in a restricted ISP). Shared on purpose: a divergent string here
+/// makes every shadow comparison a manual exercise.
+pub const VERDICT_OK: &str = "ok";
+pub const VERDICT_FAIL: &str = "fail";
+pub const VERDICT_EXCLUDED: &str = "excluded";
+
+/// One row of the shared `results` table.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResultRow {
+    pub source: String,
+    pub fingerprint: String,
+    pub display: Option<String>,
+    pub verdict: Option<String>,
+    pub delay_ms: Option<i64>,
+    pub reason: Option<String>,
+    pub country: Option<String>,
+    pub attempts: Option<i64>,
+    pub detail: Option<String>,
+    pub category: Option<String>,
+}
+
 /// UTC, second precision, no suffix -- must match `db.now()` byte for byte so
 /// the two implementations' rows are indistinguishable in one ledger.
 pub fn utc_now() -> String {
@@ -140,6 +163,117 @@ impl Storage {
         Ok(())
     }
 
+    /// Close a round with its counts in one statement.
+    ///
+    /// The Python service writes `total`/`ok`/`failed` on the same row, and
+    /// workstreams/13 requires the two ledgers to be indistinguishable during
+    /// shadow runs -- so a Rust round that closed with 0/0 would show up as a
+    /// difference that has nothing to do with node testing.
+    pub fn finish_round_with_counts(
+        &self,
+        round_id: RoundId,
+        note: Option<&str>,
+        total: i64,
+        ok: i64,
+        failed: i64,
+    ) -> DomainResult<()> {
+        self.conn
+            .execute(
+                "UPDATE rounds SET finished_at = ?1, note = COALESCE(?2, note),
+                 total = ?3, ok = ?4, failed = ?5 WHERE id = ?6",
+                rusqlite::params![utc_now(), note, total, ok, failed, round_id],
+            )
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Write one round's per-node results in a SINGLE transaction.
+    ///
+    /// Python commits per node (`db.record_result` per row); at a few hundred
+    /// nodes that is a few hundred fsyncs per round, which is why the external
+    /// review's §2.5 and workstreams/08 both ask for one write transaction per
+    /// round. Returns the number of rows written.
+    ///
+    /// An empty slice is a no-op, not an empty transaction.
+    ///
+    /// `unchecked_transaction` (rather than `transaction`) is what `&self`
+    /// allows -- it skips the borrow-checked "no other statement on this
+    /// connection while the transaction is open" guarantee. That is safe here
+    /// only because every caller reaches a `Storage` through a `Mutex`, so no
+    /// second statement can interleave. Do not hand a `Storage` to two threads
+    /// or two concurrent futures.
+    pub fn record_results(&self, round_id: RoundId, rows: &[ResultRow]) -> DomainResult<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO results(round_id, source, fingerprint, display, verdict,
+                     delay_ms, reason, country, attempts, detail, category)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                )
+                .map_err(|e| DomainError::Storage(e.to_string()))?;
+            for row in rows {
+                stmt.execute(rusqlite::params![
+                    round_id,
+                    row.source,
+                    row.fingerprint,
+                    row.display,
+                    row.verdict,
+                    row.delay_ms,
+                    row.reason,
+                    row.country,
+                    row.attempts,
+                    row.detail,
+                    row.category,
+                ])
+                .map_err(|e| DomainError::Storage(e.to_string()))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        Ok(rows.len())
+    }
+
+    /// Result rows for one round, newest round first -- the read side of
+    /// `record_results`, and what the shadow comparison diffs.
+    pub fn results_for_round(&self, round_id: RoundId) -> DomainResult<Vec<ResultRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT source, fingerprint, display, verdict, delay_ms, reason,
+                 country, attempts, detail, category
+                 FROM results WHERE round_id = ?1 ORDER BY source, fingerprint",
+            )
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map([round_id], |row| {
+                Ok(ResultRow {
+                    source: row.get(0)?,
+                    fingerprint: row.get(1)?,
+                    display: row.get(2)?,
+                    verdict: row.get(3)?,
+                    delay_ms: row.get(4)?,
+                    reason: row.get(5)?,
+                    country: row.get(6)?,
+                    attempts: row.get(7)?,
+                    detail: row.get(8)?,
+                    category: row.get(9)?,
+                })
+            })
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| DomainError::Storage(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
     pub fn last_round(&self) -> DomainResult<Option<RoundSummary>> {
         let mut stmt = self
             .conn
@@ -247,6 +381,113 @@ mod tests {
     fn an_empty_ledger_reads_as_no_last_round() {
         let storage = Storage::open_in_memory().unwrap();
         assert!(storage.last_round().unwrap().is_none());
+    }
+
+    #[test]
+    fn results_roundtrip_through_one_round() {
+        let storage = Storage::open_in_memory().unwrap();
+        let round = storage.start_round("cli", None).unwrap();
+        let rows = vec![
+            ResultRow {
+                source: "air".into(),
+                fingerprint: "0123456789abcdef".into(),
+                display: Some("node-a".into()),
+                verdict: Some(VERDICT_OK.into()),
+                delay_ms: Some(233),
+                reason: None,
+                country: Some("JP".into()),
+                attempts: Some(1),
+                detail: Some(String::new()),
+                category: Some("direct".into()),
+            },
+            ResultRow {
+                source: "air".into(),
+                fingerprint: "fedcba9876543210".into(),
+                display: Some("node-b".into()),
+                verdict: Some(VERDICT_FAIL.into()),
+                delay_ms: None,
+                reason: Some("timeout".into()),
+                country: None,
+                attempts: Some(3),
+                detail: Some("Timeout".into()),
+                category: Some("chain".into()),
+            },
+        ];
+        assert_eq!(storage.record_results(round, &rows).unwrap(), 2);
+        let back = storage.results_for_round(round).unwrap();
+        assert_eq!(back, rows, "rows must survive verbatim, order included");
+        assert_eq!(back[0].verdict.as_deref(), Some(VERDICT_OK));
+        assert_eq!(back[1].reason.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn recording_no_results_writes_nothing() {
+        let storage = Storage::open_in_memory().unwrap();
+        let round = storage.start_round("cli", None).unwrap();
+        assert_eq!(storage.record_results(round, &[]).unwrap(), 0);
+        assert!(storage.results_for_round(round).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_batch_that_fails_midway_leaves_no_rows() {
+        // Proves the batch really is one transaction. The trigger aborts on the
+        // SECOND row; without a transaction the first would already be
+        // committed and a shadow diff would see a half-written round.
+        let storage = Storage::open_in_memory().unwrap();
+        let round = storage.start_round("cli", None).unwrap();
+        storage
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER poison BEFORE INSERT ON results
+                 WHEN NEW.fingerprint = 'poison'
+                 BEGIN SELECT RAISE(ABORT, 'poison row'); END;",
+            )
+            .unwrap();
+        let rows = vec![
+            ResultRow {
+                source: "air".into(),
+                fingerprint: "good".into(),
+                verdict: Some(VERDICT_OK.into()),
+                ..Default::default()
+            },
+            ResultRow {
+                source: "air".into(),
+                fingerprint: "poison".into(),
+                verdict: Some(VERDICT_FAIL.into()),
+                ..Default::default()
+            },
+            ResultRow {
+                source: "air".into(),
+                fingerprint: "never-reached".into(),
+                ..Default::default()
+            },
+        ];
+        let err = storage.record_results(round, &rows).unwrap_err();
+        assert!(err.to_string().contains("poison"), "{err}");
+        assert!(
+            storage.results_for_round(round).unwrap().is_empty(),
+            "the first row must have rolled back with the batch"
+        );
+        // And the connection is still usable afterwards.
+        storage.conn.execute_batch("DROP TRIGGER poison").unwrap();
+        assert_eq!(
+            storage.record_results(round, &rows[..1]).unwrap(),
+            1,
+            "a later batch on the same connection must still work"
+        );
+    }
+
+    #[test]
+    fn finish_with_counts_writes_the_totals_python_expects() {
+        let storage = Storage::open_in_memory().unwrap();
+        let round = storage.start_round("api", None).unwrap();
+        storage
+            .finish_round_with_counts(round, Some("tested 3"), 3, 2, 1)
+            .unwrap();
+        let last = storage.last_round().unwrap().unwrap();
+        assert_eq!((last.total, last.ok), (3, 2));
+        assert_eq!(last.note.as_deref(), Some("tested 3"));
+        assert!(last.finished_at.is_some());
     }
 
     #[test]

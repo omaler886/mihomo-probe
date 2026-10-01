@@ -13,10 +13,11 @@
 //!     probe-cli --root <dir> db rollback --from P [--yes]
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use probe_api::AppState;
 use probe_config::Config;
+use probe_engine::{run_round, Ledger, RoundPlan, RoundSettings};
 use probe_mihomo::Controller;
 use probe_storage::{migrations, Storage};
 
@@ -127,38 +128,47 @@ fn cmd_round(root: &Path, trigger: &str) {
     let cfg = load(root);
     let storage = Storage::open(&db_path(root)).expect("open ledger");
     let secret = Config::core_secret(&root.join("data")).expect("core secret");
-    let round_id = storage.start_round(trigger, None).expect("start round");
-    // Slice scope: generate the kernel config the round would load, then try
-    // the controller. Engine phases (DNS, delay, egress, publish) land in
-    // R4-R7; the invariant that must hold from day one is that the round row
-    // always closes.
+    let controller = Controller::new(&cfg.core.api, Some(&secret));
+
+    // Config generation stays here rather than moving into the runner: it is a
+    // config concern, and the node source that fills `proxies` arrives with
+    // R5's collection phase. Until then a round has a kernel but no nodes.
     let proxies: Vec<serde_json::Value> = Vec::new();
-    let written = probe_mihomo::write_config(&root.join("core"), &cfg.core, &secret, &proxies)
-        .map_err(|e| probe_domain::DomainError::Config(e.to_string()));
-    let note = match written {
-        Ok(path) => {
-            let controller = Controller::new(&cfg.core.api, Some(&secret));
-            let outcome = tokio_block(async {
-                if controller.version().await.is_err() {
-                    format!("slice: controller unreachable ({})", controller.url())
-                } else if controller
-                    .reload(&cfg.core.container_config_path)
-                    .await
-                    .unwrap_or(false)
-                {
-                    "slice: config reloaded into kernel".to_string()
-                } else {
-                    "slice: reload refused; recreate the kernel container".to_string()
-                }
-            });
-            format!("slice round: config at {}; {outcome}", path.display())
-        }
-        Err(err) => format!("slice round: config generation failed: {err}"),
+    let written = probe_mihomo::write_config(&root.join("core"), &cfg.core, &secret, &proxies);
+
+    let mut settings = RoundSettings::from_config(&cfg);
+    // A failed write means there is no config for the kernel to load. The
+    // round still opens and closes a row, and says why.
+    if let Err(err) = &written {
+        settings.blocked = Some(err.to_string());
+    }
+
+    let plan = RoundPlan {
+        trigger: trigger.to_string(),
+        mode: None,
+        jobs: Vec::new(),
     };
-    storage
-        .finish_round(round_id, Some(&note))
-        .expect("finish round");
-    println!("round {round_id}: {note}");
+    let ledger: Arc<dyn Ledger> = Arc::new(Mutex::new(storage));
+    // The caller opens the row; the runner closes it on every path.
+    let round_id = ledger.start_round(trigger, None).unwrap_or_else(|err| {
+        eprintln!("could not open a round row: {err}");
+        std::process::exit(1);
+    });
+    let kernel = settings.kernel_prep(controller.clone(), &cfg.core.container_config_path);
+    let tester = settings.tester(controller);
+    let outcome = tokio_block(run_round(
+        round_id,
+        plan,
+        settings.limits,
+        kernel,
+        tester,
+        ledger,
+    ))
+    .unwrap_or_else(|err| {
+        eprintln!("round failed: {err}");
+        std::process::exit(1);
+    });
+    println!("round {}: {}", outcome.round_id, outcome.note);
 }
 
 /// `db` subcommands. Returns the process exit code.
@@ -375,6 +385,7 @@ async fn cmd_serve(root: &Path, host: &str, port: u16) -> std::io::Result<()> {
         cfg.auth_token.clone(),
         controller,
         cfg.core.container_config_path.clone(),
+        RoundSettings::from_config(&cfg),
     ));
     tracing_subscriber::fmt()
         .with_env_filter(

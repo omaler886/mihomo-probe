@@ -49,14 +49,47 @@
 取消语义：`acquire` 用 `select! { biased; cancel.cancelled() ... }`，
 取消优先于获取 —— 被取消的轮次不允许排队的任务再溜进来。
 
+## RoundRunner：闸门接入流水线（R5）— **已实现**
+此前轮次逻辑**有两份**（`probe-cli::cmd_round`、`probe-api::start_round`），
+都是同一段占位代码且都没走闸门 —— `RoundCtx` 没有调用方。现在收成一条路径：
+`crates/probe-engine/src/round.rs::run_round`。
+
+| 环节 | 谁负责 |
+|---|---|
+| 开轮次行 | **调用方**（`Ledger::start_round`）—— API 要在响应里返回 `round_id`，等不了 spawned task |
+| 内核准备 | `KernelPrep`：`ControllerPrep`（version + reload）或 `NotPrepared`（配置生成失败） |
+| 节点测试 | `NodeTester` 经 `RoundCtx` 逐层取槽；`KernelDelayTester` 是真实实现 |
+| 写结果 | `Ledger::record_verdicts`，**单事务批量**（外部方案 §2.5 的要求） |
+| 关轮次行 | `run_round`，**每条路径都关**（唯一的例外：`finish_round` 自身失败，
+  此时行确实留在打开态——`run_round` 把该错误原样返回，日志明确报出，
+  依赖 `open_round_ids()` / 孤儿回收） |
+
+**取消的两条不同规则**（容易混）：
+- 取消后**不写结果** —— 掉队者的判定属于一个已经不存在的轮次，写下去会推进失败计数；
+- 取消后**仍要关轮次行** —— "别写"和"别把账本留成孤儿"是两件事。
+
+内核不可达 / 配置生成失败 → **跳过节点阶段**（与 03 的整轮护栏同一条原则：
+基础设施故障不得记成节点故障），轮次行照常关闭。
+
+测试目标的选择与 Python 对齐：取 `test.targets` 稳定分区后的**首个**目标
+（有 https 就是 https），"是否要求 https"由它决定 ——
+`https_required = 首个目标是 https`。**全 http 目标列表不算"无法测试"**，
+Python 在该情况下会把 http 通过当作存活；Rust 若把它当 blocked 就会在每轮
+双跑里制造一处无意义的差异（这条曾被独立审查指出，已改）。
+
 ## 待办清单
 - [x] R5：分层并发 Limits（global/per_source/per_server_ip/diagnose）— 见上
-- [ ] R5：把 `RoundCtx` 接进实际轮次流水线（现在只有闸门本身，无调用方）
+- [x] R5：`RoundCtx` 接进轮次流水线（`run_round` + 单事务结果写入 + 取消语义）
+- [ ] R5：**节点采集**（Sub-Store → fingerprint → 变体）—— 现在 `jobs` 恒为空，
+      闸门接上了但还没限到东西
+- [ ] R5：`test_one` 的 HTTPS 优先重排 + `max_attempts=3` + 超时升级 + TERMINAL_REASONS
+      （现在只做一次尝试、只打第一个 HTTPS 目标，`attempts` 恒为 1）
 - [ ] R5：用真机轮次数据复核四层阈值（当前 `from_concurrency(20)` 的比例值是初值，**不是调优结果**）
 - [ ] R5：delay 引擎+失败归类（对拍 test_one）
 - [ ] R6：出口验证+ipmap 落地映射
+- [ ] R7：整轮护栏 `GuardDecision`（内核不可达已在 runner 内处理，其余待补）
 - [ ] R5/R9：L1/L2/L3 与自适应周期（ADR 先行）
-- [ ] R9：CancellationToken 取消/优雅停机（闸门侧已具备，待接调度）
+- [ ] R9：对外取消入口 `POST /api/v1/rounds/{id}/cancel`（闸门与 runner 侧已具备）
 
 ## 测试证据
 - Python 锚点：RetryTest/HttpsVerdictTest/ChainPayloadVerifyTest/ChainRoundTest/RoundBudgetTest 等（tests/test_logic.py）。

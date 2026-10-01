@@ -2,13 +2,19 @@
 //!
 //! This crate is the Rust counterpart of `mihomo_test/engine.py`'s round
 //! pipeline (workstreams/06). It is being built up in batches; so far it holds
-//! the concurrency layer only.
+//! the concurrency gate and the round runner that drives it.
 //!
 //! `probe-engine` sits above `probe-mihomo`/`probe-storage` and below
 //! `probe-api`/`probe-scheduler` in the workspace dependency order
 //! (workstreams/02). It does no IO of its own -- it decides *when* IO may
-//! happen.
+//! happen and *what* a round records.
 
 pub mod limits;
+pub mod round;
 
 pub use limits::{Gate, Job, LimitError, Limits, Permit, RoundCtx};
+pub use round::{
+    run_round, run_round_with_ctx, ControllerPrep, KernelDelayTester, KernelPrep, KernelState,
+    Ledger, NodeTester, NodeVerdict, NotPrepared, RoundCounts, RoundOutcome, RoundPlan,
+    RoundSettings, Verdict,
+};

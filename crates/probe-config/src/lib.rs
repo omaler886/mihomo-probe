@@ -89,11 +89,116 @@ fn default_mixed_port() -> u16 {
         .unwrap_or(DEFAULT_MIXED_PORT)
 }
 
+/// The `test` section, mirroring `config.DEFAULTS["test"]`.
+///
+/// Only the four fields the Rust round actually uses are modelled. The
+/// remaining Python keys (`timeout_ms_retry`, `max_attempts`, `retry_pause_s`)
+/// belong to the retry loop, which is not ported yet -- carrying them here
+/// would be a field nothing reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestConfig {
+    /// Targets in the order the docs and the panel show them. `engine.test_one`
+    /// re-partitions them (an `https://` target is always tried first, whatever
+    /// this order says); whether a pass must be HTTPS follows from that
+    /// partition -- see [`TestConfig::https_required`].
+    pub targets: Vec<String>,
+    pub expected_status: String,
+    pub timeout_ms: u64,
+    pub concurrency: usize,
+}
+
+pub const DEFAULT_TARGETS: [&str; 3] = [
+    "https://www.gstatic.com/generate_204",
+    "https://cp.cloudflare.com/generate_204",
+    "http://connectivitycheck.platform.hicloud.com/generate_204",
+];
+pub const DEFAULT_EXPECTED_STATUS: &str = "204";
+pub const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_CONCURRENCY: usize = 20;
+
+impl TestConfig {
+    pub fn defaults() -> Self {
+        Self {
+            targets: DEFAULT_TARGETS.iter().map(|t| (*t).to_string()).collect(),
+            expected_status: DEFAULT_EXPECTED_STATUS.into(),
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+            concurrency: DEFAULT_CONCURRENCY,
+        }
+    }
+
+    fn from_value(value: &Value) -> Self {
+        let defaults = Self::defaults();
+        // An empty `targets` is refused rather than accepted: Python restores
+        // the default list when it is empty ("test.targets 不能为空"), because
+        // a round with no target tests nothing and would look like a total
+        // outage.
+        let targets: Vec<String> = value
+            .get("targets")
+            .and_then(|v| v.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|t| t.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .filter(|list: &Vec<String>| !list.is_empty())
+            .unwrap_or(defaults.targets);
+        Self {
+            targets,
+            expected_status: value
+                .get("expected_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(DEFAULT_EXPECTED_STATUS)
+                .to_string(),
+            timeout_ms: value
+                .get("timeout_ms")
+                .and_then(|v| v.as_u64())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_TIMEOUT_MS),
+            concurrency: value
+                .get("concurrency")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| usize::try_from(v).ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_CONCURRENCY),
+        }
+    }
+
+    /// The target a single-attempt test uses: the head of Python's stable
+    /// partition in `engine.test_one` -- the first HTTPS entry when the list
+    /// has one, otherwise the first entry.
+    ///
+    /// Never panics: `targets` is non-empty by construction (`from_value`
+    /// falls back to the defaults), and the final fallback covers a
+    /// hand-built `TestConfig`.
+    pub fn preferred_target(&self) -> &str {
+        self.targets
+            .iter()
+            .find(|t| t.starts_with("https://"))
+            .or_else(|| self.targets.first())
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_TARGETS[0])
+    }
+
+    /// Whether a pass over this target list must be HTTPS to count.
+    ///
+    /// Python: `https_required = urls[0].startswith("https://")` *after* the
+    /// stable partition, so it is true exactly when the list contains an HTTPS
+    /// target. With a list of nothing but plain-HTTP targets Python accepts an
+    /// HTTP 204 as alive -- the "only HTTPS can mark a node alive" rule in the
+    /// docs describes the shipped default list, not a hard requirement.
+    pub fn https_required(&self) -> bool {
+        self.preferred_target().starts_with("https://")
+    }
+}
+
 /// The subset of the deployment config the Rust slice reads.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// The `core` section after defaults were applied.
     pub core: CoreConfig,
+    /// The `test` section after defaults were applied.
+    pub test: TestConfig,
     /// The admin token. `None` means "not configured", and like the Python
     /// `auth_ok` (which denies on a falsy token) every authenticated endpoint
     /// must then deny instead of allowing.
@@ -112,6 +217,7 @@ impl Config {
         deep_merge(&mut cfg, &stored);
         Ok(Self {
             core: CoreConfig::from_value(cfg.get("core").unwrap_or(&Value::Null)),
+            test: TestConfig::from_value(cfg.get("test").unwrap_or(&Value::Null)),
             auth_token: cfg
                 .pointer("/auth/token")
                 .and_then(|v| v.as_str())
@@ -149,6 +255,12 @@ pub fn default_tree() -> Value {
             "mixed_port": default_mixed_port(),
             "container": DEFAULT_CONTAINER,
             "container_config_path": DEFAULT_CONTAINER_CONFIG_PATH,
+        },
+        "test": {
+            "targets": DEFAULT_TARGETS,
+            "expected_status": DEFAULT_EXPECTED_STATUS,
+            "timeout_ms": DEFAULT_TIMEOUT_MS,
+            "concurrency": DEFAULT_CONCURRENCY,
         },
     })
 }
@@ -264,6 +376,85 @@ mod tests {
         assert_eq!(
             base,
             serde_json::json!({"a": {"x": 1, "y": 3, "z": 4}, "b": [9]})
+        );
+    }
+
+    #[test]
+    fn the_test_section_defaults_match_python() {
+        let test = TestConfig::defaults();
+        assert_eq!(test.expected_status, "204");
+        assert_eq!(test.timeout_ms, 5_000);
+        assert_eq!(test.concurrency, 20, "the deployed value");
+        assert_eq!(test.targets.len(), 3);
+        assert_eq!(test.preferred_target(), DEFAULT_TARGETS[0]);
+    }
+
+    #[test]
+    fn an_empty_target_list_falls_back_instead_of_testing_nothing() {
+        // Python restores the default list here; a round with no target would
+        // otherwise report every node dead.
+        let value = serde_json::json!({"targets": [], "concurrency": 0});
+        let test = TestConfig::from_value(&value);
+        assert_eq!(test.targets, TestConfig::defaults().targets);
+        assert_eq!(
+            test.concurrency, DEFAULT_CONCURRENCY,
+            "0 is not a valid width"
+        );
+    }
+
+    #[test]
+    fn a_plain_http_only_target_list_still_yields_a_target() {
+        // Python does NOT refuse this: `https_required` is False when the list
+        // has no HTTPS entry, and an HTTP 204 then counts as alive. Treating
+        // it as "nothing to test" would be a divergence the shadow run would
+        // flag on every round.
+        let value = serde_json::json!({"targets": ["http://example.com/generate_204"]});
+        let test = TestConfig::from_value(&value);
+        assert_eq!(test.targets.len(), 1);
+        assert_eq!(test.preferred_target(), "http://example.com/generate_204");
+        assert!(!test.https_required());
+    }
+
+    #[test]
+    fn https_required_tracks_the_head_of_the_partition() {
+        let defaults = TestConfig::defaults();
+        assert_eq!(defaults.preferred_target(), DEFAULT_TARGETS[0]);
+        assert!(
+            defaults.https_required(),
+            "the shipped list leads with HTTPS"
+        );
+        // A mixed list still leads with the HTTPS entry.
+        let mixed = TestConfig::from_value(&serde_json::json!({
+            "targets": ["http://plain.example/generate_204",
+                        "https://secure.example/generate_204"]
+        }));
+        assert_eq!(
+            mixed.preferred_target(),
+            "https://secure.example/generate_204"
+        );
+        assert!(mixed.https_required());
+    }
+
+    #[test]
+    fn stored_test_values_override_the_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "test": {"targets": ["https://example.com/generate_204"],
+                         "timeout_ms": 9000, "concurrency": 4}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.test.targets, vec!["https://example.com/generate_204"]);
+        assert_eq!(cfg.test.timeout_ms, 9_000);
+        assert_eq!(cfg.test.concurrency, 4);
+        assert_eq!(
+            cfg.test.expected_status, "204",
+            "untouched keys keep their default"
         );
     }
 }

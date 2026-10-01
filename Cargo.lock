@@ -710,6 +710,7 @@ dependencies = [
  "axum",
  "probe-config",
  "probe-domain",
+ "probe-engine",
  "probe-mihomo",
  "probe-storage",
  "reqwest",
@@ -728,6 +729,7 @@ dependencies = [
  "probe-api",
  "probe-config",
  "probe-domain",
+ "probe-engine",
  "probe-mihomo",
  "probe-storage",
  "serde_json",
@@ -762,9 +764,14 @@ dependencies = [
 name = "probe-engine"
 version = "0.1.0"
 dependencies = [
+ "probe-config",
+ "probe-domain",
+ "probe-mihomo",
+ "probe-storage",
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

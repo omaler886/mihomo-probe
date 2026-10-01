@@ -16,6 +16,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use probe_engine::{run_round, Ledger, RoundPlan, RoundSettings};
 use probe_mihomo::Controller;
 use probe_storage::Storage;
 
@@ -27,6 +28,8 @@ pub struct AppState {
     pub controller: Controller,
     /// Kernel-side config path handed to `PUT /configs` on reload.
     pub kernel_config_path: String,
+    /// Gate widths and test target, from the deployment config.
+    pub round: RoundSettings,
     in_flight: Arc<AtomicBool>,
 }
 
@@ -36,18 +39,42 @@ impl AppState {
         auth_token: Option<String>,
         controller: Controller,
         kernel_config_path: String,
+        round: RoundSettings,
     ) -> Self {
         Self {
             storage: Arc::new(Mutex::new(storage)),
             auth_token,
             controller,
             kernel_config_path,
+            round,
             in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 pub type SharedState = Arc<AppState>;
+
+/// Holds the single-round flag and releases it on drop.
+///
+/// `POST /api/v1/rounds` answers 409 while a round is in flight. Releasing the
+/// flag with a bare `store(false)` at the end of the spawned task means a panic
+/// anywhere in the round -- or in this handler between the CAS and the spawn --
+/// leaves the endpoint refusing forever. A drop guard survives unwinding.
+struct InFlight(Arc<AtomicBool>);
+
+impl InFlight {
+    /// The caller must already hold the flag: it is set by the compare-exchange
+    /// that admitted this round.
+    fn acquire(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// Constant-time token comparison; False unless both are non-empty. Mirrors
 /// the Python `_matches` (UTF-8 bytes, `compare_digest`).
@@ -179,12 +206,30 @@ async fn start_round(State(state): State<SharedState>) -> Response {
         )
             .into_response();
     }
+    // The row is opened here rather than inside the spawned round: the
+    // response has to carry the id, and a storage failure has to surface as a
+    // 500 instead of a 202 that never becomes a round.
+    //
+    // `busy` releases the flag on drop. Doing it with a plain `store(false)` at
+    // the end of the task means a panic anywhere in the round -- or in this
+    // handler between the CAS and the spawn -- wedges the endpoint at 409 for
+    // the life of the process.
+    let busy = InFlight::acquire(Arc::clone(&state.in_flight));
     let round_id = {
-        let storage = state.storage.lock().expect("storage lock");
+        let storage = match state.storage.lock() {
+            Ok(storage) => storage,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": {"code": "storage",
+                        "message": "ledger lock poisoned"}})),
+                )
+                    .into_response();
+            }
+        };
         match storage.start_round("api", None) {
             Ok(id) => id,
             Err(err) => {
-                state.in_flight.store(false, Ordering::Release);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": {"code": "storage",
@@ -196,33 +241,51 @@ async fn start_round(State(state): State<SharedState>) -> Response {
     };
     let task_state = state.clone();
     tokio::spawn(async move {
-        // Slice round: probe the controller, reload the config, close the
-        // round with an honest note. The engine phases arrive in R5; what
-        // must not wait is the round row never being left open.
-        let note = match task_state.controller.version().await {
-            Ok(_) => {
-                let reloaded = task_state
-                    .controller
-                    .reload(&task_state.kernel_config_path)
-                    .await
-                    .unwrap_or(false);
-                if reloaded {
-                    "slice: controller reachable, config reloaded"
-                } else {
-                    "slice: controller reachable, reload refused"
-                }
-            }
-            Err(err) => {
-                tracing::warn!(%err, round_id, "controller unreachable during slice round");
-                "slice: controller unreachable"
-            }
+        // Moved in, not read: the flag is released when this task ends,
+        // including when it unwinds.
+        let _busy = busy;
+        // The round body lives in `probe-engine` so this handler, the CLI and
+        // the future scheduler all run the same path -- including the gate and
+        // the "the row always closes" invariant.
+        let plan = RoundPlan {
+            trigger: "api".into(),
+            mode: None,
+            // Node collection (Sub-Store -> fingerprint -> variants) is the
+            // remaining R5 work; until it lands a round has a kernel but no
+            // nodes to test, and says so in its note.
+            jobs: Vec::new(),
         };
-        if let Ok(storage) = task_state.storage.lock() {
-            if let Err(err) = storage.finish_round(round_id, Some(note)) {
-                tracing::error!(%err, round_id, "could not close round row");
+        let kernel = task_state.round.kernel_prep(
+            task_state.controller.clone(),
+            &task_state.kernel_config_path,
+        );
+        let tester = task_state.round.tester(task_state.controller.clone());
+        let ledger: Arc<dyn Ledger> = task_state.storage.clone();
+
+        match run_round(
+            round_id,
+            plan,
+            task_state.round.limits,
+            kernel,
+            tester,
+            ledger,
+        )
+        .await
+        {
+            Ok(outcome) => tracing::info!(
+                round_id = outcome.round_id,
+                counts.total = outcome.counts.total,
+                cancelled = outcome.cancelled,
+                note = %outcome.note,
+                "round closed"
+            ),
+            Err(err) => {
+                // The row may be open: `finish_round` failed. `db.open_rounds()`
+                // and the reaper exist for exactly this, so the honest thing is
+                // to say so loudly rather than pretend the round closed.
+                tracing::error!(%err, round_id, "round failed; check for an open round row");
             }
         }
-        task_state.in_flight.store(false, Ordering::Release);
     });
     (
         StatusCode::ACCEPTED,
@@ -259,6 +322,10 @@ mod tests {
             Some("a".repeat(32)),
             controller,
             "/root/.config/mihomo/config.yaml".into(),
+            RoundSettings::from_config(
+                &probe_config::Config::load(std::path::Path::new("/nonexistent/config.json"))
+                    .unwrap(),
+            ),
         ))
     }
 
@@ -347,9 +414,12 @@ mod tests {
         let mut last = None;
         for _ in 0..100 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let storage = state.storage.lock().unwrap();
-            let row = storage.last_round().unwrap().unwrap();
-            if row.finished_at.is_some() {
+            let row = state.storage.lock().unwrap().last_round().unwrap().unwrap();
+            // Wait for the row to close AND the in-flight flag to clear: the
+            // flag is released just after `finish_round`, so polling only for
+            // `finished_at` leaves a window where the next POST still sees a
+            // busy round and answers 409.
+            if row.finished_at.is_some() && !state.in_flight.load(Ordering::Acquire) {
                 last = Some(row);
                 break;
             }

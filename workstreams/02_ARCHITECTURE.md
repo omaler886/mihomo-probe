@@ -11,8 +11,10 @@
   - **已存在（R5 后）**：probe-domain / probe-config / probe-storage / probe-mihomo /
     probe-engine / probe-api / probe-cli。其余仍为计划中，建 crate 时再落地（不建空壳）。
 - 依赖方向：domain ← config/dns/mihomo/substore/storage ← engine ← api/scheduler/cli。domain 不依赖 web/db/网络客户端。
-  - probe-engine 目前只依赖 tokio / tokio-util / thiserror —— 它决定"何时允许 IO"，
-    本身不做 IO；接流水线后才引入 mihomo/storage。
+  - probe-engine 依赖 `probe-domain` / `probe-config` / `probe-mihomo` / `probe-storage`
+    + tokio/tokio-util/thiserror/tracing。它决定"何时允许 IO、一轮要记什么"，
+    但**不做 IO**：内核与账本都通过 trait（`KernelPrep` / `NodeTester` / `Ledger`）注入，
+    所以它的测试既不需要内核也不需要数据库文件。
 - 技术栈（R1 锁定于 Cargo.lock）：tokio / axum / reqwest / serde+serde_json+serde_yaml / rusqlite(bundled) / tracing+tracing-subscriber / thiserror / sha2 / uuid / time / tokio-util。
   - 偏离说明：切片阶段用 rusqlite(bundled) 而非 sqlx——Windows 无系统 libsqlite，bundled 可复现构建；R2 迁移落地时复评（ADR-0001）。
   - hickory/prometheus client 在对应批次（R4/R9）引入，避免空壳依赖。
@@ -37,9 +39,9 @@
 - [x] R1：workspace 骨架 + 首条纵向切片（config→controller→round→API）
 - [x] R2：SQL migration 体系（migrations/ 目录，替代 Python 的代码内迁移）
 - [x] R3：probe-mihomo 补 lanes/select/egress/fetch/校验器
-- [x] R5：probe-engine 建立 + 分层并发闸门（仅闸门，未接流水线）
+- [x] R5：probe-engine 建立 + 分层并发闸门 + 轮次编排（已接 cli/api）
 - [ ] R4：probe-dns（DoH+ECS+fixture fuzz）
-- [ ] R5：引擎（delay/失败归类）+ 闸门接入流水线
+- [ ] R5：节点采集（Sub-Store → fingerprint → 变体）—— 现在 jobs 恒为空
 - [ ] R6：出口验证与 ipmap
 - [ ] R7：状态机/整轮保护/原子发布
 - [ ] R8：Sub-Store 兼容 API

@@ -164,6 +164,7 @@ for i in 1..10: cargo test -p probe-engine   → 10/10 轮 13 passed，无抖动
 ### 已知限制（如实记录）
 - 本批只交付**闸门本身**，尚无调用方：未接入实际轮次流水线，因此
   "取消后不写账本"目前由 API 约定保证，不是由类型系统强制。
+  **→ 已由下一节（R5 轮次编排）解决：闸门已接进 `run_round`，并有对应单测。**
 - **`diagnose` 不在 `global` 之下**（有意为之：否则会排在它所绕开的拥塞后面）。
   因此单轮在飞峰值为 `global + diagnose`，配置两层时要一起算。
 - `Limits::from_concurrency(20)` 的 per_source/per_server_ip/diagnose 是**比例初值**，
@@ -172,4 +173,98 @@ for i in 1..10: cargo test -p probe-engine   → 10/10 轮 13 passed，无抖动
   这是调用方契约，**代码层无法强制**，只能靠文档与 code review。
 - 未做 `-race` 等价检查（Rust 无 `-race`；Miri/loom 选型在 14 的 R12 批次）。
 - 单元测试全部用 `multi_thread` 运行时，但仍在单机 4 线程下跑；真机高并发未验证。
+
+---
+
+## R5（RoundCtx 接入流水线）— 2026-10-01
+
+把分层并发闸门接进真实轮次路径。此前轮次逻辑**存在两份**（`probe-cli::cmd_round`
+与 `probe-api::start_round`），都是同一段占位代码，且都没走 `RoundCtx` —— 闸门没有调用方。
+
+### 新增/修改
+- `crates/probe-engine/src/round.rs`（新）：`run_round` / `run_round_with_ctx`，
+  trait `NodeTester` / `Ledger` / `KernelPrep`，`KernelDelayTester` / `ControllerPrep` /
+  `NotPrepared`，`RoundSettings`（把「哪些配置决定一轮怎么跑」收在一处）。
+- `crates/probe-storage`：`ResultRow`、`record_results`（**单事务**批量写入）、
+  `finish_round_with_counts`、`results_for_round`，常量 `VERDICT_OK/FAIL/EXCLUDED`。
+- `crates/probe-config`：新增 `TestConfig`（`targets` / `expected_status` / `timeout_ms` /
+  `concurrency`），默认值与 Python `config.DEFAULTS["test"]` 一致。
+- `crates/probe-cli`、`crates/probe-api`：轮次路径改为调用 `run_round`，删掉两份重复占位。
+
+### fmt / clippy
+```
+cargo fmt --all -- --check                                # 通过
+cargo clippy --workspace --all-targets -- -D warnings     # 0 errors
+```
+
+### cargo test --workspace --locked（**79 通过 / 0 失败**，新增 17）
+```
+probe-engine 25（+12）:
+  a_round_records_every_verdict_and_closes_once        一次开行/一次关行/一批写入
+  failures_are_counted_and_carry_their_class           失败计数与 FailureKind 落 row
+  the_gate_actually_bounds_the_node_phase              per_server_ip=1 真的串行（闸门确实生效）
+  distinct_addresses_still_run_concurrently            对照组：不同地址仍并发
+  an_unreachable_kernel_skips_the_node_phase_and_still_closes  内核没了就不测，行照样关
+  a_refused_reload_still_tests_nodes                   reload 被拒仍测（内核可能在跑旧配置）
+  cancellation_drops_results_but_still_closes_the_row  取消：0 结果写入，行仍关闭
+  a_round_already_cancelled_writes_nothing_but_closes  开始前已取消
+  the_note_never_carries_a_controller_message           note 不含错误正文/URL
+  detail_truncation_is_character_safe                  200 字符截断不 panic（CJK 安全）
+probe-config 11（+5）：test 段默认值对齐 Python、空 targets 回落、全 http 无首选目标、覆盖
+probe-storage 13（+4）：results 往返、空批次不写、finish_with_counts 写 total/ok
+probe-api 5 / probe-mihomo 23 / probe-domain 2：回归通过
+```
+
+### CLI 端到端冒烟（临时根 `.tmp_diag/smoke-r5`）
+```
+probe-cli --root <tmp> round
+  → round 1: kernel unreachable; 0 node(s) not tested
+probe-cli --root <tmp> status
+  → last round: #1 trigger=cli finished_at=Some("2026-10-01T14:17:20")
+                note=Some("kernel unreachable; 0 node(s) not tested")
+账本直查：rounds 1 行（total/ok/failed 均为 0，finished_at 有值）；
+          results 0 行；SELECT ... WHERE finished_at IS NULL → 空
+```
+
+### 时序用例稳定性
+```
+cargo test -p probe-engine  × 10 → 10/10 轮 23 passed
+cargo test -p probe-api     × 10 → 10/10 轮  5 passed
+```
+
+### 独立审查（只读 subagent）发现并修正的 6 项
+1. **[高] `in_flight` 非全路径清理**：清理写在 spawned task 尾部，task panic 即跳过
+   → `POST /api/v1/rounds` 永久 409。改为 RAII drop guard `InFlight`（unwind 也会释放），
+   并把 handler 里 `storage.lock().expect(...)` 的 panic 面收成显式 500。
+2. **[中] 全 http 目标与 Python 分歧**：我原把"没有 https 目标"当作 blocked 跳过节点阶段。
+   实读 `engine.py:247` 后确认：`https_required = urls[0].startswith("https://")`（分区之后），
+   **全 http 列表时 Python 会把 http 通过判为存活**。已对齐，并新增
+   `TestConfig::https_required()` 把这个规则写进代码。
+3. **[中] 单事务"失败不留半截"没有证据**：新增用例用 `BEFORE INSERT` 触发器让**第二行**中止，
+   断言 `results` 一行不剩，且后续批次仍可用 —— 这是唯一能证明回滚的写法。
+4. **[中] `unchecked_transaction` 的隐含依赖未写明**：它取 `&self`、绕过借用检查，
+   只在"每连接一个 `Mutex`"下安全。已在 doc 里写明"不要把 `Storage` 交给两个线程/两个并发 future"。
+5. **[低] 取消后 permit 是否复原无直接断言**：新增 `Gate::available_permits()`，
+   在取消用例里断言归位（`(limits.global, limits.diagnose)`）。
+6. **[低] 文档陈旧/措辞过强**：`16_FINAL_REVIEW` 仍写"未接流水线"；`06` 的"每条路径都关"
+   未标注 `finish_round` 自身失败的例外。均已修。
+
+审查同时确认成立的：`finish_round` 是开行后唯一的 `?`（其余失败都被 match 吞下再关行）；
+取消用例非退化（`per_server_ip=1` 串行保证取消落在轮次中）；两条闸门用例互为对照
+（纯串行实现过不了对照组，无限流实现过不了主用例）；`TestConfig` 四项默认值与
+`config.py:239-247` 逐字一致；API 响应形状未变。
+
+### 已知限制（如实记录）
+- **轮次目前没有节点**：`jobs` 恒为空（节点采集 Sub-Store→fingerprint→变体尚未移植）。
+  所以闸门虽然接上了，实际还没限到任何东西 —— 单测用假 tester 证明它能限。
+- `KernelDelayTester` 只做**一次**尝试、只打分区后的**首个**目标。
+  Python `test_one` 的 `max_attempts=3`、超时升级（`timeout_ms_retry`）、
+  `TERMINAL_REASONS` 短路、以及失败后轮换目标均未移植；`attempts` 列固定写 1。
+- 没有重试、没有整轮护栏（`GuardDecision` 是 R7）、没有出口验证（R6）。
+  取消路径已具备且已测，但**没有对外触发点**（`POST /api/v1/rounds/{id}/cancel` 属 R9）。
+- `RoundSummary` 未增加 `failed` 字段，`last_round()` 读不到 `failed`；
+  `finish_round_with_counts` 写进去了但读侧暂不可见。
+- `POST /api/v1/rounds` 的轮次行由 handler 同步开启（为在响应里返回 `round_id`），
+  再交给 spawned task 关闭。若 `finish_round` 失败，行会留在打开态 —— 依赖
+  `open_round_ids()` / 孤儿回收，日志会明确报出。**这是 `run_round` 唯一不关行的路径。**
 

@@ -38,6 +38,11 @@ SQL migration 体系 + Python SQLite 无损迁移（总控 §11）。
 - [x] R1：切片 round 表读写（兼容现有列）
 - [x] R2：migrations + 迁移 CLI（db check/migrate/verify/backup/rollback）+ 回滚演练
 - [x] R2：核对外部方案 §2.5 的 PRAGMA/索引建议（结论：无缺口，见上）
+- [x] R5：`record_results`——**单事务**批量写 `results`（外部方案 §2.5 与本文档都要求的
+      "每轮一个写事务"；Python 是逐节点 `record_result` 各提交一次）；
+      另有 `finish_round_with_counts`（写 total/ok/failed）与 `results_for_round`（读侧）
+- [ ] R5+：`RoundSummary` 增加 `failed` 字段——`finish_round_with_counts` 已写入，
+      但 `last_round()` 读不到，双跑比对会少一个字段
 - [ ] R10：Python↔Rust 双跑数据比对工具（读同库，校验计数与语义）
 
 ## 测试证据
