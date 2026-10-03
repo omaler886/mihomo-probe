@@ -375,6 +375,8 @@ pub struct Config {
     /// `auth_ok` (which denies on a falsy token) every authenticated endpoint
     /// must then deny instead of allowing.
     pub auth_token: Option<String>,
+    /// The `substore` section (Rust-only; embedded Sub-Store).
+    pub substore: SubStoreSection,
 }
 
 impl Config {
@@ -404,6 +406,7 @@ impl Config {
                 .and_then(|v| v.as_str())
                 .filter(|t| !t.trim().is_empty())
                 .map(str::to_string),
+            substore: SubStoreSection::from_value(cfg.get("substore").unwrap_or(&Value::Null)),
         })
     }
 
@@ -424,6 +427,65 @@ impl Config {
         std::fs::write(&path, &secret)
             .map_err(|e| DomainError::Config(format!("cannot write {}: {e}", path.display())))?;
         Ok(secret)
+    }
+}
+
+/// The `substore` section: Rust-only (the Python service has no embedded
+/// Sub-Store). `embedded: true` makes `probe-cli serve` start the embedded
+/// Sub-Store (probe-substore crate) on `listen` and point the collection
+/// fetcher at it, unless `SUBSTORE_BACKEND` explicitly overrides. All keys
+/// are tolerated-absent; the defaults keep the section a no-op so existing
+/// deployments read byte-identical behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubStoreSection {
+    pub embedded: bool,
+    pub listen: String,
+    /// Explicit secret path; generated once under `data/substore/` when None.
+    pub backend_path: Option<String>,
+    pub gh_proxy: Option<String>,
+    pub auto_update: bool,
+    pub push_service: Option<String>,
+}
+
+pub const DEFAULT_SUBSTORE_LISTEN: &str = "127.0.0.1:8299";
+
+impl Default for SubStoreSection {
+    fn default() -> Self {
+        Self {
+            embedded: false,
+            listen: DEFAULT_SUBSTORE_LISTEN.into(),
+            backend_path: None,
+            gh_proxy: None,
+            auto_update: false,
+            push_service: None,
+        }
+    }
+}
+
+impl SubStoreSection {
+    fn from_value(value: &Value) -> Self {
+        let defaults = Self::default();
+        let get_str = |key: &str| -> Option<String> {
+            value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .filter(|s| !s.trim().is_empty())
+        };
+        Self {
+            embedded: value
+                .get("embedded")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            listen: get_str("listen").unwrap_or(defaults.listen),
+            backend_path: get_str("backend_path"),
+            gh_proxy: get_str("gh_proxy"),
+            auto_update: value
+                .get("auto_update")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            push_service: get_str("push_service"),
+        }
     }
 }
 
@@ -454,6 +516,16 @@ pub fn default_tree() -> Value {
             {"key": "air", "kind": "collection", "name": "air", "label": "air",
              "enabled": true},
         ],
+        // Rust-only section; Python prunes nothing and tolerates unknown keys,
+        // so a config shared between the two stays valid for both.
+        "substore": {
+            "embedded": false,
+            "listen": DEFAULT_SUBSTORE_LISTEN,
+            "backend_path": null,
+            "gh_proxy": "",
+            "auto_update": false,
+            "push_service": "",
+        },
     })
 }
 
@@ -534,6 +606,31 @@ mod tests {
         assert_eq!(cfg.core.mixed_port, DEFAULT_MIXED_PORT);
         assert_eq!(cfg.sources.len(), 1, "a corrupt file must not drop sources");
         assert!(cfg.auth_token.is_none());
+    }
+
+    #[test]
+    fn substore_section_defaults_to_a_noop_and_takes_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Absent section: embedded stays off, everything else default.
+        let cfg = Config::load(&tmp.path().join("absent.json")).unwrap();
+        assert_eq!(cfg.substore, SubStoreSection::default());
+        assert!(!cfg.substore.embedded);
+
+        // Stored overrides win per key; unspecified keys fall back.
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "substore": {"embedded": true, "listen": "127.0.0.1:18300"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.substore.embedded);
+        assert_eq!(cfg.substore.listen, "127.0.0.1:18300");
+        assert_eq!(cfg.substore.backend_path, None);
+        assert!(!cfg.substore.auto_update);
     }
 
     #[test]

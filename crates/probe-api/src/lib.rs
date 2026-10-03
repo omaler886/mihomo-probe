@@ -40,6 +40,8 @@ pub struct AppState {
     /// Deployment root: `<root>/core/config.yaml` is rewritten every round
     /// before the kernel reload, `<root>/data/core.secret` signs it.
     pub root: std::path::PathBuf,
+    /// Embedded Sub-Store to run alongside the API; `None` disables.
+    pub substore: Option<probe_substore::SubStoreConfig>,
     in_flight: Arc<AtomicBool>,
 }
 
@@ -60,6 +62,7 @@ impl AppState {
             sources: serve.sources,
             backend: serve.backend,
             root: serve.root,
+            substore: serve.substore,
             in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -80,6 +83,10 @@ pub struct ServeConfig {
     /// Deployment root: `<root>/core/config.yaml` is rewritten every round
     /// before the kernel reload, `<root>/data/core.secret` signs it.
     pub root: std::path::PathBuf,
+    /// When set, `serve` also runs the embedded Sub-Store on its own
+    /// listener. `None` keeps the API surface byte-identical (tests, shadow
+    /// runs, deployments that point at a standalone Sub-Store).
+    pub substore: Option<probe_substore::SubStoreConfig>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -360,6 +367,17 @@ pub fn build_router(state: SharedState) -> Router {
 
 /// Bind and serve; the caller decides the bind address (loopback by default).
 pub async fn serve(state: SharedState, host: &str, port: u16) -> std::io::Result<()> {
+    // The embedded Sub-Store rides along on its own listener. Its failure to
+    // boot degrades to "collection fetcher points at a dead URL" -- the probe
+    // API itself stays up, consistent with how a standalone Sub-Store dying is
+    // already handled.
+    if let Some(sub_cfg) = state.substore.clone() {
+        tokio::spawn(async move {
+            if let Err(err) = probe_substore::serve(sub_cfg).await {
+                tracing::error!("embedded sub-store failed: {err}");
+            }
+        });
+    }
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
     axum::serve(listener, build_router(state)).await
 }
@@ -384,6 +402,7 @@ mod tests {
                 sources: cfg.sources.clone(),
                 backend: "http://127.0.0.1:1".into(),
                 root: root.to_path_buf(),
+                substore: None,
             },
         ))
     }

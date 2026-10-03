@@ -87,8 +87,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "substore" => {
+            if let Err(err) = run_async(async move { cmd_substore(&root, port).await }) {
+                eprintln!("substore failed: {err}");
+                std::process::exit(1);
+            }
+        }
         other => {
-            eprintln!("unknown command: {other} (expected serve | round | status | db)");
+            eprintln!("unknown command: {other} (expected serve | round | status | db | substore)");
             std::process::exit(2);
         }
     }
@@ -394,7 +400,46 @@ async fn cmd_serve(root: &Path, host: &str, port: u16) -> std::io::Result<()> {
     let secret = Config::core_secret(&root.join("data"))
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     let controller = Controller::new(&cfg.core.api, Some(&secret));
-    let backend = probe_engine::collect::backend_from_env();
+
+    // Embedded Sub-Store: resolve the secret path up front so the collection
+    // fetcher can point at this very process. An explicit SUBSTORE_BACKEND
+    // still wins -- pointing at a standalone instance stays possible without
+    // editing the embedded section out of the config.
+    let env_backend = std::env::var("SUBSTORE_BACKEND")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    // Resolve once; the embedded service repeats the same idempotent
+    // resolution and lands on the identical persisted path.
+    let embedded = if cfg.substore.embedded {
+        let data_dir = root.join("data");
+        let backend_path =
+            probe_substore::resolve_backend_path(&data_dir, cfg.substore.backend_path.as_deref())
+                .map_err(std::io::Error::other)?;
+        let listen = cfg.substore.listen.clone();
+        if env_backend.is_some() {
+            tracing::warn!(
+                "substore.embedded=true but SUBSTORE_BACKEND is set; the embedded instance still serves, the fetcher uses the env override"
+            );
+        }
+        Some((
+            probe_substore::SubStoreConfig {
+                data_dir,
+                listen: listen.clone(),
+                backend_path: cfg.substore.backend_path.clone(),
+                gh_proxy: cfg.substore.gh_proxy.clone(),
+                auto_update: cfg.substore.auto_update,
+                push_service: cfg.substore.push_service.clone(),
+            },
+            format!("http://{listen}{backend_path}"),
+        ))
+    } else {
+        None
+    };
+    let backend = match (&env_backend, &embedded) {
+        (Some(url), _) => url.clone(),
+        (None, Some((_, url))) => url.clone(),
+        (None, None) => probe_engine::collect::backend_from_env(),
+    };
 
     let state = Arc::new(AppState::new(
         storage,
@@ -407,6 +452,7 @@ async fn cmd_serve(root: &Path, host: &str, port: u16) -> std::io::Result<()> {
             sources: cfg.sources.clone(),
             backend,
             root: root.to_path_buf(),
+            substore: embedded.map(|(cfg, _)| cfg),
         },
     ));
     tracing_subscriber::fmt()
@@ -422,6 +468,27 @@ async fn cmd_serve(root: &Path, host: &str, port: u16) -> std::io::Result<()> {
         "probe slice serving (shadow; Python remains the default implementation)"
     );
     probe_api::serve(state, host, port).await
+}
+
+/// `substore` subcommand: run the embedded Sub-Store (rquickjs + the vendored
+/// sub-store.min.js script-engine bundle) on its own port. `--port` selects
+/// the listen port (default 8299); the secret backend path is generated once
+/// under `<root>/data/substore/` and reused.
+async fn cmd_substore(root: &Path, port: u16) -> std::io::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+    let cfg = probe_substore::SubStoreConfig {
+        data_dir: root.join("data"),
+        listen: format!("127.0.0.1:{port}"),
+        ..Default::default()
+    };
+    probe_substore::serve(cfg)
+        .await
+        .map_err(std::io::Error::other)
 }
 
 fn run_async<F: std::future::Future<Output = std::io::Result<()>>>(

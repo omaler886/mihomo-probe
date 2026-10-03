@@ -10,6 +10,7 @@ probe-storage = { path = "../probe-storage" }
 probe-mihomo = { path = "../probe-mihomo" }
 probe-source = { path = "../probe-source" }
 probe-engine = { path = "../probe-engine" }
+probe-substore = { path = "../probe-substore" }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

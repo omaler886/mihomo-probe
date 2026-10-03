@@ -6,6 +6,7 @@ members = [
     "crates/probe-storage",
     "crates/probe-source",
     "crates/probe-mihomo",
+    "crates/probe-substore",
     "crates/probe-engine",
     "crates/probe-api",
     "crates/probe-cli",
@@ -30,6 +31,7 @@ tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
     "signal",
+    "fs",
     # probe-engine's layered gate needs Semaphore; tests need time::timeout
     # and time::sleep to prove the gate is not deadlocking.
     "sync",

@@ -15,6 +15,7 @@ probe-engine = { path = "../probe-engine" }
 probe-mihomo = { path = "../probe-mihomo" }
 probe-source = { path = "../probe-source" }
 probe-storage = { path = "../probe-storage" }
+probe-substore = { path = "../probe-substore" }
 serde_json = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
