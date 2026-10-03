@@ -27,6 +27,10 @@ pub struct SubStoreState {
     pub backend_path: String,
     pub frontend_dir: std::path::PathBuf,
     pub backend_name: String,
+    /// Extra `SUB_STORE_*` keys injected into `/api/utils/env` (cron lines,
+    /// push service) so the frontend reflects the deployment; the Go version
+    /// injects the same set.
+    pub env_extras: Vec<(String, String)>,
     pub(crate) inflight:
         tokio::sync::Mutex<HashMap<String, Arc<watch::Sender<Option<SharedResult>>>>>,
 }
@@ -43,6 +47,7 @@ impl SubStoreState {
             backend_path,
             frontend_dir,
             backend_name: backend_name.into(),
+            env_extras: Vec::new(),
             inflight: tokio::sync::Mutex::default(),
         }
     }
@@ -359,6 +364,9 @@ fn env_response(resp: LoonResponse, state: &SubStoreState) -> Response {
                 "SUB_STORE_CORS_ALLOWED_ORIGINS".into(),
                 serde_json::Value::String("*".into()),
             );
+            for (key, value) in &state.env_extras {
+                env.insert(key.clone(), serde_json::Value::String(value.clone()));
+            }
             if let Ok(pretty) = serde_json::to_string(&root) {
                 body = pretty;
             }

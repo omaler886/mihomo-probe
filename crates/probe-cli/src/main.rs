@@ -429,6 +429,8 @@ async fn cmd_serve(root: &Path, host: &str, port: u16) -> std::io::Result<()> {
                 gh_proxy: cfg.substore.gh_proxy.clone(),
                 auto_update: cfg.substore.auto_update,
                 push_service: cfg.substore.push_service.clone(),
+                sync_cron: cfg.substore.sync_cron.clone(),
+                produce_cron: cfg.substore.produce_cron.clone(),
             },
             format!("http://{listen}{backend_path}"),
         ))

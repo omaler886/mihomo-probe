@@ -16,3 +16,8 @@ tracing-subscriber.workspace = true
 getrandom.workspace = true
 base64 = "0.22"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+# Host-side cron (cron_jobs.rs): expression parsing + schedule iteration run
+# on local time, same as the Go robfig/cron blueprint.
+cron = "0.17.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+percent-encoding = "2"

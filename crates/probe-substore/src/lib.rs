@@ -39,6 +39,7 @@
 //!   possible later swap since [`kv::KvStore`] is a trait.
 
 pub mod assets;
+pub mod cron_jobs;
 pub mod engine;
 pub mod init_js;
 pub mod kv;
@@ -65,6 +66,12 @@ pub struct SubStoreConfig {
     /// Optional Bark-style push URL template for `$notification`
     /// (`[推送标题]`/`[推送内容]` placeholders).
     pub push_service: Option<String>,
+    /// Cron expression for the Gist-sync job (`/api/sync/artifacts`);
+    /// absent = no job. Host-side cron — the Loon bundle has no scheduler.
+    pub sync_cron: Option<String>,
+    /// Produce-cache spec: `<cron>,<sub|col>,<names...>` entries separated
+    /// by `;`; each name gets its own `/download/...` warm-up job.
+    pub produce_cron: Option<String>,
 }
 
 impl Default for SubStoreConfig {
@@ -76,6 +83,8 @@ impl Default for SubStoreConfig {
             gh_proxy: None,
             auto_update: false,
             push_service: None,
+            sync_cron: None,
+            produce_cron: None,
         }
     }
 }
@@ -133,20 +142,29 @@ pub async fn serve(cfg: SubStoreConfig) -> Result<(), ServiceError> {
 
     let backend_path = resolve_backend_path(&cfg.data_dir, cfg.backend_path.as_deref())?;
 
-    let frontend_dir = paths.frontend.clone();
+    // The frontend learns the same keys the Go version injects (cron lines
+    // and push service), so its UI reflects the deployment.
+    let mut env_extras = Vec::new();
+    for (key, value) in [
+        ("SUB_STORE_BACKEND_SYNC_CRON", cfg.sync_cron.as_deref()),
+        ("SUB_STORE_PRODUCE_CRON", cfg.produce_cron.as_deref()),
+        ("SUB_STORE_PUSH_SERVICE", cfg.push_service.as_deref()),
+    ] {
+        if let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) {
+            env_extras.push((key.to_string(), v.to_string()));
+        }
+    }
+    let mut state =
+        server::SubStoreState::new(engine, backend_path, paths.frontend.clone(), "mihomo-probe");
+    state.env_extras = env_extras;
+    let state = Arc::new(state);
+
     let gh_proxy = cfg.gh_proxy.clone();
     tokio::spawn(async move {
-        if let Err(err) = assets::ensure_frontend(&frontend_dir, gh_proxy.as_deref()).await {
+        if let Err(err) = assets::ensure_frontend(&paths.frontend, gh_proxy.as_deref()).await {
             tracing::warn!("sub-store frontend install failed (backend still works): {err}");
         }
     });
-
-    let state = Arc::new(server::SubStoreState::new(
-        engine,
-        backend_path,
-        paths.frontend,
-        "mihomo-probe",
-    ));
 
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     let panel = format!(
@@ -157,6 +175,15 @@ pub async fn serve(cfg: SubStoreConfig) -> Result<(), ServiceError> {
         listen = %cfg.listen,
         backend_path = %state.backend_path,
         "sub-store serving; panel: {panel}"
+    );
+    // Host-side cron (the Go StartSubStoreCronJobs port). Spawned only after
+    // the listener is up, so a failed boot never leaves self-calling tasks
+    // behind; they run detached for the process lifetime, like the server.
+    cron_jobs::spawn_jobs(
+        &cfg.listen,
+        &state.backend_path,
+        cfg.sync_cron.as_deref(),
+        cfg.produce_cron.as_deref(),
     );
     let app = server::router(state);
     axum::serve(listener, app).await?;

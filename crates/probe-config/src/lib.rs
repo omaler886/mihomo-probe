@@ -445,6 +445,11 @@ pub struct SubStoreSection {
     pub gh_proxy: Option<String>,
     pub auto_update: bool,
     pub push_service: Option<String>,
+    /// Gist-sync cron (`/api/sync/artifacts`); absent = no cron job.
+    pub sync_cron: Option<String>,
+    /// Produce-cache spec: `<cron>,<sub|col>,<names...>` entries separated by
+    /// `;` — each name gets a host-side `/download/...` warm-up job.
+    pub produce_cron: Option<String>,
 }
 
 pub const DEFAULT_SUBSTORE_LISTEN: &str = "127.0.0.1:8299";
@@ -458,6 +463,8 @@ impl Default for SubStoreSection {
             gh_proxy: None,
             auto_update: false,
             push_service: None,
+            sync_cron: None,
+            produce_cron: None,
         }
     }
 }
@@ -485,6 +492,8 @@ impl SubStoreSection {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             push_service: get_str("push_service"),
+            sync_cron: get_str("sync_cron"),
+            produce_cron: get_str("produce_cron"),
         }
     }
 }
@@ -525,6 +534,8 @@ pub fn default_tree() -> Value {
             "gh_proxy": "",
             "auto_update": false,
             "push_service": "",
+            "sync_cron": null,
+            "produce_cron": null,
         },
     })
 }
@@ -621,7 +632,8 @@ mod tests {
         std::fs::write(
             &path,
             serde_json::json!({
-                "substore": {"embedded": true, "listen": "127.0.0.1:18300"},
+                "substore": {"embedded": true, "listen": "127.0.0.1:18300",
+                              "sync_cron": "0 9 * * *", "produce_cron": "*/30 * * * *,sub,air"},
             })
             .to_string(),
         )
@@ -631,6 +643,11 @@ mod tests {
         assert_eq!(cfg.substore.listen, "127.0.0.1:18300");
         assert_eq!(cfg.substore.backend_path, None);
         assert!(!cfg.substore.auto_update);
+        assert_eq!(cfg.substore.sync_cron.as_deref(), Some("0 9 * * *"));
+        assert_eq!(
+            cfg.substore.produce_cron.as_deref(),
+            Some("*/30 * * * *,sub,air")
+        );
     }
 
     #[test]
