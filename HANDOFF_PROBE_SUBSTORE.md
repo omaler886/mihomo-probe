@@ -2,7 +2,9 @@
 
 > 写给下一个接手本任务的 agent。读完本文 + `workstreams/09_SUBSTORE_EXPORT.md` 即可开工；
 > 历史决策链在会话记忆 `subs-check-pro-evaluation`（C:\Users\ckai7\.zcode\cli\memories\...\memory\）。
-> 状态：**代码全部完成并验证，未提交**（git 状态见 §6）。
+> 状态：**已提交**（两批分开：`1d070f2` = R5 节点采集（本任务开始前工作区里的遗留批，
+> 已验证 135 测后先提）；`213bb6b` = probe-substore 两阶段，151 测全绿。§6 的拆分
+> 拍板已按「两批各自整理后分开提交」执行完毕）。
 
 ---
 

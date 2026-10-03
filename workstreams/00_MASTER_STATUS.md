@@ -1,8 +1,11 @@
 # 主控状态（Master Status）
 
 ## 当前阶段与总体状态
-- 阶段：R0~R3 已交付（R3=Mihomo 控制器补全）；**R5 的并发闸门 + 轮次编排已交付**
-  （`probe-engine`：`limits` + `round`，已接进 cli/api）；R4、R5 的节点采集未开始。
+- 阶段：R0~R3 已交付（R3=Mihomo 控制器补全）；R5 的并发闸门 + 轮次编排 +
+  RoundCtx 接入 + **节点采集/test_one 已交付**（`probe-engine`：`limits`/`round`/
+  `collect`/`measure`，`probe-source` 新 crate，已接进 cli/api）；R6/R7 未开始。
+  另：内嵌 Sub-Store（probe-substore，rquickjs 跑官方 bundle）已落地并接入 serve，
+  字节码缓存实测评估为不建（见 09）。
 - 原则：Python 实现保持为默认运行路径；Rust 以 shadow 双跑方式逐步逼近门禁。
 - 总控需求文档：`GLM_5.3_Flash_mihomo_probe_Rust_full_rewrite.md`（已入库）。
 
@@ -24,7 +27,7 @@
 | 06 | 探测引擎 | R0 审计完成 |
 | 07 | 出口验证 | R0 审计完成 |
 | 08 | 存储迁移 | R0 审计完成 |
-| 09 | Sub-Store 导出 | R0 审计完成 |
+| 09 | Sub-Store 导出 | R0 审计完成；内嵌 Sub-Store 已落地（probe-substore），R8 导出待做 |
 | 10 | API/调度 | R0 审计完成，P0 修复落点 |
 | 11 | 可观测性 | R0 审计完成 |
 | 12 | 安全加固 | R0 完成 P0 批次（S-12/mixed_port/query token/scanner/轮换台账/Socket 方案） |
@@ -49,9 +52,17 @@
 - R5（部分）：轮次编排 `probe-engine::round`——闸门接入 cli/api，轮次行「调用方开、
   runner 必关」，结果**单事务**批量写 `results`；新增 `TestConfig` 与
   `record_results`/`finish_round_with_counts`。Rust 测试 58 → **79**。
+- R5（部分）：RoundCtx 接进轮次流水线（a52d058）。
+- R5：节点采集 + test_one 重试语义（1d070f2）——`probe-source` 新 crate
+  （fetch/identity/prepare/source/subscription），`collect.rs` 单点装配
+  fetch→flatten→prepare→jobs，`measure.rs` 移植 test_one；jobs 不再恒空。
+  Rust 测试 79 → **135**。
+- 内嵌 Sub-Store（213bb6b）——probe-substore：rquickjs 宿主跑官方 bundle 2.42.2，
+  独立/集成双入口；详见 09。Rust 测试 135 → **151**。
 
 ## 当前失败测试
-- 无。Python 568 通过 / 2 跳过；Rust **79 通过**（R3 后 45，R5 并发 +13，R5 编排 +17）。
+- 无。Python 568 通过 / 2 跳过；Rust **151 通过**（R3 后 45，R5 并发 +13，
+  R5 编排 +17，R5 采集 +56，Sub-Store +16）。
 
 ## ADR 索引
 - ADR-0001 存储驱动：切片用 rusqlite(bundled)，R2 迁移落地时复评 sqlx（理由见 08）。
@@ -61,9 +72,10 @@
 - ADR-0005（待写）轮次 `inconclusive` 态：引入前先落 ADR（见 03）。
 
 ## 下一批可并行任务
-- R5：节点采集（Sub-Store → fingerprint → 变体）—— 没有它，闸门限不到任何东西。
-- R5：`test_one` 语义移植（HTTPS 优先 / max_attempts / 超时升级 / TERMINAL_REASONS）。
-- R5：用真机轮次数据复核四层并发阈值（现为比例初值）。
+- R5 收尾：用真机轮次数据复核四层并发阈值（现为比例初值）。
+- Sub-Store 侧（见 09）：produce/gist cron 移植；`$notification` 补 Apprise；
+  hk3 部署切换（需用户在场，先备份迁移）。
 - R4：probe-dns（DoH + ECS + 二进制 fixture + fuzz，依赖 05）。
+- R6：前置池/链式展开（collect.rs 的 keep_dialer 现为空）。
 - R7：整轮保护 GuardDecision/PublishDecision（依赖 03）。
 - 前端适配 /api/v1（依赖 10 契约冻结）。

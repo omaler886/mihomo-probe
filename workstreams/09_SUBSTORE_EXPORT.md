@@ -24,10 +24,20 @@
 - 验证：15/15 单测含真 bundle /api/utils/env 验收；实机冒烟 env 注入/CORS 预检/前端静态+SPA 回退/缺失 .js 404 全过；scan_secrets 干净。
 - **接入（同日第二阶段）**：probe-config 新增 `substore` 节（Rust-only，默认 embedded=false 全节 no-op，Python 对未知键宽容故共享 config 双侧合法）→ `probe-cli serve` 单进程拉起 探针 API + 内嵌 Sub-Store，collection fetcher 的 backend 自指向 `http://<listen><backend_path>`（`SUBSTORE_BACKEND` 环境变量仍最高优先，指向独立实例可不改配置）；probe-api `ServeConfig/AppState` 增 `substore: Option<SubStoreConfig>`，serve 内 tokio::spawn，启动失败仅降级（探针 API 存活，与独立 Sub-Store 挂掉同语义）；`probe_substore::resolve_backend_path` 保证调用方与 serve 落到同一条持久化路径。单进程冒烟：/healthz + env 2.42.2 + 前端安装同日志齐全。
 
+## 字节码缓存评估（2026-10-03，实测后结案：不建）
+release 二进制单进程实测（embedded 形态，30 次串行请求/路由）：
+- `/api/subs`（真 bundle 全程：解析+初始化+路由，含 env——env 的"注入"是对
+  bundle 响应的改写，同样先跑完整 bundle）：**p50 21.4ms / p95 23.7ms / max 220ms**。
+- 对照同进程纯 axum 路由 `/healthz`：p50 1.1ms ⇒ bundle 每请求成本 ≈ **20ms**。
+- 结论：字节码缓存最多省 20ms/请求；本系统全部请求类别（面板 UI、/download/
+  订阅生成动辄数秒、每轮采集、低频 cron 自调）对 20ms 均不敏感，不值得引入
+  （quickjs-go EvalBytecode 或 runtime 池皆然）。真正会逼人重访的信号是
+  吞吐：dispatch Mutex 在 20ms/请求下上限 ≈50 req/s，单用户面板远够。
+
 ## 测试证据
 - Python 锚点：ExportTest/YamlScalarQuotingTest/DerivedDialerGroupTest/LinkSubstoreTest/PushExportsTest/PruneLocalSubsTest/test_substore_bridge 全文件。
 - Rust 新增：probe-substore 15 测（引擎回显/异常文本/KV 往返/$httpClient 本地桥/URL 全形态/runaway 中断/真 bundle env）。
 
 ## 下一步
-- R2 快照表；R8 导出引擎；字节码缓存评估（每请求重跑 bundle 的解析开销）；produce/gist cron 移植；`$notification` 推送补 Apprise 渠道。
+- R2 快照表；R8 导出引擎；produce/gist cron 移植（蓝本 loon_server.go 的 StartSubStoreCronJobs）；`$notification` 推送补 Apprise 渠道。
 - 部署形态待拍板：hk3 compose 把 `substore.embedded` 打开并停独立 Sub-Store（需先备份迁移现有 subs/collections/air 脚本），或双轨并存。
