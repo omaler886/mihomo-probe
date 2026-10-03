@@ -126,15 +126,28 @@ fn cmd_status(root: &Path) {
 
 fn cmd_round(root: &Path, trigger: &str) {
     let cfg = load(root);
+    tokio_block(cmd_round_async(root, cfg, trigger));
+}
+
+async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str) {
+    use probe_engine::collect as collect_mod;
+
     let storage = Storage::open(&db_path(root)).expect("open ledger");
     let secret = Config::core_secret(&root.join("data")).expect("core secret");
     let controller = Controller::new(&cfg.core.api, Some(&secret));
 
-    // Config generation stays here rather than moving into the runner: it is a
-    // config concern, and the node source that fills `proxies` arrives with
-    // R5's collection phase. Until then a round has a kernel but no nodes.
-    let proxies: Vec<serde_json::Value> = Vec::new();
-    let written = probe_mihomo::write_config(&root.join("core"), &cfg.core, &secret, &proxies);
+    // The collection half of the round (R5): fetch enabled sources, flatten,
+    // prepare kernel proxies, derive jobs. One place -- the API path below
+    // calls the same function.
+    let backend = collect_mod::backend_from_env();
+    let fetcher = probe_source::SubStoreClient::new(&backend);
+    let collected = collect_mod::collect(&fetcher, &cfg.sources, &[], true).await;
+    for err in &collected.errors {
+        eprintln!("fetch failed: {err}");
+    }
+
+    let written =
+        probe_mihomo::write_config(&root.join("core"), &cfg.core, &secret, &collected.proxies);
 
     let mut settings = RoundSettings::from_config(&cfg);
     // A failed write means there is no config for the kernel to load. The
@@ -146,7 +159,7 @@ fn cmd_round(root: &Path, trigger: &str) {
     let plan = RoundPlan {
         trigger: trigger.to_string(),
         mode: None,
-        jobs: Vec::new(),
+        jobs: collected.jobs,
     };
     let ledger: Arc<dyn Ledger> = Arc::new(Mutex::new(storage));
     // The caller opens the row; the runner closes it on every path.
@@ -156,19 +169,20 @@ fn cmd_round(root: &Path, trigger: &str) {
     });
     let kernel = settings.kernel_prep(controller.clone(), &cfg.core.container_config_path);
     let tester = settings.tester(controller);
-    let outcome = tokio_block(run_round(
-        round_id,
-        plan,
-        settings.limits,
-        kernel,
-        tester,
-        ledger,
-    ))
-    .unwrap_or_else(|err| {
-        eprintln!("round failed: {err}");
-        std::process::exit(1);
-    });
-    println!("round {}: {}", outcome.round_id, outcome.note);
+    let outcome = run_round(round_id, plan, settings.limits, kernel, tester, ledger)
+        .await
+        .unwrap_or_else(|err| {
+            eprintln!("round failed: {err}");
+            std::process::exit(1);
+        });
+    println!(
+        "round {}: {} ({} node(s), {} dropped, {} fetch error(s))",
+        outcome.round_id,
+        outcome.note,
+        outcome.counts.total,
+        collected.dropped,
+        collected.errors.len()
+    );
 }
 
 /// `db` subcommands. Returns the process exit code.
@@ -380,12 +394,20 @@ async fn cmd_serve(root: &Path, host: &str, port: u16) -> std::io::Result<()> {
     let secret = Config::core_secret(&root.join("data"))
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     let controller = Controller::new(&cfg.core.api, Some(&secret));
+    let backend = probe_engine::collect::backend_from_env();
+
     let state = Arc::new(AppState::new(
         storage,
         cfg.auth_token.clone(),
         controller,
-        cfg.core.container_config_path.clone(),
-        RoundSettings::from_config(&cfg),
+        probe_api::ServeConfig {
+            kernel_config_path: cfg.core.container_config_path.clone(),
+            round: RoundSettings::from_config(&cfg),
+            core: cfg.core.clone(),
+            sources: cfg.sources.clone(),
+            backend,
+            root: root.to_path_buf(),
+        },
     ));
     tracing_subscriber::fmt()
         .with_env_filter(

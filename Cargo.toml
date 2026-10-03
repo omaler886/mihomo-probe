@@ -4,6 +4,7 @@ members = [
     "crates/probe-domain",
     "crates/probe-config",
     "crates/probe-storage",
+    "crates/probe-source",
     "crates/probe-mihomo",
     "crates/probe-engine",
     "crates/probe-api",
@@ -47,6 +48,12 @@ reqwest = { version = "0.12", default-features = false, features = [
 # without a system libsqlite (this repo's dev machine is Windows); sqlx is
 # re-evaluated when the R2 migration framework lands.
 rusqlite = { version = "0.32", features = ["bundled"] }
+# probe-source parses Sub-Store's ClashMeta output. See its `subscription`
+# module for the YAML-1.1-vs-1.2 caveat against PyYAML.
+serde_yaml = "0.9"
+# Node identity: sha256 of the canonical connection-parameter JSON, first 8
+# bytes. Must match `mihomo_test.core.fingerprint_proxy` byte for byte.
+sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["formatting", "macros"] }

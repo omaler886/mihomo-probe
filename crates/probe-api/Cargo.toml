@@ -8,6 +8,7 @@ probe-domain = { path = "../probe-domain" }
 probe-config = { path = "../probe-config" }
 probe-storage = { path = "../probe-storage" }
 probe-mihomo = { path = "../probe-mihomo" }
+probe-source = { path = "../probe-source" }
 probe-engine = { path = "../probe-engine" }
 axum = { workspace = true }
 serde = { workspace = true }

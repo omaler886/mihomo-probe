@@ -16,6 +16,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use probe_config::SourceSpec;
 use probe_engine::{run_round, Ledger, RoundPlan, RoundSettings};
 use probe_mihomo::Controller;
 use probe_storage::Storage;
@@ -30,6 +31,15 @@ pub struct AppState {
     pub kernel_config_path: String,
     /// Gate widths and test target, from the deployment config.
     pub round: RoundSettings,
+    /// Kernel section, used to render `<root>/core/config.yaml` every round.
+    pub core: probe_config::CoreConfig,
+    /// Collection snapshot taken at serve time: which sources to fetch.
+    pub sources: Vec<SourceSpec>,
+    /// Sub-Store backend the collection fetches through.
+    pub backend: String,
+    /// Deployment root: `<root>/core/config.yaml` is rewritten every round
+    /// before the kernel reload, `<root>/data/core.secret` signs it.
+    pub root: std::path::PathBuf,
     in_flight: Arc<AtomicBool>,
 }
 
@@ -38,18 +48,38 @@ impl AppState {
         storage: Storage,
         auth_token: Option<String>,
         controller: Controller,
-        kernel_config_path: String,
-        round: RoundSettings,
+        serve: ServeConfig,
     ) -> Self {
         Self {
             storage: Arc::new(Mutex::new(storage)),
             auth_token,
             controller,
-            kernel_config_path,
-            round,
+            kernel_config_path: serve.kernel_config_path,
+            round: serve.round,
+            core: serve.core,
+            sources: serve.sources,
+            backend: serve.backend,
+            root: serve.root,
             in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
+}
+
+/// Everything `serve` snapshots from the deployment config at startup.
+pub struct ServeConfig {
+    /// Kernel-side config path handed to `PUT /configs` on reload.
+    pub kernel_config_path: String,
+    /// Gate widths and test target, from the deployment config.
+    pub round: RoundSettings,
+    /// Kernel section, used to render `<root>/core/config.yaml` every round.
+    pub core: probe_config::CoreConfig,
+    /// Collection snapshot: which sources to fetch.
+    pub sources: Vec<SourceSpec>,
+    /// Sub-Store backend the collection fetches through.
+    pub backend: String,
+    /// Deployment root: `<root>/core/config.yaml` is rewritten every round
+    /// before the kernel reload, `<root>/data/core.secret` signs it.
+    pub root: std::path::PathBuf,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -247,25 +277,47 @@ async fn start_round(State(state): State<SharedState>) -> Response {
         // The round body lives in `probe-engine` so this handler, the CLI and
         // the future scheduler all run the same path -- including the gate and
         // the "the row always closes" invariant.
+        //
+        // Collection runs here, inside the task, through the same `collect`
+        // the CLI uses: fetch enabled sources, prepare kernel proxies, derive
+        // jobs. A failed source is skipped (logged below); the kernel config
+        // is rewritten before the reload so the kernel serves this round's
+        // nodes rather than a stale file.
+        let fetcher = probe_source::SubStoreClient::new(&task_state.backend);
+        let collected = probe_engine::collect(&fetcher, &task_state.sources, &[], true).await;
+        for err in &collected.errors {
+            tracing::warn!(%err, "source fetch failed; continuing with the rest");
+        }
+        let data_dir = task_state.root.join("data");
+        let secret = probe_config::Config::core_secret(&data_dir).unwrap_or_default();
+        let mut round_settings = task_state.round.clone();
+        if let Err(err) = probe_mihomo::write_config(
+            &task_state.root.join("core"),
+            &task_state.core,
+            &secret,
+            &collected.proxies,
+        ) {
+            // No config for the kernel to load: the round still opens and
+            // closes a row, and says why (same as the CLI path).
+            tracing::error!(%err, "kernel config write failed; round will report blocked");
+            round_settings.blocked = Some(err.to_string());
+        }
         let plan = RoundPlan {
             trigger: "api".into(),
             mode: None,
-            // Node collection (Sub-Store -> fingerprint -> variants) is the
-            // remaining R5 work; until it lands a round has a kernel but no
-            // nodes to test, and says so in its note.
-            jobs: Vec::new(),
+            jobs: collected.jobs,
         };
-        let kernel = task_state.round.kernel_prep(
+        let kernel = round_settings.kernel_prep(
             task_state.controller.clone(),
             &task_state.kernel_config_path,
         );
-        let tester = task_state.round.tester(task_state.controller.clone());
+        let tester = round_settings.tester(task_state.controller.clone());
         let ledger: Arc<dyn Ledger> = task_state.storage.clone();
 
         match run_round(
             round_id,
             plan,
-            task_state.round.limits,
+            round_settings.limits,
             kernel,
             tester,
             ledger,
@@ -316,16 +368,23 @@ pub async fn serve(state: SharedState, host: &str, port: u16) -> std::io::Result
 mod tests {
     use super::*;
 
-    fn test_state(controller: Controller) -> SharedState {
+    fn test_state(controller: Controller, root: &std::path::Path) -> SharedState {
+        let cfg =
+            probe_config::Config::load(std::path::Path::new("/nonexistent/config.json")).unwrap();
         Arc::new(AppState::new(
             Storage::open_in_memory().unwrap(),
             Some("a".repeat(32)),
             controller,
-            "/root/.config/mihomo/config.yaml".into(),
-            RoundSettings::from_config(
-                &probe_config::Config::load(std::path::Path::new("/nonexistent/config.json"))
-                    .unwrap(),
-            ),
+            ServeConfig {
+                kernel_config_path: "/root/.config/mihomo/config.yaml".into(),
+                round: RoundSettings::from_config(&cfg),
+                core: cfg.core.clone(),
+                // Default sources with a backend that refuses fast: collection
+                // fails closed to zero jobs, the round still closes honestly.
+                sources: cfg.sources.clone(),
+                backend: "http://127.0.0.1:1".into(),
+                root: root.to_path_buf(),
+            },
         ))
     }
 
@@ -339,7 +398,12 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_and_readyz_need_no_token() {
-        let port = spawn_on_port(test_state(Controller::new("http://127.0.0.1:1", None))).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let port = spawn_on_port(test_state(
+            Controller::new("http://127.0.0.1:1", None),
+            tmp.path(),
+        ))
+        .await;
         let client = reqwest::Client::new();
         let health = client
             .get(format!("http://127.0.0.1:{port}/healthz"))
@@ -357,7 +421,12 @@ mod tests {
 
     #[tokio::test]
     async fn guarded_endpoints_deny_without_or_with_a_wrong_token() {
-        let port = spawn_on_port(test_state(Controller::new("http://127.0.0.1:1", None))).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let port = spawn_on_port(test_state(
+            Controller::new("http://127.0.0.1:1", None),
+            tmp.path(),
+        ))
+        .await;
         let client = reqwest::Client::new();
         // No token at all...
         let resp = client
@@ -378,7 +447,12 @@ mod tests {
 
     #[tokio::test]
     async fn status_carries_no_secret() {
-        let port = spawn_on_port(test_state(Controller::new("http://127.0.0.1:19190", None))).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let port = spawn_on_port(test_state(
+            Controller::new("http://127.0.0.1:19190", None),
+            tmp.path(),
+        ))
+        .await;
         let client = reqwest::Client::new();
         let resp = client
             .get(format!("http://127.0.0.1:{port}/api/v1/status"))
@@ -396,7 +470,8 @@ mod tests {
     async fn a_round_starts_once_and_closes_with_an_honest_note() {
         // No kernel behind this URL: the round must still close with a note
         // rather than leaving the row open forever.
-        let state = test_state(Controller::new("http://127.0.0.1:1", None));
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(Controller::new("http://127.0.0.1:1", None), tmp.path());
         assert!(state.kernel_config_path.ends_with("config.yaml"));
         let port = spawn_on_port(state.clone()).await;
         let client = reqwest::Client::new();

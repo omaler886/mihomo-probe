@@ -69,6 +69,13 @@ pub enum Verdict {
 pub struct NodeVerdict {
     pub job: Job,
     pub verdict: Verdict,
+    /// Dials spent on this verdict (Python `attempts`). A single-shot tester
+    /// reports 1.
+    pub attempts: u32,
+    /// The target the final dial used. Not a ledger column -- Python does not
+    /// store it either -- but it is what makes "timed out on gstatic but
+    /// answered on cloudflare" debuggable.
+    pub url: Option<String>,
 }
 
 impl NodeVerdict {
@@ -76,6 +83,8 @@ impl NodeVerdict {
         Self {
             job,
             verdict: Verdict::Alive { delay_ms },
+            attempts: 1,
+            url: None,
         }
     }
 
@@ -86,7 +95,19 @@ impl NodeVerdict {
                 kind: kind.into(),
                 message: message.into(),
             },
+            attempts: 1,
+            url: None,
         }
+    }
+
+    pub fn with_attempts(mut self, attempts: u32) -> Self {
+        self.attempts = attempts;
+        self
+    }
+
+    pub fn with_url(mut self, url: impl Into<String>) -> Self {
+        self.url = Some(url.into());
+        self
     }
 
     pub fn is_alive(&self) -> bool {
@@ -102,7 +123,7 @@ impl NodeVerdict {
     }
 
     /// The shared `results` row. Vocabulary copied from Python: `ok` / `fail`,
-    /// `detail` bounded to 200 chars, `attempts` 1 (R5 does not retry yet).
+    /// `detail` bounded to 200 chars.
     pub fn to_result_row(&self) -> ResultRow {
         match &self.verdict {
             Verdict::Alive { delay_ms } => ResultRow {
@@ -113,7 +134,7 @@ impl NodeVerdict {
                 delay_ms: Some(i64::from(*delay_ms)),
                 reason: None,
                 country: None,
-                attempts: Some(1),
+                attempts: Some(i64::from(self.attempts)),
                 detail: Some(String::new()),
                 category: Some(self.job.variant.clone()),
             },
@@ -125,7 +146,7 @@ impl NodeVerdict {
                 delay_ms: None,
                 reason: Some(kind.clone()),
                 country: None,
-                attempts: Some(1),
+                attempts: Some(i64::from(self.attempts)),
                 detail: Some(bounded(message, DETAIL_LIMIT)),
                 category: Some(self.job.variant.clone()),
             },
@@ -219,57 +240,34 @@ impl KernelPrep for NotPrepared {
     }
 }
 
-/// [`NodeTester`] against a real kernel: one `GET /proxies/{name}/delay` per
-/// job, classified exactly as `probe-mihomo` classifies it.
-pub struct KernelDelayTester {
-    controller: Controller,
-    url: String,
+/// One `GET /proxies/{name}/delay`, classified exactly as Python `core.delay`
+/// classifies it.
+///
+/// Returns `(delay_ms, reason, detail)`: `reason` is `None` when the node
+/// answered. `controller_error` is a *node-level* verdict here because every
+/// job needs one, but Python deliberately keeps it out of the terminal reasons
+/// so a retry can overturn it -- the round-level guard (workstreams/03) is what
+/// stops it being read as "this node is dead".
+pub(crate) async fn dial_once(
+    controller: &Controller,
+    proxy: &str,
+    url: &str,
     timeout_ms: u64,
-    expected: String,
-}
-
-impl KernelDelayTester {
-    pub fn new(
-        controller: Controller,
-        url: impl Into<String>,
-        timeout_ms: u64,
-        expected: impl Into<String>,
-    ) -> Self {
-        Self {
-            controller,
-            url: url.into(),
-            timeout_ms,
-            expected: expected.into(),
+    expected: &str,
+) -> (Option<u32>, Option<String>, String) {
+    match controller.delay(proxy, url, timeout_ms, expected).await {
+        Ok(DelayOutcome::Ok(delay_ms)) => (Some(delay_ms), None, String::new()),
+        Ok(DelayOutcome::Failed { kind, message }) => {
+            (None, Some(kind), bounded(&message, ERROR_LIMIT))
         }
-    }
-}
-
-impl NodeTester for KernelDelayTester {
-    fn test<'a>(&'a self, job: Job) -> BoxFuture<'a, NodeVerdict> {
-        Box::pin(async move {
-            let outcome = self
-                .controller
-                .delay(&job.proxy_name, &self.url, self.timeout_ms, &self.expected)
-                .await;
-            match outcome {
-                Ok(DelayOutcome::Ok(delay_ms)) => NodeVerdict::alive(job, delay_ms),
-                Ok(DelayOutcome::Failed { kind, message }) => {
-                    NodeVerdict::dead(job, kind, bounded(&message, ERROR_LIMIT))
-                }
-                // The controller answered and named the node's failure.
-                Err(KernelError::Node { kind, message }) => {
-                    NodeVerdict::dead(job, kind, bounded(&message, ERROR_LIMIT))
-                }
-                // The controller itself is gone. Python deliberately keeps
-                // `controller_error` out of the terminal reasons so a retry can
-                // overturn it, but a per-node verdict still has to exist -- the
-                // round-level guard (workstreams/03) is what keeps this from
-                // being read as "this node is dead".
-                Err(KernelError::Controller(message)) => {
-                    NodeVerdict::dead(job, "controller_error", bounded(&message, ERROR_LIMIT))
-                }
-            }
-        })
+        Err(KernelError::Node { kind, message }) => {
+            (None, Some(kind), bounded(&message, ERROR_LIMIT))
+        }
+        Err(KernelError::Controller(message)) => (
+            None,
+            Some("controller_error".to_string()),
+            bounded(&message, ERROR_LIMIT),
+        ),
     }
 }
 
@@ -281,11 +279,9 @@ impl NodeTester for KernelDelayTester {
 #[derive(Debug, Clone)]
 pub struct RoundSettings {
     pub limits: Limits,
-    /// The target a single-attempt test uses -- the head of Python's stable
-    /// partition, HTTPS when the list has one.
-    pub target: String,
-    pub timeout_ms: u64,
-    pub expected: String,
+    /// The `test` section verbatim: the tester needs the whole retry policy,
+    /// not just the first target.
+    pub test: probe_config::TestConfig,
     /// Set when there is no kernel config to load at all (generation failed).
     /// The round then opens and closes a row saying so instead of testing
     /// anything. This is **not** set for an all-HTTP target list: Python tests
@@ -297,12 +293,7 @@ impl RoundSettings {
     pub fn from_config(cfg: &probe_config::Config) -> Self {
         Self {
             limits: Limits::from_concurrency(cfg.test.concurrency),
-            // The head of Python's stable partition. When that head is a
-            // plain-HTTP target, Python's `https_required` is False and an HTTP
-            // pass does count -- so an all-HTTP list is NOT a blocked round.
-            target: cfg.test.preferred_target().to_string(),
-            timeout_ms: cfg.test.timeout_ms,
-            expected: cfg.test.expected_status.clone(),
+            test: cfg.test.clone(),
             blocked: None,
         }
     }
@@ -315,15 +306,9 @@ impl RoundSettings {
         }
     }
 
-    /// The node tester for this round. Never called when `blocked` is set --
-    /// the round skips the node phase -- but the runner still needs one.
+    /// The node tester for this round: the full `test_one` policy.
     pub fn tester(&self, controller: Controller) -> Arc<dyn NodeTester> {
-        Arc::new(KernelDelayTester::new(
-            controller,
-            self.target.clone(),
-            self.timeout_ms,
-            self.expected.clone(),
-        ))
+        Arc::new(crate::measure::TestOne::new(controller, &self.test))
     }
 }
 

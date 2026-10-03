@@ -90,12 +90,7 @@ fn default_mixed_port() -> u16 {
 }
 
 /// The `test` section, mirroring `config.DEFAULTS["test"]`.
-///
-/// Only the four fields the Rust round actually uses are modelled. The
-/// remaining Python keys (`timeout_ms_retry`, `max_attempts`, `retry_pause_s`)
-/// belong to the retry loop, which is not ported yet -- carrying them here
-/// would be a field nothing reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TestConfig {
     /// Targets in the order the docs and the panel show them. `engine.test_one`
     /// re-partitions them (an `https://` target is always tried first, whatever
@@ -104,7 +99,12 @@ pub struct TestConfig {
     pub targets: Vec<String>,
     pub expected_status: String,
     pub timeout_ms: u64,
+    /// The budget a *retry* after a timeout gets. A timeout is the one failure
+    /// a bigger budget can overturn, so it is the only one that escalates.
+    pub timeout_ms_retry: u64,
     pub concurrency: usize,
+    pub max_attempts: usize,
+    pub retry_pause_s: f64,
 }
 
 pub const DEFAULT_TARGETS: [&str; 3] = [
@@ -114,7 +114,10 @@ pub const DEFAULT_TARGETS: [&str; 3] = [
 ];
 pub const DEFAULT_EXPECTED_STATUS: &str = "204";
 pub const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_TIMEOUT_MS_RETRY: u64 = 9_000;
 pub const DEFAULT_CONCURRENCY: usize = 20;
+pub const DEFAULT_MAX_ATTEMPTS: usize = 3;
+pub const DEFAULT_RETRY_PAUSE_S: f64 = 0.3;
 
 impl TestConfig {
     pub fn defaults() -> Self {
@@ -122,7 +125,10 @@ impl TestConfig {
             targets: DEFAULT_TARGETS.iter().map(|t| (*t).to_string()).collect(),
             expected_status: DEFAULT_EXPECTED_STATUS.into(),
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            timeout_ms_retry: DEFAULT_TIMEOUT_MS_RETRY,
             concurrency: DEFAULT_CONCURRENCY,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            retry_pause_s: DEFAULT_RETRY_PAUSE_S,
         }
     }
 
@@ -143,6 +149,13 @@ impl TestConfig {
             })
             .filter(|list: &Vec<String>| !list.is_empty())
             .unwrap_or(defaults.targets);
+        let positive_u64 = |key: &str, fallback: u64| -> u64 {
+            value
+                .get(key)
+                .and_then(|v| v.as_u64())
+                .filter(|v| *v > 0)
+                .unwrap_or(fallback)
+        };
         Self {
             targets,
             expected_status: value
@@ -150,17 +163,26 @@ impl TestConfig {
                 .and_then(|v| v.as_str())
                 .unwrap_or(DEFAULT_EXPECTED_STATUS)
                 .to_string(),
-            timeout_ms: value
-                .get("timeout_ms")
-                .and_then(|v| v.as_u64())
-                .filter(|v| *v > 0)
-                .unwrap_or(DEFAULT_TIMEOUT_MS),
+            timeout_ms: positive_u64("timeout_ms", DEFAULT_TIMEOUT_MS),
+            timeout_ms_retry: positive_u64("timeout_ms_retry", DEFAULT_TIMEOUT_MS_RETRY),
             concurrency: value
                 .get("concurrency")
                 .and_then(|v| v.as_u64())
                 .and_then(|v| usize::try_from(v).ok())
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_CONCURRENCY),
+            // Python `max(1, int(...))`: a zero or negative attempt budget
+            // would make every node look dead without dialling anything.
+            max_attempts: value
+                .get("max_attempts")
+                .and_then(|v| v.as_i64())
+                .map(|v| usize::try_from(v.max(1)).unwrap_or(DEFAULT_MAX_ATTEMPTS))
+                .unwrap_or(DEFAULT_MAX_ATTEMPTS),
+            retry_pause_s: value
+                .get("retry_pause_s")
+                .and_then(|v| v.as_f64())
+                .filter(|v| *v >= 0.0)
+                .unwrap_or(DEFAULT_RETRY_PAUSE_S),
         }
     }
 
@@ -192,6 +214,154 @@ impl TestConfig {
     }
 }
 
+/// The two resource kinds Sub-Store exposes.
+pub const SOURCE_KINDS: [&str; 2] = ["collection", "sub"];
+/// `config.KEY_MAX`: a source key becomes a file name and a URL segment.
+pub const KEY_MAX: usize = 48;
+
+/// One entry of the `sources` list, after `config.normalize_sources` repaired
+/// it.
+///
+/// The Rust side reads the same fields the Python round needs. `export`,
+/// `direct` and `chain` are deliberately not modelled yet: they drive
+/// publishing (R8) and chain expansion (R6), and a field nothing reads is a
+/// field that silently drifts from its Python default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSpec {
+    pub key: String,
+    /// `collection` or `sub`.
+    pub kind: String,
+    pub name: String,
+    pub label: String,
+    pub enabled: bool,
+    /// The source's nodes are transit hops rather than exits. Only feeds the
+    /// per-category statistics; `is True` rather than truthiness, so a
+    /// hand-edited `"yes"` reads as "not marked" instead of reclassifying a
+    /// whole source.
+    pub relay: bool,
+}
+
+impl SourceSpec {
+    /// Port of `config.normalize_sources` for the fields above.
+    ///
+    /// Returns an error where Python raises `ValueError` -- an explicitly
+    /// supplied key that is unusable as a file name is a config error the
+    /// operator has to see, not something to silently repair.
+    pub fn normalize(sources: &[Value]) -> DomainResult<Vec<SourceSpec>> {
+        let mut out = Vec::new();
+        let mut used: Vec<String> = Vec::new();
+        for entry in sources {
+            let Some(map) = entry.as_object() else {
+                continue;
+            };
+            let name = map
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let kind = map
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .filter(|k| SOURCE_KINDS.contains(k))
+                .unwrap_or("collection")
+                .to_string();
+            let raw_key = map
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let mut key = if raw_key.is_empty() {
+                safe_key(&name, "src")
+            } else {
+                validate_key(&raw_key)?
+            };
+            // Unique keys, `name`, `name-2`, `name-3` ...
+            let base = key.clone();
+            let mut suffix = 2;
+            while used.contains(&key) {
+                key = format!("{base}-{suffix}");
+                suffix += 1;
+            }
+            used.push(key.clone());
+
+            out.push(SourceSpec {
+                label: map
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or(&name)
+                    .to_string(),
+                enabled: map.get("enabled") != Some(&Value::Bool(false)),
+                relay: map.get("relay") == Some(&Value::Bool(true)),
+                key,
+                kind,
+                name,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// `config.safe_key`: derive a filesystem- and URL-safe key from a name.
+pub fn safe_key(value: &str, fallback: &str) -> String {
+    let stripped: String = value.chars().filter(|c| !is_unsafe_key_char(*c)).collect();
+    // `re.sub(r"\s+", "-", text.strip()).strip(".")`
+    let mut collapsed = String::new();
+    let mut in_space = false;
+    for ch in stripped.trim().chars() {
+        if ch.is_whitespace() {
+            if !in_space {
+                collapsed.push('-');
+            }
+            in_space = true;
+        } else {
+            collapsed.push(ch);
+            in_space = false;
+        }
+    }
+    let trimmed = collapsed.trim_matches('.');
+    let truncated: String = trimmed.chars().take(KEY_MAX).collect();
+    if truncated.is_empty() || truncated == "." || truncated == ".." {
+        fallback.to_string()
+    } else {
+        truncated
+    }
+}
+
+/// `config.validate_key`: reject anything unusable as a file name / URL segment.
+pub fn validate_key(key: &str) -> DomainResult<String> {
+    if key.is_empty() {
+        return Err(DomainError::Config("key 不能为空".into()));
+    }
+    if key != key.trim() {
+        return Err(DomainError::Config(format!("key 首尾不能有空白: {key:?}")));
+    }
+    if key.starts_with('.') {
+        return Err(DomainError::Config(format!("key 不能以点开头: {key:?}")));
+    }
+    if key.chars().any(is_unsafe_key_char) {
+        return Err(DomainError::Config(format!(
+            "key 含非法字符 (/ \\ : * ? \" < > |): {key:?}"
+        )));
+    }
+    if key.chars().count() > KEY_MAX {
+        return Err(DomainError::Config(format!(
+            "key 过长（上限 {KEY_MAX}）: {key:?}"
+        )));
+    }
+    Ok(key.to_string())
+}
+
+/// `_UNSAFE_KEY = re.compile(r'[/\\:*?"<>|\x00-\x1f]')`, as a predicate.
+fn is_unsafe_key_char(ch: char) -> bool {
+    matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || (ch as u32) < 0x20
+}
+
 /// The subset of the deployment config the Rust slice reads.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -199,6 +369,8 @@ pub struct Config {
     pub core: CoreConfig,
     /// The `test` section after defaults were applied.
     pub test: TestConfig,
+    /// The `sources` list after `normalize_sources` repaired it.
+    pub sources: Vec<SourceSpec>,
     /// The admin token. `None` means "not configured", and like the Python
     /// `auth_ok` (which denies on a falsy token) every authenticated endpoint
     /// must then deny instead of allowing.
@@ -206,18 +378,27 @@ pub struct Config {
 }
 
 impl Config {
-    /// Deep-merge the stored config over the defaults; invalid JSON is
-    /// tolerated as "no stored config" (the Python failure shape).
+    /// Deep-merge the stored config over the defaults. A missing file or
+    /// invalid JSON reads as an empty object (Python `stored = {}`), so the
+    /// defaults -- including the `sources` list -- survive; `Value::Null`
+    /// would instead replace the whole tree and silently drop them.
     pub fn load(config_path: &Path) -> DomainResult<Self> {
         let stored = match std::fs::read_to_string(config_path) {
-            Ok(text) => serde_json::from_str::<Value>(&text).unwrap_or(Value::Null),
-            Err(_) => Value::Null,
+            Ok(text) => serde_json::from_str::<Value>(&text).unwrap_or(json_object()),
+            Err(_) => json_object(),
         };
         let mut cfg = default_tree();
         deep_merge(&mut cfg, &stored);
+        let sources = cfg
+            .get("sources")
+            .and_then(|v| v.as_array())
+            .map(|list| SourceSpec::normalize(list))
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             core: CoreConfig::from_value(cfg.get("core").unwrap_or(&Value::Null)),
             test: TestConfig::from_value(cfg.get("test").unwrap_or(&Value::Null)),
+            sources,
             auth_token: cfg
                 .pointer("/auth/token")
                 .and_then(|v| v.as_str())
@@ -260,8 +441,19 @@ pub fn default_tree() -> Value {
             "targets": DEFAULT_TARGETS,
             "expected_status": DEFAULT_EXPECTED_STATUS,
             "timeout_ms": DEFAULT_TIMEOUT_MS,
+            "timeout_ms_retry": DEFAULT_TIMEOUT_MS_RETRY,
             "concurrency": DEFAULT_CONCURRENCY,
+            "max_attempts": DEFAULT_MAX_ATTEMPTS,
+            "retry_pause_s": DEFAULT_RETRY_PAUSE_S,
         },
+        // Mirrors config.DEFAULTS["sources"]. A stored list replaces it
+        // wholesale (`deep_merge` replaces arrays rather than merging them),
+        // which is what Python's `cfg["sources"] = normalize_sources(...)` does
+        // on the file it loaded.
+        "sources": [
+            {"key": "air", "kind": "collection", "name": "air", "label": "air",
+             "enabled": true},
+        ],
     })
 }
 
@@ -282,6 +474,12 @@ pub fn deep_merge(base: &mut Value, over: &Value) {
         }
         (base, over) => *base = over.clone(),
     }
+}
+
+/// An empty stored config: merges to a no-op, unlike `Value::Null` which
+/// would replace the default tree wholesale (see `Config::load`).
+fn json_object() -> Value {
+    Value::Object(serde_json::Map::new())
 }
 
 fn random_hex(bytes: usize) -> String {
@@ -313,6 +511,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = Config::load(&tmp.path().join("absent.json")).unwrap();
         assert_eq!(cfg.core, CoreConfig::defaults());
+        assert_eq!(
+            cfg.sources.len(),
+            1,
+            "fresh installs keep the default source"
+        );
+        assert_eq!(cfg.sources[0].key, "air");
         assert!(
             cfg.auth_token.is_none(),
             "absent token denies, never allows"
@@ -328,6 +532,7 @@ mod tests {
         std::fs::write(&path, "{\"auth\": {\"token\": \"abc").unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.core.mixed_port, DEFAULT_MIXED_PORT);
+        assert_eq!(cfg.sources.len(), 1, "a corrupt file must not drop sources");
         assert!(cfg.auth_token.is_none());
     }
 
@@ -384,9 +589,20 @@ mod tests {
         let test = TestConfig::defaults();
         assert_eq!(test.expected_status, "204");
         assert_eq!(test.timeout_ms, 5_000);
+        assert_eq!(test.timeout_ms_retry, 9_000);
         assert_eq!(test.concurrency, 20, "the deployed value");
+        assert_eq!(test.max_attempts, 3);
+        assert_eq!(test.retry_pause_s, 0.3);
         assert_eq!(test.targets.len(), 3);
         assert_eq!(test.preferred_target(), DEFAULT_TARGETS[0]);
+    }
+
+    #[test]
+    fn a_zero_attempt_budget_is_repaired_not_obeyed() {
+        // Python `max(1, int(...))`. Zero attempts would mark every node dead
+        // without dialling anything.
+        let test = TestConfig::from_value(&serde_json::json!({"max_attempts": 0}));
+        assert_eq!(test.max_attempts, 1);
     }
 
     #[test]

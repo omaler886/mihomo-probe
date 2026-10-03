@@ -10,7 +10,9 @@ probe-config = { path = "../probe-config" }
 # The engine decides *what* runs and *how much at once*; the kernel adapter and
 # the ledger arrive through traits, so tests need neither a kernel nor a file.
 probe-mihomo = { path = "../probe-mihomo" }
+probe-source = { path = "../probe-source" }
 probe-storage = { path = "../probe-storage" }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }

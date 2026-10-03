@@ -1,0 +1,16 @@
+[package]
+name = "probe-source"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+probe-domain = { path = "../probe-domain" }
+probe-config = { path = "../probe-config" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
