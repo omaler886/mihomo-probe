@@ -59,10 +59,12 @@
   Rust 测试 79 → **135**。
 - 内嵌 Sub-Store（213bb6b）——probe-substore：rquickjs 宿主跑官方 bundle 2.42.2，
   独立/集成双入口；详见 09。Rust 测试 135 → **151**。
+- Sub-Store cron（b35d753）——Gist 同步 + produce 缓存预热（loon_server.go
+  移植，SkipIfStillRunning + no-redirect 自调）。Rust 测试 151 → **159**。
 
 ## 当前失败测试
-- 无。Python 568 通过 / 2 跳过；Rust **151 通过**（R3 后 45，R5 并发 +13，
-  R5 编排 +17，R5 采集 +56，Sub-Store +16）。
+- 无。Python 568 通过 / 2 跳过；Rust **159 通过**（R3 后 45，R5 并发 +13，
+  R5 编排 +17，R5 采集 +56，Sub-Store +16，cron +8）。
 
 ## ADR 索引
 - ADR-0001 存储驱动：切片用 rusqlite(bundled)，R2 迁移落地时复评 sqlx（理由见 08）。
@@ -73,8 +75,8 @@
 
 ## 下一批可并行任务
 - R5 收尾：用真机轮次数据复核四层并发阈值（现为比例初值）。
-- Sub-Store 侧（见 09）：produce/gist cron 移植；`$notification` 补 Apprise；
-  hk3 部署切换（需用户在场，先备份迁移）。
+- Sub-Store 侧（见 09）：`$notification` 补 Apprise；hk3 部署切换（需用户
+  在场，先备份迁移）。
 - R4：probe-dns（DoH + ECS + 二进制 fixture + fuzz，依赖 05）。
 - R6：前置池/链式展开（collect.rs 的 keep_dialer 现为空）。
 - R7：整轮保护 GuardDecision/PublishDecision（依赖 03）。

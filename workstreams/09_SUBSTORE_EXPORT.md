@@ -34,10 +34,30 @@ release 二进制单进程实测（embedded 形态，30 次串行请求/路由�
   （quickjs-go EvalBytecode 或 runtime 池皆然）。真正会逼人重访的信号是
   吞吐：dispatch Mutex 在 20ms/请求下上限 ≈50 req/s，单用户面板远够。
 
+## cron 移植（2026-10-03，b35d753）
+- `cron_jobs.rs` = loon_server.go `StartSubStoreCronJobs` 移植：sync_cron →
+  GET `/api/sync/artifacts`（Gist 同步）；produce_cron →
+  `<cron>,<sub|col>,<名...>`（`;` 分隔，sub/col 标识倒序查找以兼容 cron 表达式
+  带逗号），每名一个 `/download/[collection/]<名>` 预热作业。
+- 承重语义逐字移植：SkipIfStillRunning（慢跑跳过本 tick 不排队，防在
+  dispatch Mutex 后堆积）；自调客户端 Policy::none（302 不跟出去）+ no_proxy
+  + 10min 超时 + 浏览器 UA；失败 = 状态码 ≥300，解析 error.details 记日志。
+- 表达式方言：cron crate 0.17 longhand 是 6-7 段（秒在前），robfig v3 默认
+  5 段——`parse_schedule` 对 5 段前置 `0 `，6-7 段与 @简写透传。
+- 接线：SubStoreConfig/`substore` 节增 sync_cron、produce_cron（缺省 None=
+  无作业）；serve() 监听成功后才 spawn（启动失败不留自调僵尸）；通配 bind
+  归一化 127.0.0.1；env 注入 SYNC/PRODUCE_CRON + PUSH_SERVICE（与 Go 注入集
+  一致，前端可见）。
+- 验证：159 测全绿（cron 新增 8：任务串解析/表达式方言/302 不跟随 + UA 的
+  本地 stub 集成/error.details 提取/通配归一化）；实机冒烟双 cron */1 准点
+  触发，404 路径 ERROR 日志带 RESOURCE_NOT_FOUND details。
+- 已知限制：作业为分离任务随进程存活，无显式取消句柄（Rust 侧由进程退出
+  承担 Go Shutdown 的角色）；SkipIfStillRunning 无并发压测用例。
+
 ## 测试证据
 - Python 锚点：ExportTest/YamlScalarQuotingTest/DerivedDialerGroupTest/LinkSubstoreTest/PushExportsTest/PruneLocalSubsTest/test_substore_bridge 全文件。
-- Rust 新增：probe-substore 15 测（引擎回显/异常文本/KV 往返/$httpClient 本地桥/URL 全形态/runaway 中断/真 bundle env）。
+- Rust 新增：probe-substore 23 测（引擎回显/异常文本/KV 往返/$httpClient 本地桥/URL 全形态/runaway 中断/真 bundle env/cron 8 测）。
 
 ## 下一步
-- R2 快照表；R8 导出引擎；produce/gist cron 移植（蓝本 loon_server.go 的 StartSubStoreCronJobs）；`$notification` 推送补 Apprise 渠道。
+- R2 快照表；R8 导出引擎；`$notification` 推送补 Apprise 渠道。
 - 部署形态待拍板：hk3 compose 把 `substore.embedded` 打开并停独立 Sub-Store（需先备份迁移现有 subs/collections/air 脚本），或双轨并存。
