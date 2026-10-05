@@ -8,6 +8,7 @@ import shutil
 import sys
 import threading
 import time
+import contextlib
 import unittest
 import unittest.mock
 import urllib.request
@@ -5501,6 +5502,177 @@ class RegionTagIdempotenceTest(unittest.TestCase):
     def test_a_name_without_any_tag_is_untouched(self):
         self.assertEqual(self._strip("HK-Kwu Tung-h-6491845-wjhg"),
                          "HK-Kwu Tung-h-6491845-wjhg")
+
+
+class RoundPhaseIsolationTest(unittest.TestCase):
+    """A failure late in a multi-hour round must not throw the round away.
+
+    The 2026-10-05 incident ran identical multi-hour rounds to death on one
+    CoreError each, six times in a row, with nothing in the alert naming WHERE
+    the exception landed. Two fixes are pinned here: the phases between the
+    checkpoints are stamped (`[phase]` prefixes the ledger note and the
+    alert), and the verify/publish phases -- the deep end of a big round --
+    degrade on a controller error instead of abandoning every verdict the
+    delay phase already produced.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.old = (cfgmod.DATA, cfgmod.CORE_DIR, cfgmod.CORE_SECRET_PATH,
+                    engine.EXPORT_DIR, engine.db.DB_PATH, engine.db._conn,
+                    engine.ROUND_STATE)
+        cfgmod.DATA = self.tmp
+        cfgmod.CORE_DIR = self.tmp / "core"
+        cfgmod.CORE_SECRET_PATH = self.tmp / "core.secret"
+        engine.db.DB_PATH, engine.db._conn = self.tmp / "s.db", None
+        engine.EXPORT_DIR = self.tmp / "exports"
+        # Bound at import time from DATA as well: without this the abandon
+        # path reads the real state file, fails the ownership check, and the
+        # phase-tagged note never reaches the rounds row.
+        engine.ROUND_STATE = self.tmp / "round-state.json"
+        engine.db.connect()
+
+    def tearDown(self):
+        if engine.db._conn is not None:
+            engine.db._conn.close()
+        (cfgmod.DATA, cfgmod.CORE_DIR, cfgmod.CORE_SECRET_PATH,
+         engine.EXPORT_DIR, engine.db.DB_PATH, engine.db._conn,
+         engine.ROUND_STATE) = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    class _Core:
+        def __init__(self, core_cfg, secret):
+            pass
+
+        def start_and_load(self, log=None):
+            return "started"
+
+        def delay(self, name, url, timeout_ms, expected):
+            return 30, None, ""
+
+        def select(self, group, name):
+            pass
+
+        def egress(self, port, trace_url, timeout_s=15):
+            return {"loc": "US"}, None
+
+        def fetch(self, port, url, timeout_s=15):
+            return 302, 10, None
+
+    @staticmethod
+    def _cfg():
+        return {
+            "substore": {"backend": "http://127.0.0.1:3000"},
+            "core": {"api": "http://127.0.0.1:19190", "lanes": 2, "base_port": 19300,
+                     "container": "mihomo-probe", "mixed_port": 19194,
+                     "container_config_path": "/root/.config/mihomo/config.yaml"},
+            "sources": [{"key": "air", "kind": "sub", "name": "air",
+                         "label": "air", "enabled": True}],
+            "chain": {"enabled": False},
+            "test": {"targets": ["https://probe/generate_204"], "expected_status": "204",
+                     "timeout_ms": 100, "timeout_ms_retry": 100, "max_attempts": 1,
+                     "retry_pause_s": 0, "concurrency": 2},
+            "dns": {"views": {}, "timeout_s": 1, "cache_hours": 0},
+            "verify": {"enabled": True, "entry_check": True,
+                       "exclude_entry_countries": ["CN"],
+                       "exclude_countries": ["CN"]},
+            "policy": {"drop_after_consecutive_fails": 3,
+                       "suspect_floor_ratio": 0.5, "suspect_floor_absolute": 3},
+            "schedule": {"interval_minutes": 30, "enabled": False},
+            "publish": {"enabled": True, "prefix": "probe", "add_region_tag": False},
+            "watchdog": {"round_timeout_minutes": 20},
+            "alert": {"enabled": False},
+        }
+
+    def _run(self, **patches):
+        cfg = self._cfg()
+
+        class _Store:
+            def __init__(self, backend):
+                pass
+
+            def fetch_source(self, kind, name, target="ClashMeta"):
+                return [{"name": "N", "type": "vless", "server": "t.example",
+                         "port": 443, "uuid": "u"}]
+
+        entry = patches.pop("_entry", "_run_round")
+        ctx = [unittest.mock.patch.object(engine, "Client", _Store),
+               unittest.mock.patch.object(coremod, "Core", self._Core),
+               unittest.mock.patch.object(coremod, "config_test",
+                                          return_value=(True, "")),
+               unittest.mock.patch.object(engine, "_resolve_candidates",
+                                          return_value=["1.2.3.4"]),
+               unittest.mock.patch.object(engine, "lookup_countries",
+                                          return_value={"1.2.3.4": "US"}),
+               unittest.mock.patch.object(notifier, "send", lambda *a, **k: None)]
+        ctx += [unittest.mock.patch.object(engine, name, side_effect)
+                for name, side_effect in patches.items()]
+        with contextlib.ExitStack() as stack:
+            for c in ctx:
+                stack.enter_context(c)
+            runner = getattr(engine, entry)
+            return runner(cfg, "test", None, mode=None, log=_nolog)
+
+    def _last_round_note(self):
+        row = engine.db.one("SELECT note FROM rounds ORDER BY id DESC LIMIT 1")
+        return (row or {}).get("note")
+
+    def test_a_controller_error_in_egress_verify_degrades_instead_of_abandoning(self):
+        summary = self._run(_verify_egress=lambda *a, **k: (_ for _ in ()).throw(
+            coremod.CoreError("TimeoutError: timed out")))
+        self.assertNotIn("error", summary, "the round must complete")
+        self.assertFalse(self._last_round_note(),
+                         f"the round closed normally, note: {self._last_round_note()!r}")
+        # The node kept its delay-stage verdict and was published.
+        self.assertTrue((engine.EXPORT_DIR / "air.yaml").exists(),
+                        "the export still ships on a degraded verify")
+
+    def test_a_controller_error_in_payload_verify_degrades_instead_of_abandoning(self):
+        summary = self._run(_verify_chain_payload=lambda *a, **k: (_ for _ in ()).throw(
+            coremod.CoreError("TimeoutError: timed out")))
+        self.assertNotIn("error", summary)
+        self.assertIsNone(self._last_round_note(), "the round closed normally")
+
+    def test_a_controller_error_at_publish_closes_the_round_with_a_phase_note(self):
+        def _boom(*a, **k):
+            raise coremod.CoreError("TimeoutError: timed out")
+        summary = self._run(_apply_and_publish=_boom)
+        self.assertEqual(summary.get("error"), "publish failed")
+        note = self._last_round_note() or ""
+        self.assertIn("[publish]", note, f"the note names the phase: {note}")
+        self.assertIn("TimeoutError", note)
+
+    def test_any_other_round_exception_names_its_phase_in_the_alert(self):
+        def _boom(*a, **k):
+            raise TimeoutError("timed out")
+
+        captured = []
+
+        def fake_abandon(cfg, round_id, why, log, alert_key, title):
+            captured.append((alert_key, title, why))
+
+        # run_round, not _run_round: the phase-tagged abandon lives in the
+        # locking wrapper, which is also what the scheduler actually calls.
+        with self.assertRaises(TimeoutError):
+            self._run(_verify_egress=_boom, _abandon_round=fake_abandon,
+                      _entry="run_round")
+        self.assertEqual(len(captured), 1, "the abandon path ran exactly once")
+        alert_key, title, why = captured[0]
+        self.assertEqual(alert_key, "round_failed")
+        self.assertIn("[verify]", why, f"the why names the phase: {why}")
+        self.assertIn("TimeoutError: timed out", why)
+
+    def test_the_phase_marker_advances_through_the_round(self):
+        seen = []
+        real_egress = engine._verify_egress
+
+        def spy(*a, **k):
+            seen.append(engine.current_phase())
+            return {}, set(), []
+        with unittest.mock.patch.object(engine, "_verify_egress", spy):
+            self._run()
+        self.assertEqual(seen, ["verify"], f"phase stamp: {seen}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

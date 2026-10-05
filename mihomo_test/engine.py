@@ -85,6 +85,7 @@ def _checkpoint(deadline, phase, round_id=None):
     # through each one by hand is how a call site gets missed and the dashboard
     # flips back to "unknown mode" halfway through a round -- the file is
     # rewritten at every phase, so a single missed argument is visible.
+    _set_phase(phase)
     _write_state(phase, round_id, _CURRENT_ROUND_MODE)
     if deadline is not None and time.monotonic() > deadline:
         raise RoundTimeout(f"round exceeded its budget at phase {phase}")
@@ -189,6 +190,24 @@ _CURRENT_ROUND_ID = None
 # re-reading a file that a crash may have left behind. Cleared alongside the id
 # and only ever set under the round lock, so it belongs to exactly one round.
 _CURRENT_ROUND_MODE = None
+
+# Which phase the round in flight is inside (fetch / fronts / build /
+# delay-test / verify / publish / finish). The round-level exception handler
+# stamps it into the ledger note and the alert body: "CoreError: TimeoutError"
+# alone names the exception class, not the four-hour mark it died at, and
+# guessing the phase from a 4.5-hour alert cadence is how the 2026-10-05
+# incident stayed undiagnosed for a day.
+_CURRENT_PHASE = "start"
+
+
+def _set_phase(phase):
+    global _CURRENT_PHASE
+    _CURRENT_PHASE = phase
+
+
+def current_phase():
+    """The phase of the round in flight (diagnostics; safe when idle)."""
+    return _CURRENT_PHASE
 
 
 def _set_current_round(round_id, mode=None):
@@ -1000,9 +1019,16 @@ def run_round(cfg, trigger="manual", only_source=None, mode=None, log=db.log):
                        alert_key="round_timeout", title="轮次超时，已中止并释放调度锁")
         return {"error": "round timeout", "detail": str(exc)}
     except Exception as exc:
-        log("error", f"本轮异常: {type(exc).__name__}: {exc}")
+        # The phase prefix is what turns "it died again" into "it died at the
+        # verify stage, four hours in": the exception class alone said nothing
+        # about WHERE in a multi-hour round the timeout landed, and that gap
+        # is exactly what made the 2026-10-05 streak of identical alerts
+        # undiagnosable from the outside.
+        phase = _CURRENT_PHASE
+        detail = f"{type(exc).__name__}: {exc}"
+        log("error", f"本轮异常（阶段 {phase}）: {detail}")
         _abandon_round(cfg, round_id=_CURRENT_ROUND_ID,
-                       why=f"{type(exc).__name__}: {exc}", log=log,
+                       why=f"[{phase}] {detail}", log=log,
                        alert_key="round_failed", title="轮次执行异常")
         raise
     finally:
@@ -1116,6 +1142,7 @@ def _run_round(cfg, trigger, only_source, log, mode=None):
         db.finish_round(round_id, note="no enabled sources", duration_s=0)
         return {"round_id": round_id, "error": "no enabled sources"}
     _checkpoint(deadline, "fetch", round_id)
+    _set_phase("fetch")
 
     store = Client(cfg["substore"]["backend"])
     entries, errors = collect_entries(store, sources)
@@ -1265,6 +1292,10 @@ def _run_round(cfg, trigger, only_source, log, mode=None):
     # split is the only thing that turns them into `chain_failed` (recorded,
     # streak advanced, pruned safely) rather than leaving them in no result at
     # all.
+    # The node phase is the multi-hour bulk of a big round; it sits *between*
+    # the build and delay-test checkpoints, so without this the phase stamp
+    # would read "build" for four hours and a phase-tagged alert would lie.
+    _set_phase("delay-test")
     phased = bool(fronts) or any(e.get("role") == "chain" for e in entries)
     results, chain_failed, live_fronts = _test_phases(
         core, mapping, test_cfg, concurrency, deadline, phased, log)
@@ -1296,28 +1327,62 @@ def _run_round(cfg, trigger, only_source, log, mode=None):
     # Real-payload verification before the survivor list is built: a node that
     # answered the 204 but cannot carry a real TLS session must not be
     # egress-verified or published as alive.
-    _verify_chain_payload(core, core_cfg, mapping, results, cfg, log, deadline=deadline)
+    #
+    # Both verify phases are infrastructure consumers of the same kernel the
+    # delay phase just used, and by the time they run the round is hours in.
+    # A controller that dies HERE would otherwise throw away every verdict the
+    # node phase already produced -- the 2026-10-05 incident ran identical
+    # multi-hour rounds to death at exactly this depth. A CoreError from the
+    # controller is an infrastructure verdict, not a node verdict
+    # (workstreams/03's rule), so the phases degrade: keep the delay-stage
+    # results, log loudly, publish without the exit/payload confirmation --
+    # the same shape as verify.enabled=false, which was always a supported
+    # configuration.
+    _set_phase("verify")
+    try:
+        _verify_chain_payload(core, core_cfg, mapping, results, cfg, log, deadline=deadline)
+    except coremod.CoreError as exc:
+        log("error", f"链式真实拉流校验因控制器异常跳过（节点保持延迟判定）: {exc}")
 
     survivors = [name for name, outcome in results.items() if outcome["reason"] is None]
     log("info", f"存活 {len(survivors)}/{len(mapping)}，开始出口验证")
 
     verify_cfg = cfg.get("verify", {})
     countries, unverified, over_limit = {}, set(), []
-    _checkpoint(deadline, "delay-test", round_id)
+    _checkpoint(deadline, "verify", round_id)
     if verify_cfg.get("enabled", True) and survivors:
-        countries, unverified, over_limit = _verify_egress(
-            core, core_cfg, survivors, verify_cfg, log, deadline=deadline)
+        try:
+            countries, unverified, over_limit = _verify_egress(
+                core, core_cfg, survivors, verify_cfg, log, deadline=deadline)
+        except coremod.CoreError as exc:
+            log("error", f"出口验证因控制器异常跳过（节点保持延迟判定，本轮无出口国别）: {exc}")
+            countries, unverified, over_limit = {}, set(), []
     else:
         log("info", "出口验证已关闭，跳过")
 
     _checkpoint(deadline, "publish", round_id)
-    summary = _apply_and_publish(cfg, round_id, store, by_name, proxies, results,
-                                 countries, sources, log,
-                                 excluded_entries=excluded_entries,
-                                 unverified=unverified, over_limit=over_limit,
-                                 chain_failed_entries=chain_failed,
-                                 rejected_entries=rejected_entries,
-                                 fronts=fronts)
+    _set_phase("publish")
+    try:
+        summary = _apply_and_publish(cfg, round_id, store, by_name, proxies, results,
+                                     countries, sources, log,
+                                     excluded_entries=excluded_entries,
+                                     unverified=unverified, over_limit=over_limit,
+                                     chain_failed_entries=chain_failed,
+                                     rejected_entries=rejected_entries,
+                                     fronts=fronts)
+    except coremod.CoreError as exc:
+        # Convergence happens inside _apply_and_publish, so a CoreError here
+        # means the controller also died mid-fold. The ledger rows already
+        # written stand; the round still closes honestly instead of dying
+        # four hours in with an orphan row.
+        log("error", f"收敛/发布因控制器异常中止（已收敛部分保持，本轮不发布）: {exc}")
+        db.finish_round(round_id, note=f"aborted: [publish] {exc}"[:200],
+                        duration_s=round(time.time() - started, 1))
+        notifier.send(cfg, "round_failed", "轮次发布异常",
+                      f"控制器异常，已测节点部分收敛但本轮未发布: {exc}",
+                      level="error", log=log)
+        return {"round_id": round_id, "error": "publish failed",
+                "detail": str(exc)[:200]}
     _reconcile_ledger(cfg, sources, fronts, chain_configured, log)
     stale = cleanup_exports(cfg)
     if stale:
