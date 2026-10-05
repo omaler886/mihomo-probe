@@ -664,7 +664,11 @@ impl ChainSection {
     /// to 8 when the value does not parse. An unclamped cap is the multiplier
     /// a fat CF subscription silently amplifies the round by.
     pub fn max_fronts_cap(&self) -> usize {
-        let raw = if self.max_fronts == 0 { 8 } else { self.max_fronts };
+        let raw = if self.max_fronts == 0 {
+            8
+        } else {
+            self.max_fronts
+        };
         raw.clamp(1, 64) as usize
     }
 
@@ -1077,9 +1081,16 @@ mod tests {
             "max_fronts": 3,
         }));
         assert!(chain.enabled);
-        assert_eq!(chain.front_source_kind, "sub", "an unknown kind reads as sub");
+        assert_eq!(
+            chain.front_source_kind, "sub",
+            "an unknown kind reads as sub"
+        );
         assert_eq!(chain.front_source_name, "pool");
-        assert_eq!(chain.front_pick, vec!["b", "a"], "deduped, order kept, blank dropped");
+        assert_eq!(
+            chain.front_pick,
+            vec!["b", "a"],
+            "deduped, order kept, blank dropped"
+        );
         assert_eq!(chain.front_text, "vless://x");
         assert_eq!(chain.max_fronts, 3);
         assert!(chain.is_configured());
@@ -1189,7 +1200,10 @@ mod tests {
         .unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.policy.drop_after_consecutive_fails, 5);
-        assert_eq!(cfg.policy.suspect_floor_ratio, 0.4, "a numeric string parses");
+        assert_eq!(
+            cfg.policy.suspect_floor_ratio, 0.4,
+            "a numeric string parses"
+        );
         assert_eq!(cfg.policy.suspect_floor_absolute, 2, "a float truncates");
     }
 

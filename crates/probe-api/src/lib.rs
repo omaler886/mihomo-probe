@@ -319,8 +319,7 @@ async fn start_round(State(state): State<SharedState>) -> Response {
             // configured (the 直连测活 button is a Python-UI concept).
             mode: None,
         };
-        let collected =
-            probe_engine::collect(&fetcher, &task_state.sources, true, chain).await;
+        let collected = probe_engine::collect(&fetcher, &task_state.sources, true, chain).await;
         for err in &collected.errors {
             tracing::warn!(%err, "source fetch failed; continuing with the rest");
         }

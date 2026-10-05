@@ -1046,7 +1046,10 @@ mod tests {
         let summary = storage
             .converge_nodes(round, &[pass("air", "n1", 42, "direct")], &P)
             .unwrap();
-        assert_eq!(summary.new_alive, 1, "first sight + pass = New, not Restore");
+        assert_eq!(
+            summary.new_alive, 1,
+            "first sight + pass = New, not Restore"
+        );
 
         let from: Vec<(Option<String>, String)> = {
             let mut stmt = storage
@@ -1097,22 +1100,65 @@ mod tests {
         assert_eq!(storage.previous_alive_count().unwrap(), 0, "no rounds yet");
 
         let r1 = storage.start_round("test", None).unwrap();
-        storage.finish_round_full(r1, None, &RoundGuardSummary { total: 10, ok: 8, failed: 2, ..Default::default() }).unwrap();
+        storage
+            .finish_round_full(
+                r1,
+                None,
+                &RoundGuardSummary {
+                    total: 10,
+                    ok: 8,
+                    failed: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(storage.previous_alive_count().unwrap(), 8);
 
         // A suspect round: skipped as a baseline.
         let r2 = storage.start_round("test", None).unwrap();
-        storage.finish_round_full(r2, None, &RoundGuardSummary { total: 10, ok: 1, failed: 9, suspect: true, ..Default::default() }).unwrap();
+        storage
+            .finish_round_full(
+                r2,
+                None,
+                &RoundGuardSummary {
+                    total: 10,
+                    ok: 1,
+                    failed: 9,
+                    suspect: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(storage.previous_alive_count().unwrap(), 8);
 
         // An inconclusive round: skipped the same way (ADR-0005).
         let r3 = storage.start_round("test", None).unwrap();
-        storage.finish_round_full(r3, None, &RoundGuardSummary { inconclusive: true, ..Default::default() }).unwrap();
+        storage
+            .finish_round_full(
+                r3,
+                None,
+                &RoundGuardSummary {
+                    inconclusive: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(storage.previous_alive_count().unwrap(), 8);
 
         // A good round after the bad ones becomes the new baseline.
         let r4 = storage.start_round("test", None).unwrap();
-        storage.finish_round_full(r4, None, &RoundGuardSummary { total: 10, ok: 6, failed: 4, ..Default::default() }).unwrap();
+        storage
+            .finish_round_full(
+                r4,
+                None,
+                &RoundGuardSummary {
+                    total: 10,
+                    ok: 6,
+                    failed: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(storage.previous_alive_count().unwrap(), 6);
     }
 
@@ -1123,12 +1169,19 @@ mod tests {
         let summary = storage
             .converge_nodes(
                 round,
-                &[pass("air", "n1", 42, "direct"), pass("air", "n2", 50, "direct")],
+                &[
+                    pass("air", "n1", 42, "direct"),
+                    pass("air", "n2", 50, "direct"),
+                ],
                 &P,
             )
             .unwrap();
         assert_eq!(summary.alive_nodes, 2);
         let prev = storage.previous_alive_count().unwrap();
-        assert!(probe_domain::round_is_suspect(summary.alive_nodes, prev + 10, &P));
+        assert!(probe_domain::round_is_suspect(
+            summary.alive_nodes,
+            prev + 10,
+            &P
+        ));
     }
 }

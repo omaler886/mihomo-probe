@@ -195,11 +195,19 @@ mod tests {
     }
 
     fn pass(delay: i64) -> Observation {
-        Observation { ok: true, delay_ms: Some(delay), reason: None }
+        Observation {
+            ok: true,
+            delay_ms: Some(delay),
+            reason: None,
+        }
     }
 
     fn fail(reason: &str) -> Observation {
-        Observation { ok: false, delay_ms: None, reason: Some(reason.into()) }
+        Observation {
+            ok: false,
+            delay_ms: None,
+            reason: Some(reason.into()),
+        }
     }
 
     const P: Policy = Policy {
@@ -217,7 +225,11 @@ mod tests {
         assert_eq!(update.last_reason, Some(None));
         assert_eq!(update.last_ok.as_deref(), Some("T"));
         assert_eq!(update.total_ok, Some(1));
-        assert_eq!(transition, Transition::None, "pending→alive is not noteworthy");
+        assert_eq!(
+            transition,
+            Transition::None,
+            "pending→alive is not noteworthy"
+        );
     }
 
     #[test]

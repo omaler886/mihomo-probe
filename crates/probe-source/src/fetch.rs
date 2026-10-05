@@ -390,7 +390,10 @@ mod tests {
             500,
             r#"{"code":"SUBSCRIPTION_NOT_FOUND","details":404}"#
         ));
-        assert!(is_missing(500, "Cannot convert undefined or null to object"));
+        assert!(is_missing(
+            500,
+            "Cannot convert undefined or null to object"
+        ));
         assert!(is_missing(
             500,
             r#"{"status":"failed","error":{"code":"RESOURCE_NOT_FOUND"}}"#
@@ -400,7 +403,10 @@ mod tests {
             r#"{"status":"failed","error":{"code":"whatever","details":404}}"#
         ));
         assert!(!is_missing(500, r#"{"code":"OTHER"}"#));
-        assert!(!is_missing(404, "plain 404 is handled by its status, not here"));
+        assert!(!is_missing(
+            404,
+            "plain 404 is handled by its status, not here"
+        ));
         assert!(!is_missing(200, "anything"));
     }
 
@@ -408,9 +414,7 @@ mod tests {
     /// one canned response per request, in order, with the `METHOD path`
     /// lines recorded. This is the whole surface `SubAdmin` uses -- status
     /// codes decide everything, bodies only matter through `is_missing`.
-    async fn stub_server(
-        responses: Vec<(u16, &'static str)>,
-    ) -> (String, Arc<Mutex<Vec<String>>>) {
+    async fn stub_server(responses: Vec<(u16, &'static str)>) -> (String, Arc<Mutex<Vec<String>>>) {
         use std::collections::VecDeque;
 
         use axum::extract::State;
@@ -423,11 +427,7 @@ mod tests {
             log: Arc<Mutex<Vec<String>>>,
         }
 
-        async fn handle(
-            State(stub): State<Stub>,
-            method: Method,
-            uri: Uri,
-        ) -> Response {
+        async fn handle(State(stub): State<Stub>, method: Method, uri: Uri) -> Response {
             stub.log
                 .lock()
                 .unwrap()
@@ -438,11 +438,7 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or((500, "script exhausted"));
-            (
-                StatusCode::from_u16(status).unwrap(),
-                body.to_string(),
-            )
-                .into_response()
+            (StatusCode::from_u16(status).unwrap(), body.to_string()).into_response()
         }
 
         let stub = Stub {
@@ -470,7 +466,9 @@ mod tests {
         ])
         .await;
         let client = SubStoreClient::new(&backend);
-        let action = client.upsert_sub("probe-front-manual", &manual_payload()).await;
+        let action = client
+            .upsert_sub("probe-front-manual", &manual_payload())
+            .await;
         assert_eq!(action.unwrap(), "created");
         assert_eq!(
             *requests.lock().unwrap(),
@@ -485,7 +483,9 @@ mod tests {
     async fn an_existing_sub_is_patched_not_recreated() {
         let (backend, requests) = stub_server(vec![(200, "{}"), (200, "{}")]).await;
         let client = SubStoreClient::new(&backend);
-        let action = client.upsert_sub("probe-front-manual", &manual_payload()).await;
+        let action = client
+            .upsert_sub("probe-front-manual", &manual_payload())
+            .await;
         assert_eq!(action.unwrap(), "updated");
         assert_eq!(
             *requests.lock().unwrap(),
@@ -507,15 +507,14 @@ mod tests {
         ])
         .await;
         let client = SubStoreClient::new(&backend);
-        let action = client.upsert_sub("probe-front-manual", &manual_payload()).await;
+        let action = client
+            .upsert_sub("probe-front-manual", &manual_payload())
+            .await;
         assert_eq!(action.unwrap(), "patched");
         let requests = requests.lock().unwrap();
         assert_eq!(requests[0], "GET /api/sub/probe-front-manual");
         assert_eq!(requests[1], "POST /api/subs");
-        assert_eq!(
-            requests[2],
-            "PATCH /api/sub/probe-front-manual"
-        );
+        assert_eq!(requests[2], "PATCH /api/sub/probe-front-manual");
     }
 
     #[tokio::test]
@@ -527,8 +526,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_delete_500_that_means_missing_also_reads_as_never_there() {
-        let (backend, _) =
-            stub_server(vec![(500, r#"{"code":"SUBSCRIPTION_NOT_FOUND","details":404}"#)]).await;
+        let (backend, _) = stub_server(vec![(
+            500,
+            r#"{"code":"SUBSCRIPTION_NOT_FOUND","details":404}"#,
+        )])
+        .await;
         let client = SubStoreClient::new(&backend);
         assert!(!client.delete_sub("probe-front-manual").await.unwrap());
     }

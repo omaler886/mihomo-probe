@@ -138,16 +138,14 @@ impl<'a> ChainContext<'a> {
         static NO_MANUAL: OnceLock<ManualFrontCache> = OnceLock::new();
         static NO_ADMIN: NoAdmin = NoAdmin;
         Self {
-            section: DISABLED.get_or_init(|| {
-                ChainSection {
-                    enabled: false,
-                    front_source_kind: String::new(),
-                    front_source_name: String::new(),
-                    front_pick: Vec::new(),
-                    front_text: String::new(),
-                    max_fronts: 8,
-                    test_plain_nodes: false,
-                }
+            section: DISABLED.get_or_init(|| ChainSection {
+                enabled: false,
+                front_source_kind: String::new(),
+                front_source_name: String::new(),
+                front_pick: Vec::new(),
+                front_text: String::new(),
+                max_fronts: 8,
+                test_plain_nodes: false,
             }),
             publish_prefix: "probe",
             admin: &NO_ADMIN,
@@ -203,7 +201,14 @@ pub async fn collect(
 
     let chained_round = chain.chained_round();
     let pool = if chained_round {
-        collect_fronts(chain.section, chain.publish_prefix, fetcher, chain.admin, chain.manual).await
+        collect_fronts(
+            chain.section,
+            chain.publish_prefix,
+            fetcher,
+            chain.admin,
+            chain.manual,
+        )
+        .await
     } else {
         FrontPool::default()
     };
@@ -669,8 +674,7 @@ pub fn expand_chains(
                 ..entry.clone()
             };
             if chain_flag {
-                twin.fingerprint =
-                    probe_source::variant_fingerprint(&entry.fingerprint, "direct");
+                twin.fingerprint = probe_source::variant_fingerprint(&entry.fingerprint, "direct");
             }
             out.push(twin);
         }
@@ -743,7 +747,11 @@ mod tests {
     }
 
     impl SubAdmin for FakeAdmin {
-        fn upsert_sub<'a>(&'a self, name: &'a str, _payload: &'a Value) -> BoxFut<'a, Result<String, String>> {
+        fn upsert_sub<'a>(
+            &'a self,
+            name: &'a str,
+            _payload: &'a Value,
+        ) -> BoxFut<'a, Result<String, String>> {
             Box::pin(async move {
                 self.upserts
                     .lock()
@@ -805,16 +813,16 @@ mod tests {
         let fetcher = StubFetcher {
             ok: vec![
                 ("probe-front-manual".into(), vec![ss("pasted", "7.7.7.7")]),
-                ("pool".into(), vec![ss("front-a", "9.9.9.9"), ss("front-b", "8.8.8.8")]),
+                (
+                    "pool".into(),
+                    vec![ss("front-a", "9.9.9.9"), ss("front-b", "8.8.8.8")],
+                ),
             ],
             fail: vec![],
         };
         let admin = FakeAdmin::default();
         let section = chain_section("vless://pasted", "pool", &[], 8);
-        let pool = collect_fronts(
-            &section, "probe", &fetcher, &admin, &manual(),
-        )
-        .await;
+        let pool = collect_fronts(&section, "probe", &fetcher, &admin, &manual()).await;
         let fronts = pool.fronts;
         assert_eq!(fronts.len(), 3, "paste first, then the resource");
         assert_eq!(fronts[0].kernel_name, "__FRONT0__");
@@ -828,7 +836,10 @@ mod tests {
     #[tokio::test]
     async fn front_pick_narrows_the_resource_instead_of_supplementing_it() {
         let fetcher = StubFetcher {
-            ok: vec![("pool".into(), vec![ss("a", "9.9.9.9"), ss("b", "8.8.8.8"), ss("c", "7.7.7.7")])],
+            ok: vec![(
+                "pool".into(),
+                vec![ss("a", "9.9.9.9"), ss("b", "8.8.8.8"), ss("c", "7.7.7.7")],
+            )],
             fail: vec![],
         };
         let admin = FakeAdmin::default();
@@ -836,14 +847,20 @@ mod tests {
         let pool = collect_fronts(&section, "probe", &fetcher, &admin, &manual()).await;
         let fronts = pool.fronts;
         let displays: Vec<&str> = fronts.iter().map(|f| f.display.as_str()).collect();
-        assert_eq!(displays, vec!["a", "b"],
-            "narrowed to the pick, kept in the resource's own order");
+        assert_eq!(
+            displays,
+            vec!["a", "b"],
+            "narrowed to the pick, kept in the resource's own order"
+        );
     }
 
     #[tokio::test]
     async fn the_pool_is_capped_at_max_fronts() {
         let fetcher = StubFetcher {
-            ok: vec![("pool".into(), (0..10).map(|i| ss(&format!("n{i}"), "9.9.9.9")).collect())],
+            ok: vec![(
+                "pool".into(),
+                (0..10).map(|i| ss(&format!("n{i}"), "9.9.9.9")).collect(),
+            )],
             fail: vec![],
         };
         let admin = FakeAdmin::default();
@@ -855,20 +872,33 @@ mod tests {
 
     #[tokio::test]
     async fn a_healthy_paste_is_upserted_once_and_not_again() {
-        let fetcher = StubFetcher { ok: vec![], fail: vec![] };
+        let fetcher = StubFetcher {
+            ok: vec![],
+            fail: vec![],
+        };
         let admin = FakeAdmin::default();
         let cache = manual();
         let section = chain_section("vless://x", "", &[], 8);
         collect_fronts(&section, "probe", &fetcher, &admin, &cache).await;
         collect_fronts(&section, "probe", &fetcher, &admin, &cache).await;
-        assert_eq!(admin.upserts.lock().unwrap().len(), 1, "the digest cache skips the rewrite");
+        assert_eq!(
+            admin.upserts.lock().unwrap().len(),
+            1,
+            "the digest cache skips the rewrite"
+        );
         assert_eq!(admin.upserts.lock().unwrap()[0].1, "probe-front-manual");
     }
 
     #[tokio::test]
     async fn a_failed_upsert_is_not_cached_as_synced() {
-        let fetcher = StubFetcher { ok: vec![], fail: vec![] };
-        let admin = FakeAdmin { fail_upsert: true, ..Default::default() };
+        let fetcher = StubFetcher {
+            ok: vec![],
+            fail: vec![],
+        };
+        let admin = FakeAdmin {
+            fail_upsert: true,
+            ..Default::default()
+        };
         let cache = manual();
         let section = chain_section("vless://x", "", &[], 8);
         let pool = collect_fronts(&section, "probe", &fetcher, &admin, &cache).await;
@@ -881,7 +911,10 @@ mod tests {
 
     #[tokio::test]
     async fn clearing_the_paste_deletes_the_materialised_sub_once() {
-        let fetcher = StubFetcher { ok: vec![], fail: vec![] };
+        let fetcher = StubFetcher {
+            ok: vec![],
+            fail: vec![],
+        };
         let admin = FakeAdmin::default();
         let cache = manual();
         let with_paste = chain_section("vless://x", "", &[], 8);
@@ -898,7 +931,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_disabled_section_collects_nothing_and_touches_nothing() {
-        let fetcher = StubFetcher { ok: vec![], fail: vec![] };
+        let fetcher = StubFetcher {
+            ok: vec![],
+            fail: vec![],
+        };
         let admin = FakeAdmin::default();
         let section = ChainSection {
             enabled: false,
@@ -973,8 +1009,13 @@ mod tests {
     fn a_direct_twin_gets_a_derived_fingerprint_only_when_both_ways_are_measured() {
         let fronts = vec!["__FRONT0__".to_string()];
         let specs = source_list(&[("air", true, true)]);
-        let (out, _) =
-            expand_chains(vec![chained("n", "1.2.3.4")], &fronts, Some(&specs), false, false);
+        let (out, _) = expand_chains(
+            vec![chained("n", "1.2.3.4")],
+            &fronts,
+            Some(&specs),
+            false,
+            false,
+        );
         assert_eq!(out.len(), 2, "chain variant + direct twin");
         assert_eq!(out[1].role, Role::Direct);
         assert_eq!(out[1].category, "direct");
@@ -996,19 +1037,32 @@ mod tests {
         // With `chain` off there is a single variant: re-keying it would
         // orphan the ledger rows the source already has.
         let specs = source_list(&[("air", true, false)]);
-        let (out, chained_n) =
-            expand_chains(vec![chained("n", "1.2.3.4")], &fronts, Some(&specs), false, false);
+        let (out, chained_n) = expand_chains(
+            vec![chained("n", "1.2.3.4")],
+            &fronts,
+            Some(&specs),
+            false,
+            false,
+        );
         assert_eq!(chained_n, 0);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].fingerprint, base, "unchanged identity when chain is off");
+        assert_eq!(
+            out[0].fingerprint, base,
+            "unchanged identity when chain is off"
+        );
     }
 
     #[test]
     fn a_source_with_chain_off_gets_no_variants() {
         let fronts = vec!["__FRONT0__".to_string()];
         let specs = source_list(&[("air", true, false)]);
-        let (out, chained_n) =
-            expand_chains(vec![chained("n", "1.2.3.4")], &fronts, Some(&specs), false, false);
+        let (out, chained_n) = expand_chains(
+            vec![chained("n", "1.2.3.4")],
+            &fronts,
+            Some(&specs),
+            false,
+            false,
+        );
         assert_eq!(chained_n, 0);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].role, Role::Direct);
@@ -1043,21 +1097,33 @@ mod tests {
     #[test]
     fn an_empty_pool_only_matters_on_a_chain_round() {
         // A 直连测活 round (source_flags None) with no pool: untouched.
-        let (out, chained_n) = expand_chains(vec![chained("n", "1.2.3.4")], &[], None, false, false);
+        let (out, chained_n) =
+            expand_chains(vec![chained("n", "1.2.3.4")], &[], None, false, false);
         assert_eq!(chained_n, 0);
         assert_eq!(out.len(), 1);
 
         // Chaining off but the round is shaped by per-source flags: fall
         // through to direct.
         let specs = source_list(&[("air", true, true)]);
-        let (out, _) = expand_chains(vec![chained("n", "1.2.3.4")], &[], Some(&specs), false, false);
+        let (out, _) = expand_chains(
+            vec![chained("n", "1.2.3.4")],
+            &[],
+            Some(&specs),
+            false,
+            false,
+        );
         assert_eq!(out.len(), 1);
 
         // A chain round whose pool came back empty: the chain variant is
         // *failed* (`front: None`), never measured direct. The direct twin
         // (the source is direct+chain) is still there.
-        let (out, chained_n) =
-            expand_chains(vec![chained("n", "1.2.3.4")], &[], Some(&specs), true, false);
+        let (out, chained_n) = expand_chains(
+            vec![chained("n", "1.2.3.4")],
+            &[],
+            Some(&specs),
+            true,
+            false,
+        );
         assert_eq!(chained_n, 1);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].role, Role::Chain);
@@ -1073,8 +1139,13 @@ mod tests {
     fn plain_too_expands_plain_nodes_without_a_direct_twin() {
         let fronts = vec!["__FRONT0__".to_string()];
         // Without the switch a plain node passes through.
-        let (out, _) =
-            expand_chains(vec![raw("plain", ss("plain", "1.2.3.4"))], &fronts, None, false, false);
+        let (out, _) = expand_chains(
+            vec![raw("plain", ss("plain", "1.2.3.4"))],
+            &fronts,
+            None,
+            false,
+            false,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].role, Role::Direct);
 
@@ -1188,7 +1259,10 @@ mod tests {
     #[tokio::test]
     async fn duplicate_names_stay_unique_into_the_kernel_config() {
         let fetcher = StubFetcher {
-            ok: vec![("air".into(), vec![ss("dup", "1.1.1.1"), ss("dup", "2.2.2.2")])],
+            ok: vec![(
+                "air".into(),
+                vec![ss("dup", "1.1.1.1"), ss("dup", "2.2.2.2")],
+            )],
             fail: vec![],
         };
         let out = collect(
@@ -1240,7 +1314,10 @@ mod tests {
         assert_eq!(chain_job.server_ip, "9.9.9.9");
         let twin = &out.jobs[1];
         assert_eq!(twin.role, Role::Direct);
-        assert_eq!(twin.server_ip, "1.2.3.4", "the twin dials the landing itself");
+        assert_eq!(
+            twin.server_ip, "1.2.3.4",
+            "the twin dials the landing itself"
+        );
         assert_ne!(twin.fingerprint, chain_job.fingerprint);
         let front_job = &out.jobs[2];
         assert_eq!(front_job.role, Role::Front);

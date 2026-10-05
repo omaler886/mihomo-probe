@@ -679,7 +679,11 @@ const FRONT_DEAD: &str = "front_dead";
 /// The verdict is `front_dead` so the ledger blames the front, and
 /// deduplicated by (source, fingerprint) so the node writes one row however
 /// many dead-front variants it had.
-async fn run_phases(jobs: &[Job], ctx: &RoundCtx, tester: &Arc<dyn NodeTester>) -> Vec<NodeVerdict> {
+async fn run_phases(
+    jobs: &[Job],
+    ctx: &RoundCtx,
+    tester: &Arc<dyn NodeTester>,
+) -> Vec<NodeVerdict> {
     if !jobs.iter().any(|job| job.role == Role::Chain) {
         return run_jobs(jobs, ctx, tester).await;
     }
@@ -1099,11 +1103,13 @@ mod tests {
             if self.fail_finish {
                 return Err(DomainError::Storage("rounds table is locked".into()));
             }
-            self.recorded
-                .lock()
-                .unwrap()
-                .finished
-                .push((round_id, note.to_string(), counts, suspect, inconclusive));
+            self.recorded.lock().unwrap().finished.push((
+                round_id,
+                note.to_string(),
+                counts,
+                suspect,
+                inconclusive,
+            ));
             Ok(())
         }
     }
@@ -1515,8 +1521,20 @@ mod tests {
         let jobs = vec![
             named_job("__FRONT0__", "fp-front-0", "9.9.9.9", Role::Front, None),
             named_job("__FRONT1__", "fp-front-1", "8.8.8.8", Role::Front, None),
-            named_job("n #0", "fp-node", "9.9.9.9", Role::Chain, Some("__FRONT0__")),
-            named_job("n #1", "fp-node", "8.8.8.8", Role::Chain, Some("__FRONT1__")),
+            named_job(
+                "n #0",
+                "fp-node",
+                "9.9.9.9",
+                Role::Chain,
+                Some("__FRONT0__"),
+            ),
+            named_job(
+                "n #1",
+                "fp-node",
+                "8.8.8.8",
+                Role::Chain,
+                Some("__FRONT1__"),
+            ),
         ];
         let outcome = run_round_in_test(
             plan(jobs),
@@ -1562,8 +1580,20 @@ mod tests {
             named_job("__FRONT0__", "fp-front-0", "9.9.9.9", Role::Front, None),
             named_job("__FRONT1__", "fp-front-1", "8.8.8.8", Role::Front, None),
             // Two variants of the same node, both fronts dead: one row.
-            named_job("n #0", "fp-node", "9.9.9.9", Role::Chain, Some("__FRONT0__")),
-            named_job("n #1", "fp-node", "8.8.8.8", Role::Chain, Some("__FRONT1__")),
+            named_job(
+                "n #0",
+                "fp-node",
+                "9.9.9.9",
+                Role::Chain,
+                Some("__FRONT0__"),
+            ),
+            named_job(
+                "n #1",
+                "fp-node",
+                "8.8.8.8",
+                Role::Chain,
+                Some("__FRONT1__"),
+            ),
             // A variant with no front at all (the pool collapsed after
             // expansion): the same treatment.
             named_job("m", "fp-other", "9.9.9.9", Role::Chain, None),
@@ -1628,11 +1658,13 @@ mod tests {
     #[test]
     fn folding_merges_variants_of_one_node_any_alive_wins() {
         let alive0 = NodeVerdict::alive(
-            Job::new("air", "fp", "n #0", "chain", "9.9.9.9").with_role(Role::Chain, Some("__FRONT0__".into())),
+            Job::new("air", "fp", "n #0", "chain", "9.9.9.9")
+                .with_role(Role::Chain, Some("__FRONT0__".into())),
             80,
         );
         let alive1 = NodeVerdict::alive(
-            Job::new("air", "fp", "n #1", "chain", "8.8.8.8").with_role(Role::Chain, Some("__FRONT1__".into())),
+            Job::new("air", "fp", "n #1", "chain", "8.8.8.8")
+                .with_role(Role::Chain, Some("__FRONT1__".into())),
             60,
         );
         let other = NodeVerdict::dead(
@@ -1662,7 +1694,8 @@ mod tests {
         // Chain variant and direct twin of the SAME node, both dead with
         // different reasons: first failure wins, node folds once.
         let chain = NodeVerdict::dead(
-            Job::new("air", "fp", "n #0", "chain", "9.9.9.9").with_role(Role::Chain, Some("__FRONT0__".into())),
+            Job::new("air", "fp", "n #0", "chain", "9.9.9.9")
+                .with_role(Role::Chain, Some("__FRONT0__".into())),
             "front_dead",
             "front",
         );
@@ -1674,7 +1707,11 @@ mod tests {
         let folded = fold_verdicts(&[chain, twin]);
         assert_eq!(folded.len(), 1);
         assert!(!folded[0].ok);
-        assert_eq!(folded[0].reason.as_deref(), Some("front_dead"), "first failure recorded");
+        assert_eq!(
+            folded[0].reason.as_deref(),
+            Some("front_dead"),
+            "first failure recorded"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1745,7 +1782,10 @@ mod tests {
         assert_eq!(outcome.guard, GuardDecision::MarkRoundInconclusive);
         assert!(!outcome.suspect, "an untested round is not a dead round");
         let rec = ledger.recorded.lock().unwrap();
-        assert!(rec.converged.is_empty(), "nothing folds on an inconclusive round");
+        assert!(
+            rec.converged.is_empty(),
+            "nothing folds on an inconclusive round"
+        );
         let (_, _, _, suspect, inconclusive) = &rec.finished[0];
         assert!(*inconclusive, "the rounds row carries the ADR-0005 flag");
         assert!(!*suspect);
