@@ -35,6 +35,30 @@ pub struct RawEntry {
     pub fingerprint: String,
     /// `direct` / `relay` / `chain`.
     pub category: String,
+    /// What the node does in this round (Python's `entry["role"]`): a front
+    /// is a dialer tested first, a chain variant is dialled through one
+    /// front, everything else is direct. Defaults to [`Role::Direct`]; only
+    /// the front pool and `expand_chains` produce the other two.
+    pub role: Role,
+    /// For a [`Role::Chain`] variant: the front it dials through, by kernel
+    /// name. `None` on a chain entry with an empty pool means "no front was
+    /// left" -- the runner fails it `front_dead` without dialling.
+    pub front: Option<String>,
+}
+
+/// The part a node plays in one round. Distinct from `category`: a relay not
+/// in the front pool is *tested* like any direct node (`Role::Direct`) while
+/// its numbers are still reported under 中转节点 -- `category` says what kind
+/// of node it is, `role` says what it does in this round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Role {
+    /// Tested as its own server.
+    #[default]
+    Direct,
+    /// A front-pool dialer; tested in the first phase, before the chains.
+    Front,
+    /// A chain variant, dialled through the front in `front`.
+    Chain,
 }
 
 /// A node the kernel can be given.
@@ -51,6 +75,8 @@ pub struct PreparedNode {
     pub category: String,
     pub server: Option<String>,
     pub proto: Option<String>,
+    pub role: Role,
+    pub front: Option<String>,
 }
 
 /// A node that never reached the kernel, and why.
@@ -154,6 +180,8 @@ pub fn prepare(entries: &[RawEntry], keep_dialer: &[String], strip_ech: bool) ->
             proxy: Value::Object(proxy),
             fingerprint: entry.fingerprint.clone(),
             category: entry.category.clone(),
+            role: entry.role,
+            front: entry.front.clone(),
         });
     }
 
@@ -233,6 +261,8 @@ mod tests {
             fingerprint: crate::identity::fingerprint_proxy(&proxy),
             proxy,
             category: "direct".into(),
+            role: Role::default(),
+            front: None,
         }
     }
 

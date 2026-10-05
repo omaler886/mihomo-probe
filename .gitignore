@@ -71,3 +71,9 @@ chain-alive-*.md
 # Rust workspace build output (Cargo.lock IS committed; /target is not)
 # ---------------------------------------------------------------------------
 /target/
+
+# ---------------------------------------------------------------------------
+# Local smoke-run scratch dir: a throwaway root with its own ledger, kernel
+# config and a fake Sub-Store server. Reproducible from any empty directory.
+# ---------------------------------------------------------------------------
+smoke-root/

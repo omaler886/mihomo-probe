@@ -17,7 +17,6 @@
 //!
 //! * **DNS / per-address variants** (`classify_and_expand`) -- that is R4.
 //!   Today one node yields one `Job`, keyed on the domain form.
-//! * **Chain expansion** (`expand_chains`) -- R6.
 //! * **Share-link dialects** (`vless://`, base64 bodies). Python routes those
 //!   through Sub-Store rather than parsing them itself, and so does this crate:
 //!   ask Sub-Store for `target=ClashMeta` and it hands back Clash proxies.
@@ -28,9 +27,9 @@ pub mod prepare;
 pub mod source;
 pub mod subscription;
 
-pub use fetch::{Fetcher, SubStoreClient};
+pub use fetch::{content_digest, Fetcher, SubAdmin, SubStoreClient};
 pub use identity::{fingerprint_proxy, variant_fingerprint, DROP_FIELDS, REQUIRED};
-pub use prepare::{prepare, DroppedNode, PreparedNode, RawEntry};
+pub use prepare::{prepare, DroppedNode, PreparedNode, RawEntry, Role};
 pub use source::{collect_entries, FetchedSource, CAT_CHAIN, CAT_DIRECT, CAT_RELAY};
 pub use subscription::parse_proxies;
 

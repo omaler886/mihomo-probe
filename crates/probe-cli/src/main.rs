@@ -28,6 +28,7 @@ fn main() {
     let mut host = "127.0.0.1".to_string();
     let mut port: u16 = 8088;
     let mut trigger = "cli".to_string();
+    let mut mode: Option<String> = None;
     let mut from: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut assume_yes = false;
@@ -49,6 +50,15 @@ fn main() {
             "--trigger" => {
                 i += 1;
                 trigger = args.get(i).cloned().unwrap_or(trigger);
+            }
+            "--mode" => {
+                i += 1;
+                let value = args.get(i).cloned().unwrap_or_default();
+                if value != "direct" && value != "chain" {
+                    eprintln!("--mode expects direct|chain, got {value:?}");
+                    std::process::exit(2);
+                }
+                mode = Some(value);
             }
             "--from" => {
                 i += 1;
@@ -75,7 +85,7 @@ fn main() {
         .unwrap_or_else(|| "serve".into());
     match command.as_str() {
         "status" => cmd_status(&root),
-        "round" => cmd_round(&root, &trigger),
+        "round" => cmd_round(&root, &trigger, mode.as_deref()),
         "db" => {
             let sub = positionals.get(1).map(String::as_str).unwrap_or("");
             let code = cmd_db(&root, sub, from.as_deref(), out.as_deref(), assume_yes);
@@ -130,26 +140,46 @@ fn cmd_status(root: &Path) {
     }
 }
 
-fn cmd_round(root: &Path, trigger: &str) {
+fn cmd_round(root: &Path, trigger: &str, mode: Option<&str>) {
     let cfg = load(root);
-    tokio_block(cmd_round_async(root, cfg, trigger));
+    tokio_block(cmd_round_async(root, cfg, trigger, mode));
 }
 
-async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str) {
+async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&str>) {
     use probe_engine::collect as collect_mod;
 
     let storage = Storage::open(&db_path(root)).expect("open ledger");
     let secret = Config::core_secret(&root.join("data")).expect("core secret");
     let controller = Controller::new(&cfg.core.api, Some(&secret));
 
-    // The collection half of the round (R5): fetch enabled sources, flatten,
-    // prepare kernel proxies, derive jobs. One place -- the API path below
-    // calls the same function.
+    // The collection half of the round (R5/R6): fetch enabled sources and the
+    // front pool, expand chains, prepare kernel proxies, derive jobs. One
+    // place -- the API path below calls the same function.
     let backend = collect_mod::backend_from_env();
     let fetcher = probe_source::SubStoreClient::new(&backend);
-    let collected = collect_mod::collect(&fetcher, &cfg.sources, &[], true).await;
+    let admin = probe_source::SubStoreClient::new(&backend);
+    let manual = collect_mod::ManualFrontCache::default();
+    let chain = collect_mod::ChainContext {
+        section: &cfg.chain,
+        publish_prefix: &cfg.publish_prefix,
+        admin: &admin,
+        manual: &manual,
+        mode,
+    };
+    let collected = collect_mod::collect(&fetcher, &cfg.sources, true, chain).await;
     for err in &collected.errors {
         eprintln!("fetch failed: {err}");
+    }
+    if !collected.fronts.is_empty() {
+        println!(
+            "front pool: {} front(s){}",
+            collected.fronts.len(),
+            if collected.fronts_over_cap > 0 {
+                format!(" ({} over cap)", collected.fronts_over_cap)
+            } else {
+                String::new()
+            }
+        );
     }
 
     let written =
@@ -164,12 +194,12 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str) {
 
     let plan = RoundPlan {
         trigger: trigger.to_string(),
-        mode: None,
+        mode: mode.map(str::to_string),
         jobs: collected.jobs,
     };
     let ledger: Arc<dyn Ledger> = Arc::new(Mutex::new(storage));
     // The caller opens the row; the runner closes it on every path.
-    let round_id = ledger.start_round(trigger, None).unwrap_or_else(|err| {
+    let round_id = ledger.start_round(trigger, mode).unwrap_or_else(|err| {
         eprintln!("could not open a round row: {err}");
         std::process::exit(1);
     });
@@ -182,13 +212,20 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str) {
             std::process::exit(1);
         });
     println!(
-        "round {}: {} ({} node(s), {} dropped, {} fetch error(s))",
+        "round {}: {} ({} node(s), {} dropped, {} fetch error(s), live fronts {})",
         outcome.round_id,
         outcome.note,
         outcome.counts.total,
         collected.dropped,
-        collected.errors.len()
+        collected.errors.len(),
+        outcome.live_fronts,
     );
+    if outcome.front_dead > 0 {
+        eprintln!(
+            "{} chain node(s) failed front_dead: no live front carried them",
+            outcome.front_dead
+        );
+    }
 }
 
 /// `db` subcommands. Returns the process exit code.
@@ -455,6 +492,8 @@ async fn cmd_serve(root: &Path, host: &str, port: u16) -> std::io::Result<()> {
             backend,
             root: root.to_path_buf(),
             substore: embedded.map(|(cfg, _)| cfg),
+            chain: cfg.chain.clone(),
+            publish_prefix: cfg.publish_prefix.clone(),
         },
     ));
     tracing_subscriber::fmt()

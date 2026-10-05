@@ -222,10 +222,9 @@ pub const KEY_MAX: usize = 48;
 /// One entry of the `sources` list, after `config.normalize_sources` repaired
 /// it.
 ///
-/// The Rust side reads the same fields the Python round needs. `export`,
-/// `direct` and `chain` are deliberately not modelled yet: they drive
-/// publishing (R8) and chain expansion (R6), and a field nothing reads is a
-/// field that silently drifts from its Python default.
+/// The Rust side reads the same fields the Python round needs. `export` is
+/// deliberately not modelled yet: it drives publishing (R8), and a field
+/// nothing reads is a field that silently drifts from its Python default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSpec {
     pub key: String,
@@ -239,6 +238,15 @@ pub struct SourceSpec {
     /// hand-edited `"yes"` reads as "not marked" instead of reclassifying a
     /// whole source.
     pub relay: bool,
+    /// Measure this source's nodes direct. Read by the round as
+    /// `s.get("direct", True)`: absent means on, an explicit `false` means
+    /// off, anything else is not a `false` and therefore on.
+    pub direct: bool,
+    /// Measure this source's nodes through the front pool. Both switches off
+    /// falls back to direct at expansion time (`_measure_flags`), so a source
+    /// the operator un-ticked on both sides still gets measured -- and still
+    /// shows up in the ledger -- instead of silently losing its history.
+    pub chain: bool,
 }
 
 impl SourceSpec {
@@ -298,6 +306,8 @@ impl SourceSpec {
                     .to_string(),
                 enabled: map.get("enabled") != Some(&Value::Bool(false)),
                 relay: map.get("relay") == Some(&Value::Bool(true)),
+                direct: map.get("direct") != Some(&Value::Bool(false)),
+                chain: map.get("chain") != Some(&Value::Bool(false)),
                 key,
                 kind,
                 name,
@@ -377,6 +387,10 @@ pub struct Config {
     pub auth_token: Option<String>,
     /// The `substore` section (Rust-only; embedded Sub-Store).
     pub substore: SubStoreSection,
+    /// The `chain` section after `normalize_chain` repaired it.
+    pub chain: ChainSection,
+    /// `publish.prefix`: the manual-front subscription is named from it.
+    pub publish_prefix: String,
 }
 
 impl Config {
@@ -407,6 +421,13 @@ impl Config {
                 .filter(|t| !t.trim().is_empty())
                 .map(str::to_string),
             substore: SubStoreSection::from_value(cfg.get("substore").unwrap_or(&Value::Null)),
+            chain: ChainSection::from_value(cfg.get("chain").unwrap_or(&Value::Null)),
+            publish_prefix: cfg
+                .pointer("/publish/prefix")
+                .and_then(|v| v.as_str())
+                .filter(|p| !p.trim().is_empty())
+                .unwrap_or(DEFAULT_PUBLISH_PREFIX)
+                .to_string(),
         })
     }
 
@@ -498,6 +519,159 @@ impl SubStoreSection {
     }
 }
 
+/// The `chain` section: the front pool a chained node dials through, port of
+/// `config.normalize_chain`.
+///
+/// Three inputs name the pool and they compose rather than exclude each other:
+/// `front_text` (pasted share links, materialised into a Sub-Store sub),
+/// `front_pick` (display names to keep out of `front_source`), and
+/// `front_source` (the whole resource). The pasted text wins the head of the
+/// pool because it is the operator's explicit, just-typed choice.
+///
+/// Every malformed value repairs to the disabled default rather than raising:
+/// this runs on every load, and a hand-edited config.json must not be able to
+/// stop the service from booting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainSection {
+    pub enabled: bool,
+    /// The Sub-Store resource kind. A kind outside `SOURCE_KINDS` reads as
+    /// `sub` (Python: `if ref.get("kind") not in SOURCE_KINDS`).
+    pub front_source_kind: String,
+    /// The resource's name, stripped; empty means "no resource".
+    pub front_source_name: String,
+    /// Display names to keep from the resource, deduplicated with order
+    /// preserved and capped at [`MAX_FRONT_PICK`].
+    pub front_pick: Vec<String>,
+    /// The pasted front list (share links or base64), stripped and capped at
+    /// [`MAX_FRONT_TEXT`] bytes.
+    pub front_text: String,
+    /// The configured pool cap; `collect_fronts` clamps it into `1..=64`
+    /// (Python does the clamp there, not in the normalizer).
+    pub max_fronts: i64,
+    /// Client-path mode: plain nodes (no upstream `dialer-proxy`) also get
+    /// chained variants -- and no direct twin -- so the ledger's verdict is
+    /// the client's verdict.
+    pub test_plain_nodes: bool,
+}
+
+/// `config.MAX_FRONT_TEXT`: the paste is a JSON-blob field, not a file.
+pub const MAX_FRONT_TEXT: usize = 262_144;
+/// `config.MAX_FRONT_PICK`: names, not data, but still bounded.
+pub const MAX_FRONT_PICK: usize = 500;
+
+pub const DEFAULT_PUBLISH_PREFIX: &str = "probe";
+
+impl Default for ChainSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            front_source_kind: "sub".into(),
+            front_source_name: String::new(),
+            front_pick: Vec::new(),
+            front_text: String::new(),
+            max_fronts: 8,
+            test_plain_nodes: false,
+        }
+    }
+}
+
+impl ChainSection {
+    fn from_value(value: &Value) -> Self {
+        let source = value.get("front_source");
+        let front_pick = value
+            .get("front_pick")
+            .and_then(|v| v.as_array())
+            .map(|list| {
+                let mut picked: Vec<String> = Vec::new();
+                for item in list {
+                    let name = item.as_str().unwrap_or("").trim();
+                    if name.is_empty() || picked.iter().any(|p| p == name) {
+                        continue;
+                    }
+                    picked.push(name.to_string());
+                    if picked.len() >= MAX_FRONT_PICK {
+                        break;
+                    }
+                }
+                picked
+            })
+            .unwrap_or_default();
+        let mut front_text = value
+            .get("front_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        // Character truncation, like Python's str slicing; a byte cut would
+        // land inside a UTF-8 sequence.
+        if front_text.chars().count() > MAX_FRONT_TEXT {
+            front_text = front_text.chars().take(MAX_FRONT_TEXT).collect();
+        }
+        // Python `int(block.get("max_fronts", 8) or 8)`: a falsy value (0,
+        // null, false, "") falls back to 8, a float truncates, a numeric
+        // string parses, anything else raises and is caught back to 8.
+        let max_fronts = value.get("max_fronts").map_or(8, |raw| {
+            let as_int = raw
+                .as_i64()
+                .or_else(|| raw.as_f64().map(|f| f as i64))
+                .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<i64>().ok()));
+            match as_int {
+                Some(n) if n != 0 => n,
+                _ => 8,
+            }
+        });
+        Self {
+            enabled: value.get("enabled") == Some(&Value::Bool(true)),
+            // A kind outside `SOURCE_KINDS` reads as `sub` (Python:
+            // `if ref.get("kind") not in SOURCE_KINDS`).
+            front_source_kind: source
+                .and_then(|s| s.get("kind"))
+                .and_then(|k| k.as_str())
+                .filter(|k| SOURCE_KINDS.contains(k))
+                .unwrap_or("sub")
+                .to_string(),
+            front_source_name: source
+                .and_then(|s| s.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+            front_pick,
+            front_text,
+            max_fronts,
+            test_plain_nodes: value
+                .get("test_plain_nodes")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        }
+    }
+
+    /// `engine.chain_block`: chaining counts as configured when it is enabled
+    /// *and* a pool is named -- either input counts, because they are two ways
+    /// to fill the same pool. `None`-for-half-configured is deliberate: a
+    /// half-configured chain would otherwise fail every chained node with
+    /// `front_dead` because of a missing config field, which reads as a
+    /// network problem.
+    pub fn is_configured(&self) -> bool {
+        self.enabled && (!self.front_source_name.is_empty() || !self.front_text.is_empty())
+    }
+
+    /// `engine.collect_fronts`'s cap:
+    /// `max(1, min(64, int(block.get("max_fronts", 8) or 8)))`, falling back
+    /// to 8 when the value does not parse. An unclamped cap is the multiplier
+    /// a fat CF subscription silently amplifies the round by.
+    pub fn max_fronts_cap(&self) -> usize {
+        let raw = if self.max_fronts == 0 { 8 } else { self.max_fronts };
+        raw.clamp(1, 64) as usize
+    }
+
+    /// The Sub-Store subscription the pasted front list is materialised into:
+    /// `{publish.prefix}-front-manual` (Python `manual_front_sub_name`).
+    pub fn manual_sub_name(&self, publish_prefix: &str) -> String {
+        format!("{}-front-manual", publish_prefix)
+    }
+}
+
 pub fn default_tree() -> Value {
     serde_json::json!({
         "core": {
@@ -536,6 +710,21 @@ pub fn default_tree() -> Value {
             "push_service": "",
             "sync_cron": null,
             "produce_cron": null,
+        },
+        // Mirrors config.DEFAULTS["chain"] (minus the doc-only fields). Same
+        // rules as `substore`: unknown-key tolerant, disabled by default.
+        "chain": {
+            "enabled": false,
+            "front_source": {"kind": "sub", "name": ""},
+            "front_pick": [],
+            "front_text": "",
+            "max_fronts": 8,
+            "test_plain_nodes": false,
+        },
+        // Only the field the Rust slice reads; the rest of Python's `publish`
+        // defaults stay Python-side until R8.
+        "publish": {
+            "prefix": DEFAULT_PUBLISH_PREFIX,
         },
     })
 }
@@ -588,6 +777,7 @@ pub fn resolve_root(explicit: Option<&Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn a_missing_config_file_yields_defaults() {
@@ -786,5 +976,132 @@ mod tests {
             cfg.test.expected_status, "204",
             "untouched keys keep their default"
         );
+    }
+
+    // --- chain section (R6, port of config.normalize_chain) ---
+
+    #[test]
+    fn the_chain_section_defaults_to_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&tmp.path().join("absent.json")).unwrap();
+        assert_eq!(cfg.chain, ChainSection::default());
+        assert!(!cfg.chain.is_configured());
+        assert_eq!(cfg.publish_prefix, DEFAULT_PUBLISH_PREFIX);
+    }
+
+    #[test]
+    fn a_chain_block_repairs_each_field_like_normalize_chain() {
+        let chain = ChainSection::from_value(&serde_json::json!({
+            "enabled": true,
+            "front_source": {"kind": "weird", "name": "  pool  "},
+            "front_pick": ["b", "a", "b", "", " a ", "a"],
+            "front_text": "  vless://x  ",
+            "max_fronts": 3,
+        }));
+        assert!(chain.enabled);
+        assert_eq!(chain.front_source_kind, "sub", "an unknown kind reads as sub");
+        assert_eq!(chain.front_source_name, "pool");
+        assert_eq!(chain.front_pick, vec!["b", "a"], "deduped, order kept, blank dropped");
+        assert_eq!(chain.front_text, "vless://x");
+        assert_eq!(chain.max_fronts, 3);
+        assert!(chain.is_configured());
+    }
+
+    #[test]
+    fn chain_block_enabled_is_strictly_true() {
+        // Python `out.get("enabled") is True`: a truthy string does not count.
+        for value in ["yes", "true", "1"] {
+            let chain = ChainSection::from_value(&serde_json::json!({
+                "enabled": value,
+                "front_text": "vless://x",
+            }));
+            assert!(!chain.enabled, "{value:?} must not enable chaining");
+            assert!(!chain.is_configured());
+        }
+    }
+
+    #[test]
+    fn a_half_configured_chain_is_not_configured() {
+        // `chain_block` returns None when enabled but no pool is named: a
+        // misconfigured chain must read as "off", not as "every chain dead".
+        let enabled_no_pool = ChainSection::from_value(&serde_json::json!({"enabled": true}));
+        assert!(!enabled_no_pool.is_configured());
+        // A pool without enabled is equally not a chain round.
+        let pool_disabled = ChainSection::from_value(&serde_json::json!({
+            "front_source": {"kind": "sub", "name": "pool"},
+        }));
+        assert!(!pool_disabled.is_configured());
+        // Either input alone is enough when enabled.
+        let manual_only = ChainSection::from_value(&serde_json::json!({
+            "enabled": true, "front_text": "vless://x",
+        }));
+        assert!(manual_only.is_configured());
+    }
+
+    #[test]
+    fn max_fronts_cap_mirrors_the_python_clamp() {
+        let cap = |max_fronts: Value| {
+            ChainSection::from_value(&serde_json::json!({ "max_fronts": max_fronts }))
+                .max_fronts_cap()
+        };
+        assert_eq!(cap(json!(8)), 8, "the default");
+        assert_eq!(cap(json!(0)), 8, "falsy falls back to 8");
+        assert_eq!(cap(json!(null)), 8);
+        assert_eq!(cap(json!(false)), 8);
+        assert_eq!(cap(json!(-5)), 1, "clamped low");
+        assert_eq!(cap(json!(100)), 64, "clamped high");
+        assert_eq!(cap(json!("12")), 12, "a numeric string parses");
+        assert_eq!(cap(json!("abc")), 8, "unparseable falls back to 8");
+        assert_eq!(cap(json!(7.9)), 7, "a float truncates like int()");
+    }
+
+    #[test]
+    fn a_giant_front_text_is_truncated_by_characters() {
+        let text = "x".repeat(MAX_FRONT_TEXT + 100);
+        let chain = ChainSection::from_value(&serde_json::json!({"front_text": text}));
+        assert_eq!(chain.front_text.chars().count(), MAX_FRONT_TEXT);
+    }
+
+    #[test]
+    fn the_manual_front_sub_is_named_from_the_publish_prefix() {
+        let chain = ChainSection::default();
+        assert_eq!(chain.manual_sub_name("probe"), "probe-front-manual");
+        assert_eq!(chain.manual_sub_name("mx"), "mx-front-manual");
+    }
+
+    #[test]
+    fn a_prefix_only_config_loads_into_the_chain_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"publish": {"prefix": "mx"},
+                               "chain": {"enabled": true, "front_text": "vless://y"}})
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.publish_prefix, "mx");
+        assert_eq!(
+            cfg.chain.manual_sub_name(&cfg.publish_prefix),
+            "mx-front-manual"
+        );
+        assert!(cfg.chain.is_configured());
+    }
+
+    #[test]
+    fn source_direct_and_chain_switches_default_on_and_false_turns_them_off() {
+        let sources = SourceSpec::normalize(&[
+            json!({"name": "plain"}),
+            json!({"name": "no-chain", "chain": false}),
+            json!({"name": "no-direct", "direct": false}),
+            json!({"name": "truthy", "direct": "yes"}),
+        ])
+        .unwrap();
+        assert!(sources[0].direct && sources[0].chain, "absent means on");
+        assert!(sources[1].direct && !sources[1].chain);
+        assert!(!sources[2].direct && sources[2].chain);
+        // `s.get("direct", True)`: anything that is not literally false is on.
+        assert!(sources[3].direct);
     }
 }

@@ -117,7 +117,7 @@ impl Limits {
 
 /// One unit of work, identified by the keys each consumer needs.
 ///
-/// The gate only reads `source_id` and `server_ip`; the other three travel
+/// The gate only reads `source_id` and `server_ip`; the other fields travel
 /// with the job so the result can be attributed without a side lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
@@ -128,11 +128,19 @@ pub struct Job {
     /// within one generated config because `prepare()` de-duplicates, but it is
     /// a display name and not stable across rounds: never key on it.
     pub proxy_name: String,
-    /// `direct` / `chain`; lands in `results.category`.
+    /// `direct` / `relay` / `chain`; lands in `results.category`.
     pub variant: String,
     /// The address the kernel dials from this host. For a chain node that is
     /// the *front*, not the landing -- see the module docs.
     pub server_ip: String,
+    /// What the node does in this round (Python's `entry["role"]`): fronts
+    /// test in the first phase, chain variants in the second, everything
+    /// else counts as direct.
+    pub role: probe_source::Role,
+    /// The front a [`probe_source::Role::Chain`] variant dials through, by
+    /// kernel name. `None` there means the pool was empty: the runner fails
+    /// the job `front_dead` without dialling it.
+    pub front: Option<String>,
 }
 
 impl Job {
@@ -149,7 +157,17 @@ impl Job {
             proxy_name: proxy_name.into(),
             variant: variant.into(),
             server_ip: server_ip.into(),
+            role: probe_source::Role::Direct,
+            front: None,
         }
+    }
+
+    /// Assign the role and the dialled front. The collection path derives
+    /// both from the prepared node it builds the job from.
+    pub fn with_role(mut self, role: probe_source::Role, front: Option<String>) -> Self {
+        self.role = role;
+        self.front = front;
+        self
     }
 }
 

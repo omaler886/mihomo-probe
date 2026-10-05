@@ -42,6 +42,12 @@ pub struct AppState {
     pub root: std::path::PathBuf,
     /// Embedded Sub-Store to run alongside the API; `None` disables.
     pub substore: Option<probe_substore::SubStoreConfig>,
+    /// The chain section snapshot (front pool config) taken at serve time.
+    pub chain: probe_config::ChainSection,
+    /// `publish.prefix`, from which the manual-front sub is named.
+    pub publish_prefix: String,
+    /// Process memory of what the manual-front sub was last written from.
+    pub manual: probe_engine::collect::ManualFrontCache,
     in_flight: Arc<AtomicBool>,
 }
 
@@ -63,6 +69,9 @@ impl AppState {
             backend: serve.backend,
             root: serve.root,
             substore: serve.substore,
+            chain: serve.chain,
+            publish_prefix: serve.publish_prefix,
+            manual: probe_engine::collect::ManualFrontCache::default(),
             in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -87,6 +96,10 @@ pub struct ServeConfig {
     /// listener. `None` keeps the API surface byte-identical (tests, shadow
     /// runs, deployments that point at a standalone Sub-Store).
     pub substore: Option<probe_substore::SubStoreConfig>,
+    /// The chain section snapshot (front pool config) taken at serve time.
+    pub chain: probe_config::ChainSection,
+    /// `publish.prefix`, from which the manual-front sub is named.
+    pub publish_prefix: String,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -291,7 +304,18 @@ async fn start_round(State(state): State<SharedState>) -> Response {
         // is rewritten before the reload so the kernel serves this round's
         // nodes rather than a stale file.
         let fetcher = probe_source::SubStoreClient::new(&task_state.backend);
-        let collected = probe_engine::collect(&fetcher, &task_state.sources, &[], true).await;
+        let admin = probe_source::SubStoreClient::new(&task_state.backend);
+        let chain = probe_engine::collect::ChainContext {
+            section: &task_state.chain,
+            publish_prefix: &task_state.publish_prefix,
+            admin: &admin,
+            manual: &task_state.manual,
+            // The API rounds run the scheduler's semantics: chain exactly as
+            // configured (the 直连测活 button is a Python-UI concept).
+            mode: None,
+        };
+        let collected =
+            probe_engine::collect(&fetcher, &task_state.sources, true, chain).await;
         for err in &collected.errors {
             tracing::warn!(%err, "source fetch failed; continuing with the rest");
         }
@@ -403,6 +427,8 @@ mod tests {
                 backend: "http://127.0.0.1:1".into(),
                 root: root.to_path_buf(),
                 substore: None,
+                chain: cfg.chain.clone(),
+                publish_prefix: cfg.publish_prefix.clone(),
             },
         ))
     }

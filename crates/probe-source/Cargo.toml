@@ -14,3 +14,9 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# The SubAdmin tests stub the Sub-Store admin API on a real listener, the same
+# way the probe-substore tests do: the request sequence (GET -> POST -> PATCH)
+# is the behaviour under test, not just the parsing.
+axum = { workspace = true }

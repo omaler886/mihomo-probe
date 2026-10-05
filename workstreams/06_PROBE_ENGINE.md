@@ -77,16 +77,64 @@
 Python 在该情况下会把 http 通过当作存活；Rust 若把它当 blocked 就会在每轮
 双跑里制造一处无意义的差异（这条曾被独立审查指出，已改）。
 
+## 前置池 + 链式展开 + 两遍测试（R6）— **已实现**
+
+Python 锚点：`engine.collect_fronts` / `expand_chains` / `_measure_flags` /
+`_test_phases` / `manual_fronts` / `chain_block`；`config.normalize_chain`。
+落地分布：`probe-config::ChainSection`（config 段 + `is_configured`）、
+`probe-source::SubAdmin`（manual 前置的 upsert/delete）+ `Role`（RawEntry/
+PreparedNode/Job 三层透传）、`probe-engine::collect`（`collect_fronts` +
+`expand_chains`）、`probe-engine::round::run_phases`（两遍）。
+
+| 语义 | 移植要点 |
+|---|---|
+| `chain_block` 三态 | `ChainSection::is_configured()`：`enabled is True` 且
+  （front_source_name 或 front_text）非空。半配置=未配置（否则一次手改配置会
+  让全链式 `front_dead`，读起来像网络故障） |
+| 三输入池 | manual（front_text → Sub-Store 物化订阅 `{prefix}-front-manual`，digest
+  缓存防重复写，失败不缓存下次重试，清空粘贴→删除订阅且只删一次）+ front_pick
+  名单（**窄化**资源、保持资源自身顺序，与 Python `retain` 一致）+ front_source
+  整源；manual 在前 |
+| 内核名预留 | `__FRONT{i}__` 位置派生（Python `FRONT_NAME_PREFIX`），链式变体的
+  dialer 永远解析到前置而不是同名的用户节点 |
+| 前置身份 | front job 的 fp = 原 proxy 的 fingerprint（前置自己也是别处的节点）；
+  前置 job 的 server_ip = 前置自己的 server（第一遍闸门） |
+| 变体展开 | 带上游 dialer 的节点 × 每前置一条，**fp 不变**（同一账本行：任一前置
+  拉通即活）；source 的 `direct`/`chain` 双开关（`_measure_flags`：both-off 兜底
+  直连、无 flags=历史 chain-only）；relay 节点永不展开；front 自身永不展开 |
+| 直连孪生 | 双开关同开时才有，fp = `variant_fingerprint(原fp, "direct")` —— 否则
+  两个测量互相覆盖；chain 关时单变体不改键（否则孤儿化历史行） |
+| `test_plain_nodes` | 无上游 dialer 的普通节点也过链、**不发直连孪生**（账本判活口径
+  =客户端口径）；chain 开关关的源保持直连 |
+| 空池三态 | 直连轮（flags=None）不展开；半配置/链关：fall-through 直连（记 warn）；
+  链式轮真空池：变体带 `front=None` 进 config（keep_dialer 空→剥 dialer），runner
+  判 `front_dead` 不拨号 |
+| 两遍测试 | `run_phases`：第一遍 role≠Chain（含前置），活前置集合（role=Front 且 alive）
+  才放行第二遍；未试节点按 (source, fp) 去重判 `front_dead`（attempts=0、
+  detail「前置全部不通，链式未测」、category=chain、照写账本推进 streak） |
+| 轮级口径 | `RoundOutcome.live_fronts` / `front_dead`；chain job 的 `server_ip` = 前置
+  地址（闸门 per_server_ip 限的是本机拨出去的那一跳） |
+| API/CLI | CLI `round --mode direct|chain`（None=调度语义）；API 轮次固定调度语义
+  （`mode=None`）；`ManualFrontCache` 在 AppState 常驻、CLI 每进程一份 |
+
+已知口径差异（记录，不改）：Python `finish_round` 的 total 按 (source, fp)
+去重（同节点多前置变体只计 1），Rust `counts.total` 按 verdict 数（=变体数）。
+`results` 行两边都按变体写；轮行 total 在双跑对账时按此口径折算。
+
+冒烟（smoke-root，fake Sub-Store）：直连轮 2 节点诚实关行；链式轮 front pool
+1 条 → jobs = 2 直连 + 链式变体 + 直连孪生 + front = 5，`dialer-proxy:
+__FRONT0__` 与前置代理都进了内核配置；`--mode direct` 池被跳过、dialer 全剥。
+
 ## 待办清单
 - [x] R5：分层并发 Limits（global/per_source/per_server_ip/diagnose）— 见上
 - [x] R5：`RoundCtx` 接进轮次流水线（`run_round` + 单事务结果写入 + 取消语义）
-- [ ] R5：**节点采集**（Sub-Store → fingerprint → 变体）—— 现在 `jobs` 恒为空，
-      闸门接上了但还没限到东西
-- [ ] R5：`test_one` 的 HTTPS 优先重排 + `max_attempts=3` + 超时升级 + TERMINAL_REASONS
-      （现在只做一次尝试、只打第一个 HTTPS 目标，`attempts` 恒为 1）
+- [x] R5：**节点采集**（`probe-source` crate：fetch→flatten→prepare→jobs，
+      1d070f2）
+- [x] R5：`test_one` 的 HTTPS 优先重排 + `max_attempts=3` + 超时升级 + TERMINAL_REASONS
+      （1d070f2，`measure.rs::TestOne`）
 - [ ] R5：用真机轮次数据复核四层阈值（当前 `from_concurrency(20)` 的比例值是初值，**不是调优结果**）
-- [ ] R5：delay 引擎+失败归类（对拍 test_one）
-- [ ] R6：出口验证+ipmap 落地映射
+- [x] R6：**前置池 + 链式展开 + 两遍测试**（本批，见上节）
+- [ ] R6：出口验证+ipmap 落地映射（07 主题）
 - [ ] R7：整轮护栏 `GuardDecision`（内核不可达已在 runner 内处理，其余待补）
 - [ ] R5/R9：L1/L2/L3 与自适应周期（ADR 先行）
 - [ ] R9：对外取消入口 `POST /api/v1/rounds/{id}/cancel`（闸门与 runner 侧已具备）

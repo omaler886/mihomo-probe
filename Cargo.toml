@@ -36,6 +36,10 @@ tokio = { version = "1", features = [
     # and time::sleep to prove the gate is not deadlocking.
     "sync",
     "time",
+    # probe-source's Sub-Store admin tests stub the HTTP API on a raw
+    # TcpListener; io-util is the read/write extension traits it uses.
+    "net",
+    "io-util",
 ] }
 # CancellationToken is the maintained answer to "stop this round"; hand-rolling
 # an AtomicBool would lose the wake-on-cancel that a blocked acquire needs.

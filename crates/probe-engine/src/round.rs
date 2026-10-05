@@ -30,12 +30,14 @@
 //! leave the ledger broken" are separate rules, and conflating them is how a
 //! cancel turns into an orphan row that the next start-up has to reap.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use probe_domain::{DomainError, DomainResult, RoundId};
 use probe_mihomo::{Controller, DelayOutcome, KernelError};
+use probe_source::Role;
 use probe_storage::{ResultRow, Storage, VERDICT_FAIL, VERDICT_OK};
 
 use crate::limits::{Job, Limits, RoundCtx};
@@ -339,6 +341,12 @@ pub struct RoundOutcome {
     pub results_written: usize,
     pub note: String,
     pub verdicts: Vec<NodeVerdict>,
+    /// Fronts that carried traffic in the first phase. 0 without chaining,
+    /// and 0 on the round-level "front pool is down" condition.
+    pub live_fronts: usize,
+    /// Chain nodes failed `front_dead` without dialling (deduplicated by
+    /// ledger identity).
+    pub front_dead: usize,
 }
 
 /// Run one round with a fresh gate.
@@ -389,8 +397,23 @@ pub async fn run_round_with_ctx(
         // the phase is the same rule as the round guard in workstreams/03:
         // infrastructure failure must not be recorded as node failure.
         KernelState::Unreachable(_) | KernelState::NotPrepared(_) => Vec::new(),
-        KernelState::Reloaded | KernelState::Refused => run_jobs(&plan.jobs, &ctx, &tester).await,
+        KernelState::Reloaded | KernelState::Refused => run_phases(&plan.jobs, &ctx, &tester).await,
     };
+
+    // Python `_test_phases`' two outputs, recomputed from the verdicts: the
+    // fronts that carried traffic, and the chains that were failed untried.
+    // A front's verdict has to exist before a chain's verdict can mean
+    // anything, so "front pool down" is readable right off the outcome.
+    let live_fronts = verdicts
+        .iter()
+        .filter(|v| v.job.role == Role::Front && v.is_alive())
+        .map(|v| v.job.proxy_name.clone())
+        .collect::<HashSet<_>>()
+        .len();
+    let front_dead = verdicts
+        .iter()
+        .filter(|v| v.job.role == Role::Chain && v.reason() == Some(FRONT_DEAD))
+        .count();
 
     let ok = verdicts.iter().filter(|v| v.is_alive()).count();
     let counts = RoundCounts {
@@ -435,7 +458,78 @@ pub async fn run_round_with_ctx(
         results_written,
         note,
         verdicts,
+        live_fronts,
+        front_dead,
     })
+}
+
+/// The failure class Python records for a chain whose every front was dead:
+/// the node is not "timing out", the front pool is.
+const FRONT_DEAD: &str = "front_dead";
+
+/// Test the jobs in two passes when the round has chains
+/// (Python `_test_phases`): fronts and direct nodes first, then the chain
+/// variants -- restricted to fronts that actually carried traffic. A chain
+/// through a dead front cannot succeed, so dialling it would spend a timeout
+/// per front to re-learn the front's own result.
+///
+/// A chain node whose every front is dead is *failed*, never measured direct:
+/// `collect` already stripped that option when it expanded the variants.
+/// The verdict is `front_dead` so the ledger blames the front, and
+/// deduplicated by (source, fingerprint) so the node writes one row however
+/// many dead-front variants it had.
+async fn run_phases(jobs: &[Job], ctx: &RoundCtx, tester: &Arc<dyn NodeTester>) -> Vec<NodeVerdict> {
+    if !jobs.iter().any(|job| job.role == Role::Chain) {
+        return run_jobs(jobs, ctx, tester).await;
+    }
+    let first: Vec<Job> = jobs
+        .iter()
+        .filter(|job| job.role != Role::Chain)
+        .cloned()
+        .collect();
+    let second: Vec<Job> = jobs
+        .iter()
+        .filter(|job| job.role == Role::Chain)
+        .cloned()
+        .collect();
+
+    let mut out = run_jobs(&first, ctx, tester).await;
+    if ctx.is_cancelled() {
+        return out;
+    }
+
+    // Only fronts whose own test came back clean carry a chain.
+    let live: HashSet<&str> = out
+        .iter()
+        .filter(|v| v.job.role == Role::Front && v.is_alive())
+        .map(|v| v.job.proxy_name.as_str())
+        .collect();
+    let runnable: Vec<Job> = second
+        .iter()
+        .filter(|job| job.front.as_deref().is_some_and(|f| live.contains(f)))
+        .cloned()
+        .collect();
+    if !runnable.is_empty() {
+        out.extend(run_jobs(&runnable, ctx, tester).await);
+    }
+
+    // Every node with nothing left to try is failed outright -- once per
+    // node, not once per dead-front variant.
+    let tried: HashSet<(&str, &str)> = runnable
+        .iter()
+        .map(|job| (job.source_id.as_str(), job.fingerprint.as_str()))
+        .collect();
+    let mut failed: HashSet<(&str, &str)> = HashSet::new();
+    for job in &second {
+        let key = (job.source_id.as_str(), job.fingerprint.as_str());
+        if tried.contains(&key) || !failed.insert(key) {
+            continue;
+        }
+        out.push(
+            NodeVerdict::dead(job.clone(), FRONT_DEAD, "前置全部不通，链式未测").with_attempts(0),
+        );
+    }
+    out
 }
 
 /// Fan the jobs out through the gate and collect what came back.
@@ -566,6 +660,8 @@ mod tests {
         cancel_after: Option<usize>,
         started: AtomicUsize,
         cancel: Mutex<Option<CancellationToken>>,
+        /// Kernel names that always come back dead, whatever `alive` says.
+        dead_names: Vec<String>,
     }
 
     impl FakeTester {
@@ -580,7 +676,14 @@ mod tests {
                 cancel_after: None,
                 started: AtomicUsize::new(0),
                 cancel: Mutex::new(None),
+                dead_names: Vec::new(),
             }
+        }
+
+        /// Mark these kernel names dead; everything else answers `alive`.
+        fn killing(mut self, dead: &[&str]) -> Self {
+            self.dead_names = dead.iter().map(|s| s.to_string()).collect();
+            self
         }
 
         fn slow(mut self, delay: Duration) -> Self {
@@ -638,7 +741,7 @@ mod tests {
                 self.live_global.fetch_sub(1, Ordering::AcqRel);
                 *self.live.lock().unwrap().entry(key).or_default() -= 1;
 
-                if self.alive {
+                if self.alive && !self.dead_names.contains(&job.proxy_name) {
                     NodeVerdict::alive(job, 42)
                 } else {
                     NodeVerdict::dead(job, "timeout", "Timeout")
@@ -1110,5 +1213,133 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("rounds table is locked"), "{err}");
         assert!(ledger.recorded.lock().unwrap().finished.is_empty());
+    }
+
+    fn named_job(
+        proxy_name: &str,
+        fingerprint: &str,
+        server_ip: &str,
+        role: Role,
+        front: Option<&str>,
+    ) -> Job {
+        Job::new("air", fingerprint, proxy_name, "chain", server_ip)
+            .with_role(role, front.map(str::to_string))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chains_run_only_through_fronts_that_carry_traffic() {
+        // One node, two variants: __FRONT0__ lives, __FRONT1__ is dead. The
+        // variant through the dead front must not be dialled at all -- the
+        // front's own result is the answer.
+        let tester = Arc::new(FakeTester::new(true).killing(&["__FRONT1__"]));
+        let jobs = vec![
+            named_job("__FRONT0__", "fp-front-0", "9.9.9.9", Role::Front, None),
+            named_job("__FRONT1__", "fp-front-1", "8.8.8.8", Role::Front, None),
+            named_job("n #0", "fp-node", "9.9.9.9", Role::Chain, Some("__FRONT0__")),
+            named_job("n #1", "fp-node", "8.8.8.8", Role::Chain, Some("__FRONT1__")),
+        ];
+        let outcome = run_round_in_test(
+            plan(jobs),
+            loose(),
+            Arc::new(FakeKernel(KernelState::Reloaded)),
+            tester.clone(),
+            FakeLedger::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.live_fronts, 1);
+        // Three dialled (two fronts + the live-front variant) + one failed
+        // untried. The dead-front variant of a node whose other variant ran
+        // is NOT re-failed: the node was tried.
+        assert_eq!(tester.started(), 3);
+        assert_eq!(outcome.front_dead, 0);
+        assert_eq!(outcome.counts.total, 3);
+        assert!(
+            outcome
+                .verdicts
+                .iter()
+                .all(|v| v.reason() != Some("front_dead")),
+            "no front_dead rows when a live front carried the node: {:?}",
+            outcome.verdicts
+        );
+        // The dead front itself still has its own real verdict.
+        assert_eq!(
+            outcome
+                .verdicts
+                .iter()
+                .filter(|v| v.job.proxy_name == "__FRONT1__")
+                .map(|v| v.reason())
+                .collect::<Vec<_>>(),
+            vec![Some("timeout")]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_with_every_front_dead_fails_front_dead_without_dialling() {
+        let tester = Arc::new(FakeTester::new(true).killing(&["__FRONT0__", "__FRONT1__"]));
+        let jobs = vec![
+            named_job("__FRONT0__", "fp-front-0", "9.9.9.9", Role::Front, None),
+            named_job("__FRONT1__", "fp-front-1", "8.8.8.8", Role::Front, None),
+            // Two variants of the same node, both fronts dead: one row.
+            named_job("n #0", "fp-node", "9.9.9.9", Role::Chain, Some("__FRONT0__")),
+            named_job("n #1", "fp-node", "8.8.8.8", Role::Chain, Some("__FRONT1__")),
+            // A variant with no front at all (the pool collapsed after
+            // expansion): the same treatment.
+            named_job("m", "fp-other", "9.9.9.9", Role::Chain, None),
+        ];
+        let ledger = FakeLedger::new();
+        let outcome = run_round_in_test(
+            plan(jobs),
+            loose(),
+            Arc::new(FakeKernel(KernelState::Reloaded)),
+            tester.clone(),
+            ledger.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.live_fronts, 0);
+        assert_eq!(tester.started(), 2, "only the two fronts were dialled");
+        assert_eq!(outcome.front_dead, 2, "one row per node, not per variant");
+        let dead_rows: Vec<_> = outcome
+            .verdicts
+            .iter()
+            .filter(|v| v.reason() == Some("front_dead"))
+            .collect();
+        assert_eq!(dead_rows.len(), 2);
+        for row in &dead_rows {
+            assert_eq!(row.attempts, 0, "front_dead is a no-dial verdict");
+        }
+        let row = dead_rows[0].to_result_row();
+        assert_eq!(row.reason.as_deref(), Some("front_dead"));
+        assert_eq!(row.detail.as_deref(), Some("前置全部不通，链式未测"));
+        assert_eq!(row.category.as_deref(), Some("chain"));
+        // The write carries the no-dial verdicts too: the streak advances
+        // through policy exactly as a dial failure would.
+        assert_eq!(outcome.results_written as i64, outcome.counts.total);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_round_without_chains_stays_single_pass() {
+        // Roles other than Chain never split the phase: fronts and direct
+        // nodes test together, as before R6.
+        let tester = Arc::new(FakeTester::new(true).killing(&["__FRONT1__"]));
+        let jobs = vec![
+            named_job("__FRONT0__", "fp-front-0", "9.9.9.9", Role::Front, None),
+            named_job("plain", "fp-plain", "1.1.1.1", Role::Direct, None),
+        ];
+        let outcome = run_round_in_test(
+            plan(jobs),
+            loose(),
+            Arc::new(FakeKernel(KernelState::Reloaded)),
+            tester,
+            FakeLedger::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.counts.total, 2);
+        assert_eq!(outcome.live_fronts, 1);
+        assert_eq!(outcome.front_dead, 0);
     }
 }

@@ -11,7 +11,7 @@ use serde_json::Value;
 use probe_config::SourceSpec;
 
 use crate::identity::fingerprint_proxy;
-use crate::prepare::RawEntry;
+use crate::prepare::{RawEntry, Role};
 
 pub const CAT_DIRECT: &str = "direct";
 pub const CAT_RELAY: &str = "relay";
@@ -81,6 +81,8 @@ pub fn collect_entries(sources: &[FetchedSource]) -> Vec<RawEntry> {
                 proxy: proxy.clone(),
                 fingerprint: fingerprint_proxy(proxy),
                 category: classify_category(proxy, source.relay).to_string(),
+                role: Role::default(),
+                front: None,
             });
             index += 1;
         }
