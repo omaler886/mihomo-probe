@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 /// A round row id, mirroring `rounds.id` in the Python SQLite schema.
 pub type RoundId = i64;
 
+pub mod policy;
+pub use policy::{
+    apply as apply_policy, round_is_suspect, NodeSnapshot, NodeUpdate, Observation, Policy,
+    Transition, STATUS_ALIVE, STATUS_DEAD, STATUS_EXCLUDED, STATUS_PENDING, STATUS_UNKNOWN,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoundStatus {

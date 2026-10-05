@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use crate::{utc_now, DomainResult};
 
-pub const LATEST_VERSION: i64 = 2;
+pub const LATEST_VERSION: i64 = 3;
 
 /// (version, name, sql). Versions are strictly increasing and append-only:
 /// an applied migration is never edited, corrections come as new files.
@@ -27,6 +27,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         2,
         "0002_probe_ledger",
         include_str!("../../../migrations/0002_probe_ledger.sql"),
+    ),
+    (
+        3,
+        "0003_r7_round_guard",
+        include_str!("../../../migrations/0003_r7_round_guard.sql"),
     ),
 ];
 
@@ -138,10 +143,14 @@ mod tests {
     fn apply_records_all_versions_and_is_idempotent() {
         let mut conn = Connection::open_in_memory().unwrap();
         let first = apply(&mut conn).unwrap();
-        assert_eq!(first, vec![1, 2]);
+        assert_eq!(
+            first,
+            (1..=LATEST_VERSION).collect::<Vec<_>>(),
+            "all versions applied, in order"
+        );
         let second = apply(&mut conn).unwrap();
         assert!(second.is_empty(), "re-open must not re-apply");
         let done = applied(&conn).unwrap();
-        assert_eq!(done.len(), 2);
+        assert_eq!(done.len(), LATEST_VERSION as usize);
     }
 }

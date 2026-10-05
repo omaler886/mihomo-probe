@@ -83,10 +83,22 @@ Go 方案的差异报告结构适用，字段按本仓库命名。Go 影子**只
 CI 需归档：JUnit XML、上述 JSON 汇总、覆盖率文件、Benchmark 基线、`-race` 结果、
 Golden Test 差异。Rust 侧落地方式（`cargo test --format json` / nextest JUnit 输出）在 R10 定。
 
+## 已知口径差异（双跑对账时按此折算）
+- R6（06）：轮行 `total` Python 按 (source, fp) 去重 vs Rust 按变体数；
+  `results` 行两侧都按变体写。
+- R7（03）：收敛折叠暂不更新 `nodes.proto` / `server` / `country` /
+  `ip_alive` / `ip_total` 展示列（等 R4 per-address 变体与 ipmap 切片落地），
+  死活状态机列（status/consec_fail/total_*/last_*）已对齐；折叠口径 =
+  `_score_bucket` 的 `domain_pass="any"`（任一变体活即活、活者最小延迟、
+  category 跟随通过变体），`domain_pass="all"` 到 R4 再接。
+- R7（ADR-0005）：`rounds.inconclusive` 列为 Rust 侧新增；Python 读方将其
+  当作「ok=0 的完成轮」——suspect 护栏因此保守触发，方向安全，无需改 Python。
+
 ## 待办清单
 - [x] R0：基线记录
 - [x] R0：P0 修复回归测试（14 例）
 - [x] R1：Rust 侧切片单测（config/storage/mihomo/api，见 TEST_REPORT_RUST.md）
+- [x] R7：收敛口径差异登记（本节，R6/R7 批次）
 - [ ] R2：fixtures 目录与首批共享夹具（G-01 ~ G-14）
 - [ ] R10：双跑差异报告 + 机器可读汇总
 

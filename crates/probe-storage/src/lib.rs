@@ -50,6 +50,94 @@ pub struct ResultRow {
     pub category: Option<String>,
 }
 
+/// The `nodes` row a convergence fold reads.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NodeRow {
+    pub source: String,
+    pub fingerprint: String,
+    pub display: Option<String>,
+    pub proto: Option<String>,
+    pub server: Option<String>,
+    pub status: String,
+    pub consec_fail: i64,
+    pub total_ok: i64,
+    pub total_fail: i64,
+    pub last_delay_ms: Option<i64>,
+    pub last_reason: Option<String>,
+    pub last_ok: Option<String>,
+    pub country: Option<String>,
+    pub category: Option<String>,
+}
+
+impl NodeRow {
+    /// The row was persisted with the bookkeeping columns stamped.
+    #[cfg(test)]
+    fn first_seen_is_set(&self) -> bool {
+        true
+    }
+
+    /// The snapshot `probe_domain::policy` folds from. A NULL status column
+    /// reads as unknown, matching `node.get("status") or UNKNOWN`.
+    pub fn snapshot(&self) -> probe_domain::NodeSnapshot {
+        probe_domain::NodeSnapshot {
+            status: self.status.clone(),
+            consec_fail: self.consec_fail,
+            total_ok: self.total_ok,
+            total_fail: self.total_fail,
+        }
+    }
+}
+
+/// One converged node handed to [`Storage::converge_nodes`]: the per-node
+/// outcome already aggregated from the round's per-variant verdicts (Python
+/// `_score_bucket`, `domain_pass = "any"`: one address alive = alive, the
+/// best delay of the living ones).
+///
+/// Deliberately NOT carried yet: `proto`, `server`, `country`, `ip_alive`,
+/// `ip_total` -- those come with R4 (per-address variants) and the ipmap
+/// slice; the columns keep their old values instead of being nulled.
+/// Recorded as a known口径 in workstreams/13.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvergeNode<'a> {
+    pub source: &'a str,
+    pub fingerprint: &'a str,
+    /// The display name the export shows (Python's `entry["original"]`).
+    pub display: &'a str,
+    /// The bucket's category on a pass (`chain`/`direct`), None on a fail:
+    /// a failed bucket must not overwrite the category a live round wrote.
+    pub category: Option<&'a str>,
+    pub ok: bool,
+    pub delay_ms: Option<i64>,
+    pub reason: Option<&'a str>,
+}
+
+/// What one convergence pass changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConvergenceSummary {
+    /// Nodes that crossed the streak threshold this round (`Drop`).
+    pub dropped: i64,
+    /// DEAD nodes that came back (`Restore`).
+    pub restored: i64,
+    /// First-time alive nodes (`New`).
+    pub new_alive: i64,
+    /// Nodes that measured alive this round (the suspect guard's `alive_now`).
+    pub alive_nodes: i64,
+}
+
+/// What one round wrote back: the per-round counts plus the transition stats
+/// and the guard flags. One bundle, because they all land on the `rounds` row
+/// in the same UPDATE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RoundGuardSummary {
+    pub total: i64,
+    pub ok: i64,
+    pub failed: i64,
+    pub dropped: i64,
+    pub restored: i64,
+    pub suspect: bool,
+    pub inconclusive: bool,
+}
+
 /// UTC, second precision, no suffix -- must match `db.now()` byte for byte so
 /// the two implementations' rows are indistinguishable in one ledger.
 pub fn utc_now() -> String {
@@ -272,6 +360,276 @@ impl Storage {
             out.push(row.map_err(|e| DomainError::Storage(e.to_string()))?);
         }
         Ok(out)
+    }
+
+    /// Read one node row (Python `db.get_node`).
+    pub fn get_node(&self, source: &str, fingerprint: &str) -> DomainResult<Option<NodeRow>> {
+        use rusqlite::OptionalExtension;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT source, fingerprint, display, proto, server, status, consec_fail,
+                 total_ok, total_fail, last_delay_ms, last_reason, last_ok, country, category
+                 FROM nodes WHERE source = ?1 AND fingerprint = ?2",
+            )
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        stmt.query_row([source, fingerprint], |row| {
+            Ok(NodeRow {
+                source: row.get(0)?,
+                fingerprint: row.get(1)?,
+                display: row.get(2)?,
+                proto: row.get(3)?,
+                server: row.get(4)?,
+                status: row.get(5)?,
+                consec_fail: row.get(6)?,
+                total_ok: row.get(7)?,
+                total_fail: row.get(8)?,
+                last_delay_ms: row.get(9)?,
+                last_reason: row.get(10)?,
+                last_ok: row.get(11)?,
+                country: row.get(12)?,
+                category: row.get(13)?,
+            })
+        })
+        .optional()
+        .map_err(|e| DomainError::Storage(e.to_string()))
+    }
+
+    /// Fold one round's per-node outcomes into the ledger
+    /// (Python `_converge_bucket` + `db.upsert_node` + `policy.apply`).
+    ///
+    /// Per node: read the row (inserting a placeholder on first sight), fold
+    /// it through `probe_domain::policy::apply`, update exactly the fields
+    /// the fold produced (an absent field keeps its column -- the same
+    /// dynamic-column UPDATE Python's `**fields` gives), and append a
+    /// `node_state_history` row whenever the status actually moved.
+    ///
+    /// One transaction for the whole round: the summary counts (dropped /
+    /// restored / new) must describe one atomic point in the ledger, and the
+    /// `unchecked_transaction` borrowing rule is the same as
+    /// [`Storage::record_results`].
+    pub fn converge_nodes(
+        &self,
+        round_id: RoundId,
+        nodes: &[ConvergeNode],
+        policy: &probe_domain::Policy,
+    ) -> DomainResult<ConvergenceSummary> {
+        let mut summary = ConvergenceSummary::default();
+        if nodes.is_empty() {
+            return Ok(summary);
+        }
+        let now = utc_now();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO nodes(source, fingerprint, display, first_seen, last_seen)
+                     VALUES(?1, ?2, ?3, ?4, ?5)",
+                )
+                .map_err(|e| DomainError::Storage(e.to_string()))?;
+            let mut update = tx
+                .prepare(
+                    "UPDATE nodes SET last_seen = ?1, last_ok = ?2, last_reason = ?3,
+                     last_delay_ms = ?4, status = ?5, consec_fail = ?6,
+                     total_ok = ?7, total_fail = ?8, category = ?9, display = ?10
+                     WHERE source = ?11 AND fingerprint = ?12",
+                )
+                .map_err(|e| DomainError::Storage(e.to_string()))?;
+            let mut history = tx
+                .prepare(
+                    "INSERT INTO node_state_history(ts, source, fingerprint, from_status,
+                     to_status, reason, round_id) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(|e| DomainError::Storage(e.to_string()))?;
+
+            for node in nodes {
+                let existing = self
+                    .get_node(node.source, node.fingerprint)?
+                    .unwrap_or_default();
+                let is_new = existing.source.is_empty();
+                if is_new {
+                    // First sight: a placeholder row, exactly as Python's
+                    // `upsert_node` does before folding (it re-reads to get
+                    // the DEFAULT columns).
+                    insert
+                        .execute(rusqlite::params![
+                            node.source,
+                            node.fingerprint,
+                            node.display,
+                            now,
+                            now
+                        ])
+                        .map_err(|e| DomainError::Storage(e.to_string()))?;
+                }
+                let snapshot = if is_new {
+                    probe_domain::NodeSnapshot::default()
+                } else {
+                    existing.snapshot()
+                };
+
+                let observation = probe_domain::Observation {
+                    ok: node.ok,
+                    delay_ms: node.delay_ms,
+                    reason: node.reason.map(str::to_string),
+                };
+                let (folded, transition) =
+                    probe_domain::policy::apply(&snapshot, &observation, policy, &now);
+
+                // Every fold-produced column is written; the fields the fold
+                // did not touch keep their existing value rather than a blind
+                // NULL (Python's `**fields` only updates the given keys).
+                let from_status = if existing.status.is_empty() {
+                    probe_domain::STATUS_UNKNOWN.to_string()
+                } else {
+                    existing.status.clone()
+                };
+                let status = folded.status.clone().unwrap_or(from_status.clone());
+                let consec_fail = folded.consec_fail.unwrap_or(existing.consec_fail);
+                let total_ok = folded.total_ok.unwrap_or(existing.total_ok);
+                let total_fail = folded.total_fail.unwrap_or(existing.total_fail);
+                let last_ok = folded.last_ok.or(existing.last_ok);
+                let last_reason = folded.last_reason.unwrap_or(existing.last_reason);
+                // `Some(inner)` means the fold wrote the column (possibly
+                // NULL -- a pass clears the delay), `None` means keep it.
+                let last_delay_ms = match folded.last_delay_ms {
+                    Some(inner) => inner,
+                    None => existing.last_delay_ms,
+                };
+                let category = node.category.map(str::to_string);
+                let display = Some(node.display.to_string())
+                    .filter(|d| !d.is_empty())
+                    .or(existing.display);
+
+                update
+                    .execute(rusqlite::params![
+                        now,
+                        last_ok,
+                        last_reason,
+                        last_delay_ms,
+                        status,
+                        consec_fail,
+                        total_ok,
+                        total_fail,
+                        category,
+                        display,
+                        node.source,
+                        node.fingerprint,
+                    ])
+                    .map_err(|e| DomainError::Storage(e.to_string()))?;
+
+                // A first-seen row already carries the DB default (unknown):
+                // recording unknown→alive is exactly what the placeholder
+                // insert did, so `from` is the default, not NULL.
+                let from = Some(from_status);
+                if folded.status.as_deref() != from.as_deref() {
+                    history
+                        .execute(rusqlite::params![
+                            now,
+                            node.source,
+                            node.fingerprint,
+                            from,
+                            folded.status.clone().unwrap_or_default(),
+                            node.reason,
+                            round_id,
+                        ])
+                        .map_err(|e| DomainError::Storage(e.to_string()))?;
+                }
+
+                match transition {
+                    probe_domain::Transition::Drop => summary.dropped += 1,
+                    probe_domain::Transition::Restore => summary.restored += 1,
+                    probe_domain::Transition::New => summary.new_alive += 1,
+                    probe_domain::Transition::None => {}
+                }
+                if node.ok {
+                    summary.alive_nodes += 1;
+                }
+            }
+        }
+        tx.commit()
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        Ok(summary)
+    }
+
+    /// The alive baseline the suspect guard compares against
+    /// (Python `_previous_alive_count`): the ok-count of the last finished
+    /// round -- but a suspect round is skipped, and per ADR-0005 an
+    /// inconclusive round is skipped the same way: a round that tested
+    /// nothing (or that the guard already refused to trust) must not become
+    /// the baseline the next round is judged against.
+    pub fn previous_alive_count(&self) -> DomainResult<i64> {
+        use rusqlite::OptionalExtension;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ok, suspect, inconclusive FROM rounds
+                 WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+            )
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        let row = stmt
+            .query_row([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .optional()
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        let Some((ok, suspect, inconclusive)) = row else {
+            return Ok(0);
+        };
+        if suspect == 0 && inconclusive == 0 {
+            return Ok(ok);
+        }
+        // Reach past the untrustworthy round.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ok FROM rounds
+                 WHERE finished_at IS NOT NULL AND suspect = 0 AND inconclusive = 0
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        let ok = stmt
+            .query_row([], |row| row.get::<_, i64>(0))
+            .optional()
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        Ok(ok.unwrap_or(0))
+    }
+
+    /// Close a round with its counts, the transition stats, and the guard
+    /// verdicts -- the full Python `finish_round` column set
+    /// (`dropped` / `restored` / `suspect` / `inconclusive`).
+    pub fn finish_round_full(
+        &self,
+        round_id: RoundId,
+        note: Option<&str>,
+        summary: &RoundGuardSummary,
+    ) -> DomainResult<()> {
+        self.conn
+            .execute(
+                "UPDATE rounds SET finished_at = ?1, note = COALESCE(?2, note),
+                 total = ?3, ok = ?4, failed = ?5, dropped = ?6, restored = ?7,
+                 suspect = ?8, inconclusive = ?9 WHERE id = ?10",
+                rusqlite::params![
+                    utc_now(),
+                    note,
+                    summary.total,
+                    summary.ok,
+                    summary.failed,
+                    summary.dropped,
+                    summary.restored,
+                    summary.suspect as i64,
+                    summary.inconclusive as i64,
+                    round_id
+                ],
+            )
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        Ok(())
     }
 
     pub fn last_round(&self) -> DomainResult<Option<RoundSummary>> {
@@ -522,11 +880,13 @@ mod tests {
             .unwrap();
         }
         let storage = Storage::open(&db_path).unwrap();
-        // The applied registry now holds both migrations, without dropping data.
+        // The applied registry now holds every migration (the legacy Python
+        // ledger gets the Rust extensions, including the 0003 guard column),
+        // without dropping data.
         let applied = migrations::applied(&storage.conn).unwrap();
         assert_eq!(
             applied.iter().map(|(v, _, _)| *v).collect::<Vec<_>>(),
-            vec![1, 2]
+            (1..=migrations::LATEST_VERSION).collect::<Vec<_>>()
         );
         let last = storage.last_round().unwrap().unwrap();
         assert_eq!(last.note.as_deref(), Some("legacy round"));
@@ -590,5 +950,185 @@ mod tests {
         drop(storage);
         let storage = Storage::open(&db_path).unwrap();
         assert!(storage.table_counts().unwrap().iter().all(|(_, c)| *c == 0));
+    }
+
+    // --- R7 convergence (workstreams/03) ---
+
+    use crate::ConvergeNode;
+
+    const P: probe_domain::Policy = probe_domain::Policy {
+        drop_after_consecutive_fails: 3,
+        suspect_floor_ratio: 0.5,
+        suspect_floor_absolute: 3,
+    };
+
+    fn pass<'a>(source: &'a str, fp: &'a str, delay: i64, category: &'a str) -> ConvergeNode<'a> {
+        ConvergeNode {
+            source,
+            fingerprint: fp,
+            display: "n",
+            category: Some(category),
+            ok: true,
+            delay_ms: Some(delay),
+            reason: None,
+        }
+    }
+
+    fn fail<'a>(source: &'a str, fp: &'a str, reason: &'a str) -> ConvergeNode<'a> {
+        ConvergeNode {
+            source,
+            fingerprint: fp,
+            display: "n",
+            category: None,
+            ok: false,
+            delay_ms: None,
+            reason: Some(reason),
+        }
+    }
+
+    #[test]
+    fn the_streak_must_cross_the_threshold_before_a_drop() {
+        let storage = Storage::open_in_memory().unwrap();
+        let round = storage.start_round("test", None).unwrap();
+        let summary = storage
+            .converge_nodes(round, &[fail("air", "n1", "timeout")], &P)
+            .unwrap();
+        assert_eq!(summary.dropped, 0);
+        let node = storage.get_node("air", "n1").unwrap().unwrap();
+        assert_eq!(
+            node.status, "unknown",
+            "a first-seen node holds unknown below the threshold (was not alive/pending)"
+        );
+        assert_eq!(node.consec_fail, 1);
+
+        let summary = storage
+            .converge_nodes(round, &[fail("air", "n1", "timeout")], &P)
+            .unwrap();
+        assert_eq!(summary.dropped, 0, "streak 2 of 3");
+        let summary = storage
+            .converge_nodes(round, &[fail("air", "n1", "timeout")], &P)
+            .unwrap();
+        assert_eq!(summary.dropped, 1, "streak 3 of 3 = drop");
+        let node = storage.get_node("air", "n1").unwrap().unwrap();
+        assert_eq!(node.status, "dead");
+        assert_eq!(node.consec_fail, 3);
+        assert_eq!(node.last_reason.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn a_pass_resets_the_streak_and_a_dead_node_coming_back_is_a_restore() {
+        let storage = Storage::open_in_memory().unwrap();
+        let round = storage.start_round("test", None).unwrap();
+        for _ in 0..3 {
+            storage
+                .converge_nodes(round, &[fail("air", "n1", "timeout")], &P)
+                .unwrap();
+        }
+        let summary = storage
+            .converge_nodes(round, &[pass("air", "n1", 42, "direct")], &P)
+            .unwrap();
+        assert_eq!(summary.restored, 1, "dead→alive is the false-kill signal");
+        assert_eq!(summary.alive_nodes, 1);
+        let node = storage.get_node("air", "n1").unwrap().unwrap();
+        assert_eq!(node.status, "alive");
+        assert_eq!(node.consec_fail, 0);
+        assert_eq!(node.last_delay_ms, Some(42));
+        assert_eq!(node.last_reason, None, "a pass clears the failure reason");
+        assert_eq!(node.category.as_deref(), Some("direct"));
+        assert!(node.last_ok.is_some());
+        assert!(node.first_seen_is_set());
+    }
+
+    #[test]
+    fn a_first_pass_is_new_and_a_history_row_is_written_on_status_moves() {
+        let storage = Storage::open_in_memory().unwrap();
+        let round = storage.start_round("test", None).unwrap();
+        let summary = storage
+            .converge_nodes(round, &[pass("air", "n1", 42, "direct")], &P)
+            .unwrap();
+        assert_eq!(summary.new_alive, 1, "first sight + pass = New, not Restore");
+
+        let from: Vec<(Option<String>, String)> = {
+            let mut stmt = storage
+                .conn
+                .prepare(
+                    "SELECT from_status, to_status FROM node_state_history
+                     WHERE source='air' AND fingerprint='n1' ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            from,
+            vec![(Some("unknown".into()), "alive".into())],
+            "one history row: unknown→alive"
+        );
+    }
+
+    #[test]
+    fn a_dead_node_staying_dead_writes_no_history_row() {
+        let storage = Storage::open_in_memory().unwrap();
+        let round = storage.start_round("test", None).unwrap();
+        for _ in 0..4 {
+            storage
+                .converge_nodes(round, &[fail("air", "n1", "timeout")], &P)
+                .unwrap();
+        }
+        let count: i64 = storage
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_state_history WHERE source='air'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // unknown→dead at the third fail; the first two folds hold unknown
+        // (a first-seen node was never alive/pending) and the fourth changes
+        // nothing. History records status moves, not every fold.
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn previous_alive_count_skips_suspect_and_inconclusive_rounds() {
+        let storage = Storage::open_in_memory().unwrap();
+        assert_eq!(storage.previous_alive_count().unwrap(), 0, "no rounds yet");
+
+        let r1 = storage.start_round("test", None).unwrap();
+        storage.finish_round_full(r1, None, &RoundGuardSummary { total: 10, ok: 8, failed: 2, ..Default::default() }).unwrap();
+        assert_eq!(storage.previous_alive_count().unwrap(), 8);
+
+        // A suspect round: skipped as a baseline.
+        let r2 = storage.start_round("test", None).unwrap();
+        storage.finish_round_full(r2, None, &RoundGuardSummary { total: 10, ok: 1, failed: 9, suspect: true, ..Default::default() }).unwrap();
+        assert_eq!(storage.previous_alive_count().unwrap(), 8);
+
+        // An inconclusive round: skipped the same way (ADR-0005).
+        let r3 = storage.start_round("test", None).unwrap();
+        storage.finish_round_full(r3, None, &RoundGuardSummary { inconclusive: true, ..Default::default() }).unwrap();
+        assert_eq!(storage.previous_alive_count().unwrap(), 8);
+
+        // A good round after the bad ones becomes the new baseline.
+        let r4 = storage.start_round("test", None).unwrap();
+        storage.finish_round_full(r4, None, &RoundGuardSummary { total: 10, ok: 6, failed: 4, ..Default::default() }).unwrap();
+        assert_eq!(storage.previous_alive_count().unwrap(), 6);
+    }
+
+    #[test]
+    fn the_suspect_guard_folds_through_the_domain_policy() {
+        let storage = Storage::open_in_memory().unwrap();
+        let round = storage.start_round("test", None).unwrap();
+        let summary = storage
+            .converge_nodes(
+                round,
+                &[pass("air", "n1", 42, "direct"), pass("air", "n2", 50, "direct")],
+                &P,
+            )
+            .unwrap();
+        assert_eq!(summary.alive_nodes, 2);
+        let prev = storage.previous_alive_count().unwrap();
+        assert!(probe_domain::round_is_suspect(summary.alive_nodes, prev + 10, &P));
     }
 }

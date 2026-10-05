@@ -30,7 +30,7 @@
 //! leave the ledger broken" are separate rules, and conflating them is how a
 //! cancel turns into an orphan row that the next start-up has to reap.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -174,8 +174,27 @@ pub trait Ledger: Send + Sync {
     /// Write one round's results. Called at most once per round, and never
     /// after a cancellation.
     fn record_verdicts(&self, round_id: RoundId, verdicts: &[NodeVerdict]) -> DomainResult<usize>;
+    /// Fold the round's aggregated per-node outcomes into the nodes table
+    /// (R7 convergence: streaks, transitions, history). An empty slice is a
+    /// no-op returning the zero summary.
+    fn converge(
+        &self,
+        round_id: RoundId,
+        nodes: &[probe_storage::ConvergeNode],
+        policy: &probe_domain::Policy,
+    ) -> DomainResult<probe_storage::ConvergenceSummary>;
+    /// The alive baseline for the suspect guard (last finished round's ok
+    /// count, skipping suspect and inconclusive rounds).
+    fn previous_alive_count(&self) -> DomainResult<i64>;
     /// Close the round. Called on every path, including cancellation.
-    fn finish_round(&self, round_id: RoundId, note: &str, counts: RoundCounts) -> DomainResult<()>;
+    fn finish_round(
+        &self,
+        round_id: RoundId,
+        note: &str,
+        counts: RoundCounts,
+        suspect: bool,
+        inconclusive: bool,
+    ) -> DomainResult<()>;
 }
 
 /// What the kernel was able to do before the node phase.
@@ -320,6 +339,32 @@ pub struct RoundCounts {
     pub total: i64,
     pub ok: i64,
     pub failed: i64,
+    /// Nodes the convergence pass demoted to dead this round.
+    pub dropped: i64,
+    /// Dead nodes that came back this round (`Restore`).
+    pub restored: i64,
+}
+
+/// The round guard's verdict (workstreams/03, `GuardDecision`). One value per
+/// round, decided before anything is written:
+///
+/// * [`GuardDecision::ApplyConvergence`] -- the round ran on a healthy kernel
+///   and stayed above the alive floor: fold every verdict into the nodes
+///   table and publish as usual.
+/// * [`GuardDecision::PreservePreviousState`] -- the round ran but its alive
+///   count fell below the floor (`round_is_suspect`). The convergence STILL
+///   lands in the ledger -- the streaks are facts -- but the round is marked
+///   `suspect` and the previous round's publication is preserved (the
+///   publish half of that is R8; the marker and the skipped baseline are R7).
+/// * [`GuardDecision::MarkRoundInconclusive`] -- the kernel was unreachable
+///   or there was no config to load. Nothing is tested, nothing converges,
+///   no streak moves, and the round row carries `inconclusive = 1` so the
+///   alive-baseline reader (`previous_alive_count`) skips it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardDecision {
+    ApplyConvergence,
+    PreservePreviousState,
+    MarkRoundInconclusive,
 }
 
 /// What to run this round.
@@ -328,6 +373,9 @@ pub struct RoundPlan {
     pub trigger: String,
     pub mode: Option<String>,
     pub jobs: Vec<Job>,
+    /// Convergence thresholds and the guard floor. The runner folds every
+    /// verdict under this policy; nothing reads a hard-coded value.
+    pub policy: probe_domain::Policy,
 }
 
 /// What happened.
@@ -347,6 +395,14 @@ pub struct RoundOutcome {
     /// Chain nodes failed `front_dead` without dialling (deduplicated by
     /// ledger identity).
     pub front_dead: usize,
+    /// The guard's verdict for this round.
+    pub guard: GuardDecision,
+    /// True when the alive count fell below the floor: the convergence still
+    /// landed, but the publication is preserved (R8 reads this flag).
+    pub suspect: bool,
+    /// Convergence transition stats, from the fold.
+    pub dropped_nodes: i64,
+    pub restored_nodes: i64,
 }
 
 /// Run one round with a fresh gate.
@@ -392,12 +448,15 @@ pub async fn run_round_with_ctx(
 
     let kernel_state = kernel.prepare().await;
 
-    let verdicts = match kernel_state {
-        // A test through a kernel that is not there measures nothing. Skipping
-        // the phase is the same rule as the round guard in workstreams/03:
-        // infrastructure failure must not be recorded as node failure.
-        KernelState::Unreachable(_) | KernelState::NotPrepared(_) => Vec::new(),
-        KernelState::Reloaded | KernelState::Refused => run_phases(&plan.jobs, &ctx, &tester).await,
+    // Guard rule #1/#2 (workstreams/03): a kernel that is not there -- or a
+    // round with no config to load -- measures nothing and must not be
+    // recorded as mass node failure. The round is marked inconclusive
+    // instead (ADR-0005).
+    let (verdicts, inconclusive) = match kernel_state {
+        KernelState::Unreachable(_) | KernelState::NotPrepared(_) => (Vec::new(), true),
+        KernelState::Reloaded | KernelState::Refused => {
+            (run_phases(&plan.jobs, &ctx, &tester).await, false)
+        }
     };
 
     // Python `_test_phases`' two outputs, recomputed from the verdicts: the
@@ -420,6 +479,46 @@ pub async fn run_round_with_ctx(
         total: verdicts.len() as i64,
         ok: ok as i64,
         failed: (verdicts.len() - ok) as i64,
+        dropped: 0,
+        restored: 0,
+    };
+
+    // R7 convergence: fold the round's verdicts into the nodes table -- the
+    // streaks are facts about the nodes, not about the publication. A
+    // cancelled round folds nothing (its verdicts were dropped by the
+    // workers' own checks), and an inconclusive round has no verdicts at all.
+    let (convergence, suspect, guard) = if ctx.check().is_ok() && !inconclusive {
+        let folded = fold_verdicts(&verdicts);
+        let borrowed: Vec<probe_storage::ConvergeNode> = folded
+            .iter()
+            .map(|node| probe_storage::ConvergeNode {
+                source: &node.source,
+                fingerprint: &node.fingerprint,
+                display: &node.display,
+                category: node.category.as_deref(),
+                ok: node.ok,
+                delay_ms: node.delay_ms,
+                reason: node.reason.as_deref(),
+            })
+            .collect();
+        let summary = ledger.converge(round_id, &borrowed, &plan.policy)?;
+        let alive_prev = ledger.previous_alive_count()?;
+        if probe_domain::round_is_suspect(summary.alive_nodes, alive_prev, &plan.policy) {
+            (summary, true, GuardDecision::PreservePreviousState)
+        } else {
+            (summary, false, GuardDecision::ApplyConvergence)
+        }
+    } else {
+        (
+            probe_storage::ConvergenceSummary::default(),
+            false,
+            GuardDecision::MarkRoundInconclusive,
+        )
+    };
+    let counts = RoundCounts {
+        dropped: convergence.dropped,
+        restored: convergence.restored,
+        ..counts
     };
 
     // The single guard for "a cancelled round writes no results". It reads the
@@ -442,9 +541,16 @@ pub async fn run_round_with_ctx(
     };
 
     let cancelled = ctx.is_cancelled();
-    let note = compose_note(&kernel_state, counts, cancelled, planned);
+    let mut note = compose_note(&kernel_state, counts, cancelled, planned);
+    if suspect {
+        // Python: "alive X < floor from previous Y; not published".
+        note.push_str(&format!(
+            "; suspect: alive {} below floor from previous {}; publish preserved",
+            convergence.alive_nodes, plan.policy.suspect_floor_absolute
+        ));
+    }
     // Unconditional, cancellation included: see the module docs.
-    ledger.finish_round(round_id, &note, counts)?;
+    ledger.finish_round(round_id, &note, counts, suspect, inconclusive)?;
     // The row is closed; now the earlier failure, if any, is safe to report.
     if let Some(err) = write_error {
         return Err(err);
@@ -460,7 +566,102 @@ pub async fn run_round_with_ctx(
         verdicts,
         live_fronts,
         front_dead,
+        guard,
+        suspect,
+        dropped_nodes: convergence.dropped,
+        restored_nodes: convergence.restored,
     })
+}
+
+/// Reduce the round's per-variant verdicts to one outcome per node
+/// (Python `_score_bucket`, `domain_pass = "any"`): a node is alive when any
+/// of its variants answered, the recorded delay is the best of the living,
+/// and a dead node reports the first failing variant's reason. The category
+/// follows the measurement -- the variant that actually passed -- so a chain
+/// whose chain variant failed but whose direct twin passed is folded as a
+/// direct pass, never as a chain the round just disproved.
+fn fold_verdicts(verdicts: &[NodeVerdict]) -> Vec<FoldedNode> {
+    struct Fold {
+        display: String,
+        ok: bool,
+        delay: Option<i64>,
+        reason: Option<String>,
+        category: Option<String>,
+    }
+
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut folds: HashMap<(String, String), Fold> = HashMap::new();
+    for verdict in verdicts {
+        let key = (
+            verdict.job.source_id.clone(),
+            verdict.job.fingerprint.clone(),
+        );
+        let delay = match &verdict.verdict {
+            Verdict::Alive { delay_ms } => Some(i64::from(*delay_ms)),
+            Verdict::Dead { .. } => None,
+        };
+        match folds.get_mut(&key) {
+            Some(fold) => {
+                if let Some(d) = delay {
+                    fold.ok = true;
+                    fold.delay = Some(fold.delay.map_or(d, |best| best.min(d)));
+                    fold.reason = None;
+                    fold.category = Some(verdict.job.variant.clone());
+                } else if !fold.ok && fold.reason.is_none() {
+                    fold.reason = verdict.reason().map(str::to_string);
+                }
+            }
+            None => {
+                order.push(key.clone());
+                let alive = delay.is_some();
+                folds.insert(
+                    key,
+                    Fold {
+                        display: verdict.job.proxy_name.clone(),
+                        ok: alive,
+                        delay,
+                        reason: if alive {
+                            None
+                        } else {
+                            verdict.reason().map(str::to_string)
+                        },
+                        category: if alive {
+                            Some(verdict.job.variant.clone())
+                        } else {
+                            None
+                        },
+                    },
+                );
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|key| {
+            let fold = folds.remove(&key).expect("fold tracked in order");
+            FoldedNode {
+                source: key.0,
+                fingerprint: key.1,
+                display: fold.display,
+                category: fold.category,
+                ok: fold.ok,
+                delay_ms: fold.delay,
+                reason: fold.reason,
+            }
+        })
+        .collect()
+}
+
+/// The owned per-node aggregation `fold_verdicts` produces; the ledger borrows
+/// it as [`probe_storage::ConvergeNode`] for the duration of the fold.
+struct FoldedNode {
+    source: String,
+    fingerprint: String,
+    display: String,
+    category: Option<String>,
+    ok: bool,
+    delay_ms: Option<i64>,
+    reason: Option<String>,
 }
 
 /// The failure class Python records for a chain whose every front was dead:
@@ -632,10 +833,46 @@ impl Ledger for Mutex<Storage> {
             .record_results(round_id, &rows)
     }
 
-    fn finish_round(&self, round_id: RoundId, note: &str, counts: RoundCounts) -> DomainResult<()> {
+    fn converge(
+        &self,
+        round_id: RoundId,
+        nodes: &[probe_storage::ConvergeNode],
+        policy: &probe_domain::Policy,
+    ) -> DomainResult<probe_storage::ConvergenceSummary> {
         self.lock()
             .map_err(|_| DomainError::Storage("ledger lock poisoned".into()))?
-            .finish_round_with_counts(round_id, Some(note), counts.total, counts.ok, counts.failed)
+            .converge_nodes(round_id, nodes, policy)
+    }
+
+    fn previous_alive_count(&self) -> DomainResult<i64> {
+        self.lock()
+            .map_err(|_| DomainError::Storage("ledger lock poisoned".into()))?
+            .previous_alive_count()
+    }
+
+    fn finish_round(
+        &self,
+        round_id: RoundId,
+        note: &str,
+        counts: RoundCounts,
+        suspect: bool,
+        inconclusive: bool,
+    ) -> DomainResult<()> {
+        self.lock()
+            .map_err(|_| DomainError::Storage("ledger lock poisoned".into()))?
+            .finish_round_full(
+                round_id,
+                Some(note),
+                &probe_storage::RoundGuardSummary {
+                    total: counts.total,
+                    ok: counts.ok,
+                    failed: counts.failed,
+                    dropped: counts.dropped,
+                    restored: counts.restored,
+                    suspect,
+                    inconclusive,
+                },
+            )
     }
 }
 
@@ -754,7 +991,8 @@ mod tests {
     struct Recorded {
         started: Vec<(String, Option<String>)>,
         results: Vec<(RoundId, Vec<NodeVerdict>)>,
-        finished: Vec<(RoundId, String, RoundCounts)>,
+        finished: Vec<(RoundId, String, RoundCounts, bool, bool)>,
+        converged: Vec<(RoundId, usize)>,
     }
 
     struct FakeLedger {
@@ -763,6 +1001,8 @@ mod tests {
         fail_record: bool,
         /// Make `finish_round` fail, to prove the failure is reported.
         fail_finish: bool,
+        /// What `previous_alive_count` reports: the suspect guard's baseline.
+        baseline: Mutex<i64>,
     }
 
     impl FakeLedger {
@@ -771,6 +1011,17 @@ mod tests {
                 recorded: Mutex::new(Recorded::default()),
                 fail_record: false,
                 fail_finish: false,
+                baseline: Mutex::new(0),
+            })
+        }
+
+        /// A fake with a nonzero alive baseline: the suspect guard bites.
+        fn with_baseline(baseline: i64) -> Arc<Self> {
+            Arc::new(Self {
+                recorded: Mutex::new(Recorded::default()),
+                fail_record: false,
+                fail_finish: false,
+                baseline: Mutex::new(baseline),
             })
         }
 
@@ -779,6 +1030,7 @@ mod tests {
                 recorded: Mutex::new(Recorded::default()),
                 fail_record: true,
                 fail_finish: false,
+                baseline: Mutex::new(0),
             })
         }
 
@@ -787,6 +1039,7 @@ mod tests {
                 recorded: Mutex::new(Recorded::default()),
                 fail_record: false,
                 fail_finish: true,
+                baseline: Mutex::new(0),
             })
         }
     }
@@ -815,11 +1068,33 @@ mod tests {
             Ok(verdicts.len())
         }
 
+        fn converge(
+            &self,
+            round_id: RoundId,
+            nodes: &[probe_storage::ConvergeNode],
+            _policy: &probe_domain::Policy,
+        ) -> DomainResult<probe_storage::ConvergenceSummary> {
+            // The fake folds nothing; it records that the runner asked, with
+            // how many nodes, so the guard tests can assert on the handoff.
+            self.recorded
+                .lock()
+                .unwrap()
+                .converged
+                .push((round_id, nodes.len()));
+            Ok(probe_storage::ConvergenceSummary::default())
+        }
+
+        fn previous_alive_count(&self) -> DomainResult<i64> {
+            Ok(*self.baseline.lock().unwrap())
+        }
+
         fn finish_round(
             &self,
             round_id: RoundId,
             note: &str,
             counts: RoundCounts,
+            suspect: bool,
+            inconclusive: bool,
         ) -> DomainResult<()> {
             if self.fail_finish {
                 return Err(DomainError::Storage("rounds table is locked".into()));
@@ -828,7 +1103,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .finished
-                .push((round_id, note.to_string(), counts));
+                .push((round_id, note.to_string(), counts, suspect, inconclusive));
             Ok(())
         }
     }
@@ -856,6 +1131,7 @@ mod tests {
             trigger: "test".into(),
             mode: None,
             jobs,
+            policy: probe_domain::Policy::default(),
         }
     }
 
@@ -920,7 +1196,9 @@ mod tests {
             RoundCounts {
                 total: 2,
                 ok: 2,
-                failed: 0
+                failed: 0,
+                dropped: 0,
+                restored: 0
             }
         );
         assert_eq!(outcome.results_written, 2);
@@ -955,7 +1233,9 @@ mod tests {
             RoundCounts {
                 total: 1,
                 ok: 0,
-                failed: 1
+                failed: 1,
+                dropped: 0,
+                restored: 0
             }
         );
         assert_eq!(outcome.verdicts[0].reason(), Some("timeout"));
@@ -1341,5 +1621,133 @@ mod tests {
         assert_eq!(outcome.counts.total, 2);
         assert_eq!(outcome.live_fronts, 1);
         assert_eq!(outcome.front_dead, 0);
+    }
+
+    // --- R7 guard + convergence (workstreams/03) ---
+
+    #[test]
+    fn folding_merges_variants_of_one_node_any_alive_wins() {
+        let alive0 = NodeVerdict::alive(
+            Job::new("air", "fp", "n #0", "chain", "9.9.9.9").with_role(Role::Chain, Some("__FRONT0__".into())),
+            80,
+        );
+        let alive1 = NodeVerdict::alive(
+            Job::new("air", "fp", "n #1", "chain", "8.8.8.8").with_role(Role::Chain, Some("__FRONT1__".into())),
+            60,
+        );
+        let other = NodeVerdict::dead(
+            Job::new("air", "other", "m", "direct", "1.1.1.1"),
+            "timeout",
+            "Timeout",
+        );
+        let folded = fold_verdicts(&[alive0, alive1, other]);
+        assert_eq!(folded.len(), 2, "two nodes, not three verdicts");
+
+        let node = &folded[0];
+        assert_eq!(node.source, "air");
+        assert_eq!(node.fingerprint, "fp");
+        assert!(node.ok, "one front carrying traffic is enough");
+        assert_eq!(node.delay_ms, Some(60), "the best of the living delays");
+        assert_eq!(node.reason, None);
+        assert_eq!(node.category.as_deref(), Some("chain"));
+
+        let dead = &folded[1];
+        assert!(!dead.ok);
+        assert_eq!(dead.reason.as_deref(), Some("timeout"));
+        assert_eq!(dead.category, None, "a failed bucket keeps no category");
+    }
+
+    #[test]
+    fn a_dead_twin_does_not_rescue_a_dead_node_but_carries_its_reason() {
+        // Chain variant and direct twin of the SAME node, both dead with
+        // different reasons: first failure wins, node folds once.
+        let chain = NodeVerdict::dead(
+            Job::new("air", "fp", "n #0", "chain", "9.9.9.9").with_role(Role::Chain, Some("__FRONT0__".into())),
+            "front_dead",
+            "front",
+        );
+        let twin = NodeVerdict::dead(
+            Job::new("air", "fp", "n #d", "direct", "1.2.3.4"),
+            "tls_error",
+            "tls",
+        );
+        let folded = fold_verdicts(&[chain, twin]);
+        assert_eq!(folded.len(), 1);
+        assert!(!folded[0].ok);
+        assert_eq!(folded[0].reason.as_deref(), Some("front_dead"), "first failure recorded");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_healthy_round_converges_and_is_not_suspect() {
+        let ledger = FakeLedger::new();
+        let round_id = ledger.start_round("test", None).unwrap();
+        let outcome = run_round(
+            round_id,
+            plan(vec![job("air", "10.0.0.1")]),
+            loose(),
+            Arc::new(FakeKernel(KernelState::Reloaded)),
+            Arc::new(FakeTester::new(true)),
+            ledger.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.guard, GuardDecision::ApplyConvergence);
+        assert!(!outcome.suspect);
+        assert_eq!(
+            ledger.recorded.lock().unwrap().converged,
+            vec![(outcome.round_id, 1)],
+            "the runner handed the fold exactly one node"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_round_below_the_alive_floor_is_marked_suspect() {
+        // baseline 10, and the fake converge reports no alive nodes: 0 < the
+        // absolute floor of 3 → suspect, publish preserved.
+        let ledger = FakeLedger::with_baseline(10);
+        let round_id = ledger.start_round("test", None).unwrap();
+        let outcome = run_round(
+            round_id,
+            plan(vec![job("air", "10.0.0.1")]),
+            loose(),
+            Arc::new(FakeKernel(KernelState::Reloaded)),
+            Arc::new(FakeTester::new(false)),
+            ledger.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.guard, GuardDecision::PreservePreviousState);
+        assert!(outcome.suspect);
+        let rec = ledger.recorded.lock().unwrap();
+        let (_, note, _, suspect, inconclusive) = &rec.finished[0];
+        assert!(*suspect, "the rounds row must carry the suspect flag");
+        assert!(!*inconclusive);
+        assert!(note.contains("suspect: alive"), "note: {note}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unreachable_kernel_marks_the_round_inconclusive() {
+        let ledger = FakeLedger::with_baseline(10);
+        let round_id = ledger.start_round("test", None).unwrap();
+        let outcome = run_round(
+            round_id,
+            plan(vec![job("air", "10.0.0.1")]),
+            loose(),
+            Arc::new(FakeKernel(KernelState::Unreachable("refused".into()))),
+            Arc::new(FakeTester::new(true)),
+            ledger.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.guard, GuardDecision::MarkRoundInconclusive);
+        assert!(!outcome.suspect, "an untested round is not a dead round");
+        let rec = ledger.recorded.lock().unwrap();
+        assert!(rec.converged.is_empty(), "nothing folds on an inconclusive round");
+        let (_, _, _, suspect, inconclusive) = &rec.finished[0];
+        assert!(*inconclusive, "the rounds row carries the ADR-0005 flag");
+        assert!(!*suspect);
     }
 }

@@ -391,6 +391,8 @@ pub struct Config {
     pub chain: ChainSection,
     /// `publish.prefix`: the manual-front subscription is named from it.
     pub publish_prefix: String,
+    /// The `policy` section: convergence thresholds and the round guard.
+    pub policy: PolicySection,
 }
 
 impl Config {
@@ -428,6 +430,7 @@ impl Config {
                 .filter(|p| !p.trim().is_empty())
                 .unwrap_or(DEFAULT_PUBLISH_PREFIX)
                 .to_string(),
+            policy: PolicySection::from_value(cfg.get("policy").unwrap_or(&Value::Null)),
         })
     }
 
@@ -672,6 +675,75 @@ impl ChainSection {
     }
 }
 
+/// The `policy` section: convergence thresholds and the round guard, port of
+/// `config.DEFAULTS["policy"]`. Feeds `probe_domain::policy` (workstreams/03);
+/// 0.5 / 3 / 3 are experience values pending a re-check against real round
+/// history before the Rust path takes traffic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolicySection {
+    /// `drop_after_consecutive_fails`: rounds of consecutive failure before a
+    /// node is judged dead.
+    pub drop_after_consecutive_fails: i64,
+    /// `suspect_floor_ratio`: alive_now below `alive_prev * ratio` is suspect.
+    pub suspect_floor_ratio: f64,
+    /// `suspect_floor_absolute`: never trust a floor smaller than this.
+    pub suspect_floor_absolute: i64,
+}
+
+impl Default for PolicySection {
+    fn default() -> Self {
+        Self {
+            drop_after_consecutive_fails: 3,
+            suspect_floor_ratio: 0.5,
+            suspect_floor_absolute: 3,
+        }
+    }
+}
+
+impl From<PolicySection> for probe_domain::Policy {
+    fn from(section: PolicySection) -> Self {
+        Self {
+            drop_after_consecutive_fails: section.drop_after_consecutive_fails,
+            suspect_floor_ratio: section.suspect_floor_ratio,
+            suspect_floor_absolute: section.suspect_floor_absolute,
+        }
+    }
+}
+
+impl PolicySection {
+    fn from_value(value: &Value) -> Self {
+        // Python: `int(policy.get("drop_after_consecutive_fails", 3))` and
+        // `float(policy.get("suspect_floor_ratio", 0.5))` -- a malformed value
+        // raises and the round dies, but a *missing* key takes the default.
+        // JSON values that do not convert read as the default here (config
+        // repair over config death, the same rule `normalize_chain` follows).
+        let get_i64 = |key: &str, fallback: i64| -> i64 {
+            value
+                .get(key)
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_f64().map(|f| f as i64))
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                })
+                .unwrap_or(fallback)
+        };
+        let get_f64 = |key: &str, fallback: f64| -> f64 {
+            value
+                .get(key)
+                .and_then(|v| {
+                    v.as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                })
+                .unwrap_or(fallback)
+        };
+        Self {
+            drop_after_consecutive_fails: get_i64("drop_after_consecutive_fails", 3),
+            suspect_floor_ratio: get_f64("suspect_floor_ratio", 0.5),
+            suspect_floor_absolute: get_i64("suspect_floor_absolute", 3),
+        }
+    }
+}
+
 pub fn default_tree() -> Value {
     serde_json::json!({
         "core": {
@@ -725,6 +797,12 @@ pub fn default_tree() -> Value {
         // defaults stay Python-side until R8.
         "publish": {
             "prefix": DEFAULT_PUBLISH_PREFIX,
+        },
+        // Mirrors config.DEFAULTS["policy"].
+        "policy": {
+            "drop_after_consecutive_fails": 3,
+            "suspect_floor_ratio": 0.5,
+            "suspect_floor_absolute": 3,
         },
     })
 }
@@ -1087,6 +1165,40 @@ mod tests {
             "mx-front-manual"
         );
         assert!(cfg.chain.is_configured());
+    }
+
+    #[test]
+    fn the_policy_section_defaults_and_repairs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&tmp.path().join("absent.json")).unwrap();
+        assert_eq!(cfg.policy, PolicySection::default());
+        assert_eq!(cfg.policy.drop_after_consecutive_fails, 3);
+        assert_eq!(cfg.policy.suspect_floor_ratio, 0.5);
+        assert_eq!(cfg.policy.suspect_floor_absolute, 3);
+
+        let path = tmp.path().join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "policy": {"drop_after_consecutive_fails": 5,
+                           "suspect_floor_ratio": "0.4",
+                           "suspect_floor_absolute": 2.9}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.policy.drop_after_consecutive_fails, 5);
+        assert_eq!(cfg.policy.suspect_floor_ratio, 0.4, "a numeric string parses");
+        assert_eq!(cfg.policy.suspect_floor_absolute, 2, "a float truncates");
+    }
+
+    #[test]
+    fn the_policy_section_converts_into_the_domain_policy() {
+        let policy = probe_domain::Policy::from(PolicySection::default());
+        assert_eq!(policy.drop_after_consecutive_fails, 3);
+        assert!(!probe_domain::round_is_suspect(5, 0, &policy));
+        assert!(probe_domain::round_is_suspect(1, 10, &policy));
     }
 
     #[test]

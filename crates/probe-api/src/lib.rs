@@ -46,6 +46,8 @@ pub struct AppState {
     pub chain: probe_config::ChainSection,
     /// `publish.prefix`, from which the manual-front sub is named.
     pub publish_prefix: String,
+    /// The `policy` section snapshot: convergence thresholds and the guard.
+    pub policy: probe_config::PolicySection,
     /// Process memory of what the manual-front sub was last written from.
     pub manual: probe_engine::collect::ManualFrontCache,
     in_flight: Arc<AtomicBool>,
@@ -71,6 +73,7 @@ impl AppState {
             substore: serve.substore,
             chain: serve.chain,
             publish_prefix: serve.publish_prefix,
+            policy: serve.policy,
             manual: probe_engine::collect::ManualFrontCache::default(),
             in_flight: Arc::new(AtomicBool::new(false)),
         }
@@ -100,6 +103,8 @@ pub struct ServeConfig {
     pub chain: probe_config::ChainSection,
     /// `publish.prefix`, from which the manual-front sub is named.
     pub publish_prefix: String,
+    /// The `policy` section snapshot: convergence thresholds and the guard.
+    pub policy: probe_config::PolicySection,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -337,6 +342,7 @@ async fn start_round(State(state): State<SharedState>) -> Response {
             trigger: "api".into(),
             mode: None,
             jobs: collected.jobs,
+            policy: task_state.policy.clone().into(),
         };
         let kernel = round_settings.kernel_prep(
             task_state.controller.clone(),
@@ -429,6 +435,7 @@ mod tests {
                 substore: None,
                 chain: cfg.chain.clone(),
                 publish_prefix: cfg.publish_prefix.clone(),
+                policy: cfg.policy.clone(),
             },
         ))
     }

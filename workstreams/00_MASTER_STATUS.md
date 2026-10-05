@@ -2,9 +2,11 @@
 
 ## 当前阶段与总体状态
 - 阶段：R0~R3 已交付（R3=Mihomo 控制器补全）；R5 已交付（并发闸门 + 轮次编排 +
-  RoundCtx + 节点采集/test_one）；**R6 引擎侧已交付**：前置池（三输入 +
-  manual 物化）+ 链式展开（双开关/plain_too/front_dead 语义）+ 两遍测试
-  （`run_phases`），cli/api 已挂接（`round --mode`）。R7 未开始。
+  RoundCtx + 节点采集/test_one）；R6 引擎侧已交付（前置池 + 链式展开 +
+  两遍测试）；**R7 已交付**：节点收敛（`probe-domain::policy` 五态折叠 +
+  `probe-storage::converge_nodes` 单事务落账 + history）+ `GuardDecision`
+  三态护栏 + `round_is_suspect` 存活下限 + ADR-0005 `rounds.inconclusive`
+  （migration 0003）。R8（发布/PublishDecision）未开始。
   另：内嵌 Sub-Store（probe-substore，rquickjs 跑官方 bundle）已落地并接入 serve，
   字节码缓存实测评估为不建（见 09）。
 - 原则：Python 实现保持为默认运行路径；Rust 以 shadow 双跑方式逐步逼近门禁。
@@ -68,26 +70,37 @@
   `probe-engine::collect::collect_fronts/expand_chains`、`round::run_phases`
   两遍（front 先测→链式限活前置→front_dead 未拨判败）；CLI `--mode` +
   API 挂接。Rust 测试 159 → **196**。
+- R7 整轮护栏 + 节点收敛（本批）——`probe-domain::policy`（五态折叠纯函数 +
+  `round_is_suspect`，无时钟无 IO）；`probe-config::PolicySection`（三阈值）；
+  `probe-storage`（migration 0003 `rounds.inconclusive`、`converge_nodes`
+  单事务折叠 + `node_state_history`、`previous_alive_count` 跳过 suspect/
+  inconclusive、`finish_round_full`）；`probe-engine`（`GuardDecision`
+  ApplyConvergence/PreservePreviousState/MarkRoundInconclusive、
+  `fold_verdicts` any-alive 口径、suspect 轮 note + 轮级标记）。ADR-0005 裁决
+  落稿（03）。Rust 测试 196 → **219**。
 
 ## 当前失败测试
-- 无。Python 568 通过 / 2 跳过；Rust **196 通过**（R3 后 45，R5 并发 +13，
+- 无。Python 568 通过 / 2 跳过；Rust **219 通过**（R3 后 45，R5 并发 +13，
   R5 编排 +17，R5 采集 +56，Sub-Store +16，cron +8，R6 链式 +37，
-  axum/tokio net feature 为 probe-source stub 测试引入）。
+  R7 护栏 +23，axum/tokio net feature 为 probe-source stub 测试引入）。
 
 ## ADR 索引
 - ADR-0001 存储驱动：切片用 rusqlite(bundled)，R2 迁移落地时复评 sqlx（理由见 08）。
 - ADR-0002 Docker Socket 退役路径：三步走（见 12）。
 - ADR-0003 / 0003b 迁移框架与表改名时机（R2 定稿，见 08）。
 - ADR-0004 语言选型：维持 Rust，否决 Go 重写（2026-10-01，见 02；外部 Go 合并方案已评估）。
-- ADR-0005（待写）轮次 `inconclusive` 态：引入前先落 ADR（见 03）。
+- ADR-0005 `rounds.inconclusive` 轮次态：**已裁决**（2026-10-05，见 03——
+  轮级标记、非第六节点态；migration 0003；`previous_alive_count` 跳过；
+  Python 读方保守兼容）。
 
 ## 下一批可并行任务
-- R5 收尾：用真机轮次数据复核四层并发阈值（现为比例初值）。
+- R5 收尾：用真机轮次数据复核四层并发阈值与 policy 阈值（现为比例/经验初值）。
 - Sub-Store 侧（见 09）：`$notification` 补 Apprise；hk3 部署切换（需用户
   在场，先备份迁移）。
 - R4：probe-dns（DoH + ECS + 二进制 fixture + fuzz，依赖 05）。
 - R6 收尾（见 07）：出口验证 + ipmap 落地映射。
-- R7：整轮保护 GuardDecision/PublishDecision（依赖 03）。
+- R8：发布与 PublishDecision（suspect 轮保留上轮发布的执行面；export_snapshots
+  表已就位）。
 - 前端适配 /api/v1（依赖 10 契约冻结）。
-- 口径差异待对账：轮行 total 按 (source, fp) 去重（Python）vs 按变体数
-  （Rust），双跑对账时折算（见 06 R6 节）。
+- 口径差异待对账（见 13「已知口径差异」）：轮行 total 去重口径、收敛折叠
+  展示列（proto/server/country/ip）暂缺、inconclusive 列 Python 保守兼容。

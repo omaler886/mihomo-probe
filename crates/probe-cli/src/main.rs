@@ -196,6 +196,7 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
         trigger: trigger.to_string(),
         mode: mode.map(str::to_string),
         jobs: collected.jobs,
+        policy: cfg.policy.clone().into(),
     };
     let ledger: Arc<dyn Ledger> = Arc::new(Mutex::new(storage));
     // The caller opens the row; the runner closes it on every path.
@@ -225,6 +226,15 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
             "{} chain node(s) failed front_dead: no live front carried them",
             outcome.front_dead
         );
+    }
+    match outcome.guard {
+        probe_engine::round::GuardDecision::ApplyConvergence => {}
+        probe_engine::round::GuardDecision::PreservePreviousState => {
+            eprintln!("guard: suspect round — previous publication preserved");
+        }
+        probe_engine::round::GuardDecision::MarkRoundInconclusive => {
+            eprintln!("guard: round marked inconclusive — no streak advanced");
+        }
     }
 }
 
@@ -494,6 +504,7 @@ async fn cmd_serve(root: &Path, host: &str, port: u16) -> std::io::Result<()> {
             substore: embedded.map(|(cfg, _)| cfg),
             chain: cfg.chain.clone(),
             publish_prefix: cfg.publish_prefix.clone(),
+            policy: cfg.policy.clone(),
         },
     ));
     tracing_subscriber::fmt()
