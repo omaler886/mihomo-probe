@@ -201,6 +201,22 @@ def live_nodes(group="__LANE0__"):
             and not name.startswith("lane")]
 
 
+def lane_members(lane):
+    """The nodes one lane's select group lists.
+
+    Since 2026-10-08 a lane group carries only its own slice of the proxies
+    (`index % lanes`), so a node can only be selected on the lane that owns it.
+    Tests that used to pick a candidate from the full node list and select it on
+    two arbitrary lanes now have to ask each lane for its own members.
+    """
+    status, body = core_api("/proxies")
+    if status != 200 or not isinstance(body, dict):
+        raise unittest.SkipTest(f"kernel API unavailable (HTTP {status})")
+    group = (body.get("proxies") or {}).get(f"__LANE{lane}__") or {}
+    return [n for n in (group.get("all") or [])
+            if n not in ("DIRECT", "REJECT", "PASS", "GLOBAL", "COMPATIBLE")]
+
+
 # --------------------------------------------------------------------------
 # health
 # --------------------------------------------------------------------------
@@ -362,7 +378,11 @@ class KernelEgressTest(unittest.TestCase):
         selected: any individual node can be down at any moment, and that is
         the pool being tested, not a fault in the lane plumbing.
         """
-        names = live_nodes()
+        # Only lane0's own members can be selected on lane0 since the groups
+        # were split; asking the kernel which those are is what `lane_members`
+        # is for. Falling back to the full list keeps this working against an
+        # older kernel config.
+        names = lane_members(0) or live_nodes()
         if not names:
             self.skipTest("the kernel has no testable proxies loaded")
         errors = []
@@ -443,81 +463,73 @@ class LaneIndependenceTest(unittest.TestCase):
             self.assertEqual(group.get("type"), "Selector",
                              f"{name} is not a Selector")
 
-    def test_swapping_two_lanes_swaps_their_exits(self):
+    def test_two_lanes_hold_independent_selections(self):
         """The decisive check: lanes are independent, not aliases of one selector.
 
-        Picks two nodes that egress from different IPs *on the lanes they will
-        actually be tested through*. A country difference is the cheapest way to
-        find such a pair, but an IP difference is what the assertion actually
-        needs -- plenty of live nodes share a country.
+        Replaces `test_swapping_two_lanes_swaps_their_exits`. That version
+        selected the *same* node on lane0 and lane1 and then swapped it, which
+        required every lane group to list every proxy. Since 2026-10-08 each
+        group lists only its own slice (`index % lanes`), so a node is
+        selectable on exactly one lane and that shape is impossible.
 
-        Both lanes are validated before the swap, deliberately. An earlier
-        version picked candidates by probing lane0 only and then asserted on
-        lane1, which had never been proven to carry traffic at all; a node that
-        merely choked *through lane1* (same node, different socket path) then
-        read as "the swap did nothing". Observed on vps as a one-off failure
-        with before=[192.0.2.40, 192.0.2.111] and after=[192.0.2.111, None]
-        -- i.e. lane1 dropped out, which the test misreported as an independence
-        violation. Probing both lanes up front turns that into a skip.
+        The property is unchanged: a shared selector would make the second
+        lane's choice overwrite the first's, so the two lanes would report the
+        same exit. Here each lane picks from its own group, both exits are read
+        at once, and then lane0 alone is moved to a second node of its own --
+        lane1 must not follow.
         """
-        names = live_nodes()
-        if len(names) < 2:
-            self.skipTest("need at least two loaded nodes to swap")
+        def select_and_read(lane, name):
+            status, _ = core_api(f"/proxies/__LANE{lane}__", "PUT", {"name": name})
+            if status not in (200, 204):
+                return None
+            return _trace_ip(self.ports[lane])
 
-        chosen = []
-        seen_ips = set()
-        for name in names[:30]:
-            ips = {}
-            usable = True
-            for lane in (0, 1):
-                status, _ = core_api(f"/proxies/__LANE{lane}__", "PUT", {"name": name})
-                if status not in (200, 204):
-                    usable = False
-                    break
-                ip = _trace_ip(self.ports[lane])
-                if not ip:
-                    usable = False      # this node cannot carry traffic here
-                    break
-                ips[lane] = ip
-            if not usable:
+        a1 = a2 = b = None
+        ip_a1 = ip_a2 = ip_b = None
+        for name in lane_members(0)[:20]:
+            ip = select_and_read(0, name)
+            if not ip:
                 continue
-            # a candidate is only interesting if it egresses differently on the
-            # two lanes than the candidate we already have
-            if ips[0] in seen_ips:
-                continue
-            seen_ips.update(ips.values())
-            chosen.append((name, ips[0], ips[1]))
-            if len(chosen) == 2:
+            if a1 is None:
+                a1, ip_a1 = name, ip
+            elif ip != ip_a1:
+                a2, ip_a2 = name, ip
                 break
-        if len(chosen) < 2:
-            self.skipTest("could not find two nodes that both lanes can carry traffic to")
-        if chosen[0][1] == chosen[1][2]:
-            self.skipTest("could not find two nodes with distinct egress IPs")
+        if a2 is None:
+            self.skipTest("could not find two lane0 nodes with distinct exits")
+        for name in lane_members(1)[:20]:
+            ip = select_and_read(1, name)
+            if ip and ip != ip_a1:
+                b, ip_b = name, ip
+                break
+        if b is None:
+            self.skipTest("no lane1 node with an exit distinct from lane0's")
 
-        a, b = chosen[0], chosen[1]
         try:
-            core_api("/proxies/__LANE0__", "PUT", {"name": a[0]})
-            core_api("/proxies/__LANE1__", "PUT", {"name": b[0]})
+            self.assertIn(core_api("/proxies/__LANE0__", "PUT", {"name": a1})[0],
+                          (200, 204))
+            self.assertIn(core_api("/proxies/__LANE1__", "PUT", {"name": b})[0],
+                          (200, 204))
             before = {0: _trace_ip(self.ports[0]), 1: _trace_ip(self.ports[1])}
             if None in before.values():
-                self.skipTest("a chosen node went down between probing and swapping")
+                self.skipTest("a chosen node went down between probing and checking")
             self.assertNotEqual(before[0], before[1],
-                                "the two lanes already egress from the same IP")
+                                "both lanes egress from one IP -- they share a selector")
 
-            # swap the selections
-            core_api("/proxies/__LANE0__", "PUT", {"name": b[0]})
-            core_api("/proxies/__LANE1__", "PUT", {"name": a[0]})
+            # move lane0 only; lane1 must not follow
+            self.assertIn(core_api("/proxies/__LANE0__", "PUT", {"name": a2})[0],
+                          (200, 204))
             time.sleep(1)
             after = {0: _trace_ip(self.ports[0]), 1: _trace_ip(self.ports[1])}
         finally:
             # always put the lanes back on something sane: a round may start any time
-            core_api("/proxies/__LANE0__", "PUT", {"name": a[0]})
-            core_api("/proxies/__LANE1__", "PUT", {"name": b[0]})
+            core_api("/proxies/__LANE0__", "PUT", {"name": a1})
+            core_api("/proxies/__LANE1__", "PUT", {"name": b})
 
         if None in after.values():
-            self.skipTest("a chosen node dropped out during the swap")
-        self.assertEqual(after[0], before[1], "lane0 did not follow its new selection")
-        self.assertEqual(after[1], before[0], "lane1 did not follow its new selection")
+            self.skipTest("a chosen node dropped out during the check")
+        self.assertEqual(after[0], ip_a2, "lane0 did not follow its new selection")
+        self.assertEqual(after[1], before[1], "lane1 moved when lane0 changed")
 
     def test_lane_inbound_rules_pin_the_listener(self):
         """Each lane's listener must be bound to its own group by an IN-NAME rule."""

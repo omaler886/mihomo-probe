@@ -277,14 +277,39 @@ def build_config(proxies, core_cfg, secret, out_dir=None):
     # at 174 live nodes is ~330s of the round. Each lane gets its own group and
     # its own port, and an IN-NAME rule pins that listener to that group, so
     # they can run concurrently.
+    #
+    # Each lane's group carries only the proxies that lane will ever select:
+    # the ones whose *config position* is congruent to the lane index, the same
+    # split the verification passes use (`engine._verify_egress` /
+    # `_verify_chain_payload` / `ipmap.probe_all` all bucket by `index % lanes`).
+    #
+    # Listing all proxies in all groups is what made a 486-node round write a
+    # 450KB config of which 93% was the same 486 names repeated 16 times. The
+    # kernel re-reads and rebuilds every group on `PUT /configs?force=true`,
+    # and at 7776 group members that took longer than the 20s HTTP timeout --
+    # so on hk3 every scheduled round from 2026-09-29 03:57Z onward died in
+    # `Core.reload` with `CoreError: TimeoutError: timed out` before a single
+    # node was tested (287 rounds, nine days, while the panel kept showing the
+    # previous round's `alive` ledger). Splitting the groups cuts the file to
+    # roughly a sixteenth of its group section and keeps reload well inside
+    # the timeout.
+    #
+    # The coupling is load-bearing: a lane's group must contain every node that
+    # pass may select on it, or `core.select` raises and the node silently
+    # loses its exit check. `lane_of` in the callers is the same `index %
+    # lanes`, computed from the mapping `prepare` returns alongside `proxies`
+    # (the two lists are built in lockstep).
     lanes = lane_count(core_cfg)
     ports = lane_ports(core_cfg, lanes)
     lines += ["proxy-groups:"]
     for i in range(lanes):
+        members = names[i::lanes]
         lines += [f'  - name: "{lane_group(i)}"', "    type: select", "    proxies:"]
-        for name in names:
+        for name in members:
             lines.append("      - " + json.dumps(name, ensure_ascii=False))
-        if not names:
+        # mihomo rejects a select group with no members; a lane that owns no
+        # node still needs a well-formed group for its listener and rule.
+        if not members:
             lines.append("      - DIRECT")
     lines += ["listeners:"]
     for i in range(lanes):

@@ -1256,6 +1256,13 @@ def _run_round(cfg, trigger, only_source, log, mode=None):
     for item in dropped:
         log("warn", f"剔除不可用配置的节点 {item['name']}: {item['why']}")
     log("info", f"内核配置就绪: {len(proxies)} 节点, 剔除 {len(dropped)}")
+    # Which lane each node belongs to. `build_config` wrote every lane's select
+    # group from exactly this split (`index % lanes` over `mapping`, whose order
+    # matches `proxies`), so a node selected on any other lane is not in that
+    # group and `core.select` raises. The verification passes must use this map
+    # rather than re-bucketing their own (subset, reordered) queues.
+    lane_of = {m["mihomo"]: i % coremod.lane_count(core_cfg)
+               for i, m in enumerate(mapping)}
     # Map the pruned names back to their entries. `make_testable` reports
     # `{name, why}` because that is all `prepare` knows -- it sees proxies, not
     # entries -- but the ledger keys on (source, fp), so the caller has to
@@ -1353,7 +1360,8 @@ def _run_round(cfg, trigger, only_source, log, mode=None):
     if verify_cfg.get("enabled", True) and survivors:
         try:
             countries, unverified, over_limit = _verify_egress(
-                core, core_cfg, survivors, verify_cfg, log, deadline=deadline)
+                core, core_cfg, survivors, verify_cfg, log, deadline=deadline,
+                lane_of=lane_of)
         except coremod.CoreError as exc:
             log("error", f"出口验证因控制器异常跳过（节点保持延迟判定，本轮无出口国别）: {exc}")
             countries, unverified, over_limit = {}, set(), []
@@ -1619,7 +1627,8 @@ def _test_phases(core, mapping, test_cfg, concurrency, deadline, chained, log):
     return results, chain_failed, len(live)
 
 
-def _verify_egress(core, core_cfg, survivors, verify_cfg, log, deadline=None):
+def _verify_egress(core, core_cfg, survivors, verify_cfg, log, deadline=None,
+                   lane_of=None):
     """Route real traffic through each survivor and read its exit country.
 
     The kernel's selector is global state, so a single group makes this phase
@@ -1628,6 +1637,15 @@ def _verify_egress(core, core_cfg, survivors, verify_cfg, log, deadline=None):
     IN-NAME rule pins that listener to that group, so lanes run concurrently
     and independently (verified: swapping two lanes' selections swaps their
     reported exits).
+
+    `lane_of` maps kernel name -> lane index and MUST be the same split
+    `core.build_config` used when it wrote each lane's select group (its
+    `index % lanes` over the mapping). The groups now carry only their own
+    lane's proxies, so selecting a node on the wrong lane raises a CoreError
+    and that node silently loses its exit check. The old `queue[i::lanes]`
+    bucket happened to agree with the old all-proxies-in-every-group layout;
+    it no longer does, because `queue` here is the *survivor* list, a subset
+    of the mapping whose positions do not match the config positions.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1640,7 +1658,18 @@ def _verify_egress(core, core_cfg, survivors, verify_cfg, log, deadline=None):
     if not queue:
         return {}, set(), []
 
-    buckets = {i: queue[i::lanes] for i in range(lanes)}
+    if lane_of is None:
+        # No mapping in hand: fall back to the positional split. Correct only
+        # when every lane group lists every proxy (the pre-2026-10-08 layout),
+        # which is why the round always passes `lane_of` explicitly -- and why
+        # this branch is noisy rather than silent.
+        log("warn", "出口验证未收到车道分配（lane_of），按队列位置分桶；"
+                    "仅当每个车道组列出全部节点时才正确")
+        buckets = {i: queue[i::lanes] for i in range(lanes)}
+    else:
+        buckets = {i: [] for i in range(lanes)}
+        for name in queue:
+            buckets[lane_of.get(name, 0) % lanes].append(name)
     out, lock, progress = {}, threading.Lock(), [0]
 
     def run_lane(index):
@@ -1744,12 +1773,22 @@ def _verify_chain_payload(core, core_cfg, mapping, results, cfg, log, deadline=N
     lanes = coremod.lane_count(core_cfg)
     ports = coremod.lane_ports(core_cfg, lanes)
     queue = fronts + chains
+    # Bucket by the node's position in `mapping`, which is the split
+    # `core.build_config` used when it wrote each lane's select group. Bucketing
+    # by position in `queue` would be wrong now that a group lists only its own
+    # lane's proxies: `queue` is fronts-then-chains, a reordering of a subset of
+    # the mapping, so a node would be selected on a lane whose group does not
+    # contain it and the select would raise.
+    lane_of = {m["mihomo"]: i % lanes for i, m in enumerate(mapping)}
+    buckets = {i: [] for i in range(lanes)}
+    for m in queue:
+        buckets[lane_of.get(m["mihomo"], 0) % lanes].append(m)
     failures, lock, progress = {}, threading.Lock(), [0]
 
     def run_lane(index):
         lane_out = {}
         group, port = coremod.lane_group(index), ports[index]
-        for m in queue[index::lanes]:
+        for m in buckets[index]:
             if deadline is not None and time.monotonic() > deadline:
                 break
             try:

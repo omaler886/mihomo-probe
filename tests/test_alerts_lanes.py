@@ -177,12 +177,44 @@ class LaneConfigTest(unittest.TestCase):
         self.assertIn("port: 19201", text)
         self.assertIn("listen: 127.0.0.1", text)
 
-    def test_every_lane_lists_every_proxy(self):
+    def test_every_proxy_lands_in_exactly_one_lane_group(self):
+        """The lane groups partition the proxies; they do not each list them all.
+
+        Replaces `test_every_lane_lists_every_proxy`, which asserted the exact
+        layout that caused the 2026-09-29 outage: 16 lanes x 486 nodes = 7776
+        group members, a 450KB config, and a `PUT /configs?force=true` that
+        outlived the controller's timeout on every round for nine days.
+
+        The invariant that has to hold instead is a partition, because
+        `engine._verify_egress` / `_verify_chain_payload` select a node only on
+        the lane `build_config` filed it under (`index % lanes`). A missing
+        node loses its exit check; a node in two groups would not break
+        anything but means the config grew back.
+        """
         proxies = [{"name": "a", "type": "vless", "server": "s", "port": 1},
-                   {"name": "b", "type": "trojan", "server": "t", "port": 2}]
-        text = self.render(self.cfg(lanes=3), proxies)
-        self.assertEqual(text.count('      - "a"'), 3)
-        self.assertEqual(text.count('      - "b"'), 3)
+                   {"name": "b", "type": "trojan", "server": "t", "port": 2},
+                   {"name": "c", "type": "vmess", "server": "u", "port": 3},
+                   {"name": "d", "type": "ss", "server": "v", "port": 4}]
+        lanes = 3
+        text = self.render(self.cfg(lanes=lanes), proxies)
+
+        groups, current = {}, None
+        for line in text.splitlines():
+            if line.startswith('  - name: "__LANE'):
+                current = line.split('"')[1]
+                groups[current] = []
+            elif current is not None and line.startswith("      - "):
+                groups[current].append(line.strip()[2:].strip('"'))
+            elif line.startswith("listeners:"):
+                current = None
+
+        # names[i::lanes]: lane0 -> a, d; lane1 -> b; lane2 -> c
+        self.assertEqual(groups.get("__LANE0__"), ["a", "d"])
+        self.assertEqual(groups.get("__LANE1__"), ["b"])
+        self.assertEqual(groups.get("__LANE2__"), ["c"])
+        for name in ("a", "b", "c", "d"):
+            self.assertEqual(text.count(f'      - "{name}"'), 1,
+                             f"{name} must appear in exactly one lane group")
 
     def test_match_fallback_targets_lane_zero(self):
         self.assertIn("MATCH,__LANE0__", self.render(self.cfg(lanes=4)))

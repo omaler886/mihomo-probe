@@ -21,7 +21,7 @@ pub mod lanes;
 pub use config_check::{culprit_from, validate, ConfigCheck, ProxyRef};
 pub use controller::{Controller, DelayOutcome, KernelError};
 pub use exit::{egress, fetch, parse_trace, ExitIdentity};
-pub use lanes::{lane_count, lane_group, lane_name, lane_ports};
+pub use lanes::{lane_count, lane_group, lane_members, lane_name, lane_ports};
 
 /// Loopback-only kernel config, field-for-field the Python `build_config`
 /// output (same key order, same quoting style, inline-JSON proxies).
@@ -76,10 +76,17 @@ pub fn build_config(core: &CoreConfig, secret: &str, proxies: &[Value]) -> Strin
         lines.push(format!("  - name: \"{}\"", lane_group(i)));
         lines.push("    type: select".into());
         lines.push("    proxies:".into());
-        if names.is_empty() {
+        // Only this lane's own slice. Listing every proxy in every group is
+        // what produced a 450KB config (93% of it the same names repeated 16
+        // times) and killed every round on hk3 for nine days; see
+        // `lanes::lane_members`.
+        let members = lane_members(&names, i, lanes);
+        if members.is_empty() {
+            // mihomo rejects a select group with no members, so a lane that
+            // owns nothing still gets a well-formed group.
             lines.push("      - DIRECT".into());
         } else {
-            for name in &names {
+            for name in members {
                 lines.push(format!("      - {}", quote_name(name)));
             }
         }
@@ -230,7 +237,7 @@ proxy-groups:
   - name: \"__LANE1__\"
     type: select
     proxies:
-      - \"n1\"
+      - DIRECT
 listeners:
   - name: \"lane0\"
     type: mixed
