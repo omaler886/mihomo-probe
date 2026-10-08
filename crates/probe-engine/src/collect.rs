@@ -410,10 +410,7 @@ pub async fn collect_fronts(
         tracing::warn!("chain.front_pick 有名单但没有前置来源，已忽略");
     }
 
-    let proxies: Vec<Value> = manual_fronts
-        .drain(..)
-        .chain(resource.into_iter())
-        .collect();
+    let proxies: Vec<Value> = manual_fronts.drain(..).chain(resource).collect();
 
     let cap = chain.max_fronts_cap();
     let mut fronts = Vec::new();
