@@ -29,7 +29,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, not @stable: a floating toolchain let a new clippy lint turn this
+      # job red while the dev box stayed green (three failed pushes, 2026-10-05).
+      # Keep in step with rust-toolchain.toml at the repo root.
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2

@@ -1,0 +1,24 @@
+# Pin the Rust toolchain so CI and the dev box agree on one version.
+#
+# Why this file exists: .github/workflows/ci.yml used to ask for
+# `dtolnay/rust-toolchain@stable`, which floats to whatever stable happens to be
+# newest on the runner. clippy gains lints over time, so a lint added in a newer
+# release turns the rust job red while a local checkout on an older toolchain
+# stays green. That is exactly what happened on 2026-10-05: the rust job failed
+# three pushes in a row on `clippy::useless_conversion` (fired from 1.97 on, for
+# `.chain(x.into_iter())`) while the local msvc stable was still 1.91.
+#
+# `channel` carries no host triple, so rustup resolves it against the default
+# host: x86_64-unknown-linux-gnu on the ubuntu CI runner, and whatever
+# `rustup show` reports as "Default host" on a dev machine. On Windows that is
+# normally x86_64-pc-windows-msvc. If yours is the gnu ABI instead -- which
+# cannot build rusqlite(bundled) or windows-sys -- run once in this directory:
+#
+#     rustup override set 1.99.0-x86_64-pc-windows-msvc
+#
+# Keep the version below in step with the `dtolnay/rust-toolchain@<version>`
+# ref in .github/workflows/ci.yml; the two are deliberately redundant (the file
+# covers any bare `cargo` invocation, the ref makes CI's intent explicit).
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
