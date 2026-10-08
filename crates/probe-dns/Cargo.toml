@@ -1,0 +1,18 @@
+[package]
+name = "probe-dns"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# No probe-domain dependency: this crate is transport only. The caches
+# (domain_views / ip_geo) and the expansion live with the engine, so nothing
+# here names a domain type -- see lib.rs.
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }
+getrandom = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

@@ -1,7 +1,9 @@
 # 主控状态（Master Status）
 
 ## 当前阶段与总体状态
-- 阶段：R0~R3 已交付（R3=Mihomo 控制器补全）；R5 已交付（并发闸门 + 轮次编排 +
+- 阶段：R0~R3 已交付（R3=Mihomo 控制器补全）；**R4 已交付（补做批，2026-10-08）**：
+  `probe-dns`（DoH+ECS 手写报文 + 8 个二进制 fixture）——但**未接入 engine**
+  （`classify_and_expand` 仍是 TODO），见 05；R5 已交付（并发闸门 + 轮次编排 +
   RoundCtx + 节点采集/test_one）；R6 引擎侧已交付（前置池 + 链式展开 +
   两遍测试）；**R7 已交付**：节点收敛（`probe-domain::policy` 五态折叠 +
   `probe-storage::converge_nodes` 单事务落账 + history）+ `GuardDecision`
@@ -26,7 +28,7 @@
 | 02 | 目标架构 | R0 草案定稿 |
 | 03 | 领域状态机 | R0 审计完成，设计待 R2 |
 | 04 | Mihomo 控制器 | R0 审计完成 |
-| 05 | DNS/ECS | R0 审计完成 |
+| 05 | DNS/ECS | R4 交付（transport + fixture）；engine 接入待做 |
 | 06 | 探测引擎 | R0 审计完成 |
 | 07 | 出口验证 | R0 审计完成 |
 | 08 | 存储迁移 | R0 审计完成 |
@@ -78,11 +80,17 @@
   ApplyConvergence/PreservePreviousState/MarkRoundInconclusive、
   `fold_verdicts` any-alive 口径、suspect 轮 note + 轮级标记）。ADR-0005 裁决
   落稿（03）。Rust 测试 196 → **219**。
+- R4 probe-dns（补做批）——`wire`（手写报文：`build_query`/`parse_ips`/`skip_name`，
+  三处有意硬化见 05）、`resolver`（DoH GET + `resolve_views`）、`geo`（ip-api 批量
+  查询，45s 超时 + 一次重试 + 错误文本 80 字符）、`fixtures/dns-packets/`（8 个二进制包
+  + `tools/make_dns_fixtures.py`）。**未接 engine**，无调用方。Rust 测试 219 → 221
+  （车道分桶修复 +2）→ **243**。
 
 ## 当前失败测试
-- 无。Python 568 通过 / 2 跳过；Rust **219 通过**（R3 后 45，R5 并发 +13，
+- 无。Python 568 通过 / 2 跳过；Rust **243 通过**（R3 后 45，R5 并发 +13，
   R5 编排 +17，R5 采集 +56，Sub-Store +16，cron +8，R6 链式 +37，
-  R7 护栏 +23，axum/tokio net feature 为 probe-source stub 测试引入）。
+  R7 护栏 +23，车道分桶修复 +2，R4 probe-dns +22，axum/tokio net feature 为
+  probe-source stub 测试引入）。
 
 ## ADR 索引
 - ADR-0001 存储驱动：切片用 rusqlite(bundled)，R2 迁移落地时复评 sqlx（理由见 08）。
@@ -97,7 +105,8 @@
 - R5 收尾：用真机轮次数据复核四层并发阈值与 policy 阈值（现为比例/经验初值）。
 - Sub-Store 侧（见 09）：`$notification` 补 Apprise；hk3 部署切换（需用户
   在场，先备份迁移）。
-- R4：probe-dns（DoH + ECS + 二进制 fixture + fuzz，依赖 05）。
+- R4 收尾（见 05）：engine 接入 `classify_and_expand` + `domain_views`/`ip_geo`
+  缓存 + any/all 聚合；`cargo-fuzz` 未接。
 - R6 收尾（见 07）：出口验证 + ipmap 落地映射。
 - R8：发布与 PublishDecision（suspect 轮保留上轮发布的执行面；export_snapshots
   表已就位）。

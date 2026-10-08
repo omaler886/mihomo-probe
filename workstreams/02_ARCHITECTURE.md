@@ -8,8 +8,10 @@
 
 ## 设计决策
 - Workspace 布局（R1 已建立，见 crates/）：probe-domain / probe-config / probe-storage / probe-mihomo / probe-dns / probe-substore / probe-engine / probe-api / probe-scheduler / probe-observability / probe-supervisor / probe-cli。
-  - **已存在（R5 后）**：probe-domain / probe-config / probe-storage / probe-mihomo /
-    probe-engine / probe-api / probe-cli。其余仍为计划中，建 crate 时再落地（不建空壳）。
+  - **已存在（R7 后）**：probe-domain / probe-config / probe-storage / probe-mihomo /
+    probe-dns / probe-source / probe-substore / probe-engine / probe-api / probe-cli。
+    其余（probe-scheduler / probe-observability / probe-supervisor）仍为计划中，
+    建 crate 时再落地（不建空壳）。
 - 依赖方向：domain ← config/dns/mihomo/substore/storage ← engine ← api/scheduler/cli。domain 不依赖 web/db/网络客户端。
   - probe-engine 依赖 `probe-domain` / `probe-config` / `probe-mihomo` / `probe-storage`
     + tokio/tokio-util/thiserror/tracing。它决定"何时允许 IO、一轮要记什么"，
@@ -40,7 +42,7 @@
 - [x] R2：SQL migration 体系（migrations/ 目录，替代 Python 的代码内迁移）
 - [x] R3：probe-mihomo 补 lanes/select/egress/fetch/校验器
 - [x] R5：probe-engine 建立 + 分层并发闸门 + 轮次编排（已接 cli/api）
-- [ ] R4：probe-dns（DoH+ECS+fixture fuzz）
+- [x] R4：probe-dns（DoH+ECS 手写报文 + 8 个二进制 fixture）——**未接 engine**，见 05
 - [ ] R5：节点采集（Sub-Store → fingerprint → 变体）—— 现在 jobs 恒为空
 - [ ] R6：出口验证与 ipmap
 - [ ] R7：状态机/整轮保护/原子发布
@@ -52,6 +54,7 @@
 | 时间 | 文件 | 变更 | 原因 |
 |---|---|---|---|
 | 2026-09-30 | Cargo.toml, crates/* | R1 workspace | 纵向切片 |
+| 2026-10-08 | crates/probe-dns, Cargo.toml, Cargo.lock | R4 probe-dns | DoH+ECS 补做批 |
 
 ## 本机工具链注记
 - 默认工具链 x86_64-pc-windows-gnu 缺 gcc/dlltool（rusqlite bundled、windows-sys 构建失败）；

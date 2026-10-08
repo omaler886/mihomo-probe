@@ -160,3 +160,141 @@ Rust 全量重构的变更台账。每批含影响范围与回滚方法；总控
 
 ### 回滚
 - `git revert` 本提交（probe-mihomo 回到 R2 形态，切片功能不受影响）。
+
+---
+
+## 修复 — 车道 select group 分桶（2026-10-08）
+
+> **不是 R 批次**，是一次生产事故修复；Rust 侧同步了同一改动。
+> 代码在**前一个提交**（`fix(engine): 车道 select group 只列本车道节点`），
+> 本节与该提交一起入账。细节见 `.workbuddy-ai/memory/2026-10-08.md` 与
+> `reports/lane-split-fix-20261008.html`。
+
+### 问题
+线上 287 轮全部 `aborted: CoreError: TimeoutError: timed out`（2026-09-29 03:57Z 起，
+面板与导出停在旧快照 9 天，看起来像"大量测出来实际不可用"，实为测活完全停摆）。
+根因：`build_config` 给**每条车道**列出**全部节点** → 486 节点 × 16 车道 = **7776 个
+组成员** → 459KB 配置 → `PUT /configs?force=true` 超过 HTTP 客户端 20s 超时 → 整轮作废
+（`total=0`，一个节点都没测）。
+
+### 修复
+- Python `core.build_config`：车道 group 只列本车道切片 `names[i::lanes]`（空则落 `DIRECT`）。
+- Python `engine`：`_run_round` 新增 `lane_of`（`index % lanes`，与配置同源）；
+  `_verify_egress` / `_verify_chain_payload` 据此分桶。原先按 `queue[i::lanes]` 分桶，
+  而 `queue` 是 `mapping` 的**子集且重排**，与配置位置不一致时 `core.select` 会在错误车道
+  失败 → 节点静默丢失出口验证。
+- Rust `probe-mihomo`：新增 `lanes::lane_members`（同一 `index % lanes` 切分），
+  `build_config` 改用之；补 2 个测试。顺带修掉该函数引入的 clippy `needless_lifetimes`
+  （说明上一批没跑过 clippy）。
+- 测试：`test_every_lane_lists_every_proxy`（断言的正是导致事故的旧布局）重写为划分断言
+  `test_every_proxy_lands_in_exactly_one_lane_group`；`test_live.py` 新增 `lane_members()`
+  并改造两条车道用例。
+
+### 效果
+组成员 7776 → 486（−93.8%）；配置 459,518 → 173,772 字节（−62.2%）。
+线上第 793/794/795 轮连续成功（`ok` = 224 / 209 / 212）。
+Rust 侧新增 2 个测试（`lane_members` 的划分与边界用例）：全量 219 → 221。
+
+### 已知限制
+- 线上代码仍落后本地 HEAD（本批只部署了 `core.py` + `engine.py`）。
+- `chain.front_pick` 只挑中 1 个前置（`max_fronts=3` 形同虚设），该前置一挂整轮链式全
+  `front_dead`。
+
+### 回滚
+- `git revert` 该提交；线上回滚需
+  `docker compose up -d --build --force-recreate mihomo-test`。
+
+---
+
+## R4 — probe-dns：DoH + ECS + 二进制 fixture（2026-10-08）
+
+> **本批是补做批次**：R0–R3 后 R4 被跳过、直接进了 R5–R7；`crates/probe-dns/` 一直以
+> **未提交的工作区状态**存在（未 `git add`，`Cargo.toml` 的成员行与 `Cargo.lock` 条目也未提交）。
+> 本批把它整理、补齐、入账，所以提交时间晚于 R5–R7，内容属于 R4。
+
+### 新增（全部在 crates/probe-dns）
+- `wire` 模块：手写 DNS 报文，逐字段对齐 `mihomo_test/doh.py`——`build_query`（随机 id、
+  RD 标志、OPT 记录 + ECS option、label 长度前缀编码）、`parse_ips`（QD/AN 计数、
+  `skip_name` 跳过压缩指针、A=4B / AAAA=16B）。
+- `resolver` 模块：`DohResolver::query`（GET `?dns=<base64url-nopad>`、
+  `Accept: application/dns-message`）、`resolve_views`（逐视角 A+AAAA、视图内去重保序、
+  失败视图产空列表）、`ViewConfig`。`rand_id()` 用 `getrandom::fill` 对齐 `os.urandom(2)`。
+- `geo` 模块：`GeoClient::fetch_batch`——`ip-api.com/batch` 的 HTTP 半边，
+  `urlopen(timeout=45)` 的等价物、失败重试一次（间隔 2s）、错误文本截 80 字符。
+  **分块（90/批）与缓存归调用方**，与 Python 的分工一致。
+- `fixtures/dns-packets/`：8 个二进制包 + `tools/make_dns_fixtures.py`（可复现生成）——
+  A 记录（owner name 走压缩指针）、AAAA、CNAME→A、NXDOMAIN、恶意 rdlength、
+  自指针 question、坏 label 长度、不足 12 字节的短包。
+
+### 对 Python 的三处**有意**硬化（`workstreams/05` 已记）
+1. 非零 RCODE → `WireError::Rcode`，不再与"空 answer"混同（Python 返回空列表）。
+2. 包被截断 → `WireError::Truncated`，不再返回"部分答案"（Python 遇短记录 `break`）。
+3. `MAX_NAME_JUMPS` 具名上限（Python 靠 `offset >= len(data)` 兜底）。
+   调用方可见行为不变：`resolve_views` 对"查询失败"与"无记录"同样产空视图。
+
+### 测试（cargo test --workspace --locked，243 通过 / 0 失败）
+- `probe-dns` 22 通过：`wire` 18（含 8 个 fixture 用例）、`geo` 3、`resolver` 1。
+- 全量 **243** = R7 后 219 + lane 修复 2（`lane_members` 的两个划分用例）+ 本批 22。
+- `fmt --all -- --check` 无输出；`clippy --workspace --all-targets -- -D warnings` 零告警。
+
+### 独立审查（只读 subagent，两轮）发现并修正的 11 项
+**第一轮**（整理后立即跑）：
+1. **[中] `GeoClient::fetch_batch` 无超时**：Python 是 `urlopen(timeout=45)`，缺了它一个
+   挂住的端点会拖死整轮。已加 `BATCH_TIMEOUT_S = 45`。
+2. **[中] 畸形 JSON body 不重试**：Python 的 `json.load(resp)` 与请求在同一个 `try` 里，
+   所以 body 解析失败**也会重试**；Rust 原本用 `?` 直接返回，恰在"端点偶发返错页"这个
+   场景上与 Python 分歧。已改为与传输错误同一路径重试，并加对照组测试。
+3. **[中] `lib.rs` / `Cargo.toml` 有现在时假陈述**：原文写"engine owns the caches and the
+   expansion (`classify_and_expand`)"，但 `probe-engine` 根本没依赖 `probe-dns`。
+   已改为如实标注"未接入"。
+4. **[中] 「坏标签」fixture 缺失**：md 待办点名要、docstring 也自称覆盖，但实际没有。
+   已补 `bad-label-overrun.bin`（label 长度 0x41 = 65，既非合法 label 也非指针）。
+5. **[低] `parse_ips` / `MAX_NAME_JUMPS` 的 doc 不准确**：前者说指针环会 `None → Truncated`
+   （实际自指针 → `Ok([])`）；后者说"each hop must make progress towards the buffer start"
+   （不跟随指针，该句是从"会解引用"的实现抄来的）。均已改正。
+6. **[低] 冗余代码与依赖**：`skip_name` 与 `read_name` 的实现在整理前的原文里**逐字相同**
+   （后者 doc 却声称 "following compression pointers with loop protection"），已合并为一个；
+   `probe-domain` / `serde` / `tracing` 三个依赖全未使用，已删。
+
+**第二轮**（修完后复核，抓到第一轮的漏网与我自己的新错误）：
+7. **[中] `encode_name` 的 doc 仍是现在时假陈述**：写"idna-encode non-ASCII labels"，
+   实现却是拒绝——第一轮清理假陈述时的漏网。
+8. **[中] 顶注把两种情形混为一谈**（**第一轮修复时我自己引入的**）：写"a self-pointing
+   pointer costs a single step and the walk then ends on the packet's own bounds"——自指针是在
+   指针分支**直接返回**，与 `MAX_NAME_JUMPS` 无关；"Python relied on its buffer check"对自指针
+   也不成立。已改为区分"指针一步结束"与"畸形 label 链被上限截断"。
+9. **[中] 合法但非数组的 JSON 会被重试**（本次修复的副作用）：Python 的 `json.load` 会接受
+   非数组 body（随后在 `lookup_countries` 的 `row.get` 上崩），Rust 直接反序列化到 `Vec`
+   则归入重试。已在 doc 记为**有意的选择**（更严格的一侧）。
+10. **[中] `query` 的 timeout / `ViewConfig.ecs_prefix` 没有 Python 默认值**（8 / 24），
+    接入方必须显式补否则语义漂移。已加 `DEFAULT_TIMEOUT_S` / `DEFAULT_ECS_PREFIX` 常量。
+11. **[低] 若干措辞/边界**：`MAX_NAME_JUMPS` doc 的 off-by-one（64 次迭代 → 最多 63 个标签）；
+    `parse_ips` doc 的"malformed rdata is skipped"与"runs short is an error"自相矛盾；
+    `geo` 的 `query` 过滤用 `as_str` 而非 Python 的真值判断（空串未丢）；`lib.rs` 说
+    "probe-source's crate doc points here"属夸大。均已改正。
+
+**审查者明确无法验证的一项**：`skip_name` 与 `read_name` 在合并前「逐字节相同」——
+因这批代码此前未入库（`?? crates/probe-dns/`），无基线可 diff。依据是整理时读到的原文；
+现状自洽，且与 Python 的单一 `_skip_name` 结构一致。
+
+审查确认成立的：8 个 fixture 的字节逐一手工解析后与全部断言相符；`BATCH_TIMEOUT_S` /
+重试次数与间隔 / 80 字符截断与 Python 逐项一致；删依赖无遗漏且 `serde_json` 够用
+（`reqwest` 的 `.json()` 自带 serde 支持）；`rand_id` 对齐 `os.urandom(2)`；`build_query`
+显式 qid 不影响双跑对账（id 本就随机且从不与响应比对）；`ecs_option` 的 prefix 边界等价；
+`resolve_views` 对失败 query 的最终视图与 Python 一致（都无条件产出该视图，可能为空）。
+
+### 影响范围
+- 全部为新增 crate；`Cargo.toml` 只加一行成员、`Cargo.lock` 只加 probe-dns 条目。
+- **Python 零改动**；无调用方，默认路径行为不变。
+
+### 已知限制（如实记录）
+- **未接入任何调用方**：`probe-engine` 未依赖 `probe-dns`，`classify_and_expand` 未实现，
+  一轮仍"一个 server 测一个地址"。R4 剩下：engine 接入 + `domain_views`/`ip_geo` 缓存 +
+  any/all 聚合。
+- **无日志接缝**：返回 `Result<_, String>` 而不自己记日志，与 Python 分工一致。
+- **非 ASCII 域名**：Python idna 编码成功、Rust 拒绝（无 `idna` 依赖），是真实分歧。
+- **fuzz 未做**：md 目标是"fixture 与 fuzz"，本批只交付固定 fixture，未接 `cargo-fuzz`。
+
+### 回滚
+- `git revert` 本提交（回到没有 `crates/probe-dns/` 的状态）；无数据/格式迁移，
+  Python 侧无影响。

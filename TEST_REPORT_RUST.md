@@ -268,3 +268,83 @@ cargo test -p probe-api     × 10 → 10/10 轮  5 passed
   再交给 spawned task 关闭。若 `finish_round` 失败，行会留在打开态 —— 依赖
   `open_round_ids()` / 孤儿回收，日志会明确报出。**这是 `run_round` 唯一不关行的路径。**
 
+---
+
+## R4 — 2026-10-08（补做批；HEAD：R4 提交）
+
+> R4 在 R0–R3 后被跳过、直接进了 R5–R7，`crates/probe-dns/` 一直以未提交的工作区状态
+> 存在（未 `git add`，`Cargo.toml` 成员行与 `Cargo.lock` 条目也未提交）。本批整理、补齐、入账。
+
+### fmt / clippy
+```
+cargo +stable-x86_64-pc-windows-msvc fmt --all
+cargo +stable-x86_64-pc-windows-msvc fmt --all -- --check      # 无输出
+cargo +stable-x86_64-pc-windows-msvc clippy --workspace --all-targets -- -D warnings
+→ 0 error（判据 `grep -cE "^error"`；输出里的 os error 5 是 Windows 增量目录噪声，非 lint）
+```
+- 上一批（lane 分桶修复）遗留一处 `needless_lifetimes`（`crates/probe-mihomo/src/lanes.rs:47`），
+  说明那批没跑过 clippy；本批一并修掉。
+
+### cargo test --workspace --locked（**243 通过 / 0 失败**，本批新增 22）
+```
+probe-api      5 passed
+probe-cli     24 passed
+probe-config  20 passed
+probe-dns     22 passed   ← 本批新增（wire 18 / geo 3 / resolver 1）
+probe-domain  12 passed
+probe-engine  67 passed
+probe-mihomo  25 passed
+probe-source  46 passed
+probe-storage 19 passed
+probe-substore 23 passed（耗时 190s，rquickjs 跑官方 bundle）
+```
+（243 = R7 后 219 + lane 修复 2 + 本批 22）
+
+### probe-dns 的 22 个用例
+```
+wire（18）：报文头/ECS option 逐字节断言、无 ECS 则无 additional、非 ASCII label 拒绝、
+           A/AAAA 顺序、跳过其它类型、非零 RCODE、短包、自指针 question、
+           answer owner name 走指针；+ 8 个 fixture 用例（见下）
+geo（3）：批量 POST 语义（本地 axum stub 回显）、429 一次重试后报错、畸形 body 也重试
+resolver（1）：视图内去重保序、无 resolver 的视图被跳过、失败视图产空列表
+```
+
+### 二进制 fixture（`crates/probe-dns/fixtures/dns-packets/`，8 个）
+由 `tools/make_dns_fixtures.py` 生成（无随机、每次写出同样字节）。逐包断言：
+```
+a-answer-compressed.bin    43B  owner name 指针→offset 12 → ["1.2.3.4"]
+aaaa-answer.bin            56B  16B rdata → ["2001:db8::1"]
+cname-then-a.bin           66B  ANCOUNT=2，跳过 CNAME → ["1.2.3.4"]
+nxdomain.bin               30B  rcode 3 → Err(Rcode(3))
+truncated-answer.bin       41B  rdlength 声称 4 实给 2 → Err(Truncated)
+pointer-loop-question.bin  18B  question 自指针 → Ok([])
+bad-label-overrun.bin      22B  label 长度 0x41(65) → Err(Truncated)
+short-header.bin            6B  < 12 → Err(Truncated)
+```
+其中「恶意长度」「坏标签」是内联测试原本没覆盖的两类。
+
+### 独立审查（只读 subagent，两轮）发现并修正的 11 项
+（完整版见 CHANGELOG_RUST.md 的 R4 节；此处只列摘要）
+- **第一轮 6 项**：`fetch_batch` 缺 45s 超时；畸形 JSON body 未重试；`lib.rs`/`Cargo.toml`
+  现在时假陈述；「坏标签」fixture 实际缺失；`parse_ips`/`MAX_NAME_JUMPS` doc 不准确；
+  `skip_name`/`read_name` 逐字重复 + 3 个未使用依赖。
+- **第二轮 5 项**（含第一轮的漏网与我自己的新错误）：`encode_name` doc 仍是假陈述；
+  **顶注把「自指针」与「label 链越界」混为一谈（第一轮修复时我自己引入的）**；
+  非数组 JSON 被重试（有意选择，已记 doc）；`query` 超时与 `ecs_prefix` 缺 Python 默认值
+  （已加 `DEFAULT_TIMEOUT_S`/`DEFAULT_ECS_PREFIX`）；`MAX_NAME_JUMPS` off-by-one 等措辞。
+
+审查者明确**无法验证**的一项：`skip_name`/`read_name` 合并前「逐字节相同」——这批代码
+此前未入库，无基线可 diff；依据是整理时读到的原文。
+
+审查确认成立：8 个 fixture 字节逐一手工解析与断言相符；超时/重试/80 截断与 Python 逐项
+一致；删依赖无遗漏且 `serde_json` 够用；`rand_id` 对齐 `os.urandom(2)`；`build_query`
+显式 qid 不影响对账；`resolve_views` 失败 query 的最终视图与 Python 一致。
+
+### 已知限制（如实记录）
+- **未接入任何调用方**：`grep -rn "probe-dns" crates/*/Cargo.toml` 只命中它自己，
+  `probe-engine` 未依赖它；`classify_and_expand` 未实现。轮次仍"一个 server 测一个地址"。
+- **缓存未做**：`domain_views`(6h) / `ip_geo` 归调用方，本 crate 不持有。
+- **`cargo-fuzz` 未接**：md 目标是"fixture 与 fuzz"，本批只交付固定 fixture。
+- **非 ASCII 域名是真实分歧**：Python 的 idna 编码会成功、Rust 拒绝（无 `idna` 依赖）。
+- 本机无真内核/容器，与既有批次相同。
+
