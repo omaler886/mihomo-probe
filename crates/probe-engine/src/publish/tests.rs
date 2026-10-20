@@ -585,6 +585,12 @@ fn symlinks_junction_equivalents_and_shared_files_are_rejected() {
     fs::create_dir(&child).unwrap();
     fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(materialize_export(&linked_root.join("child"), "air", &rendered).is_err());
+    // The checked root rejects every entry it did not create itself, so the
+    // probe symlink has to leave before the clean-materialize assertions --
+    // on Linux its presence made the next call fail with
+    // "export root is shared with entries this service did not create"
+    // (this test is #[cfg(unix)] and had never executed before CI run 3).
+    fs::remove_file(&linked_root).unwrap();
     let target = root
         .0
         .join(format!("{}-{}.yaml", export_hash("air"), rendered.sha256()));

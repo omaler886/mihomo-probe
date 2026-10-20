@@ -490,4 +490,41 @@ probe-engine / probe-cli+config+mihomo / storage+source+dns），证实 20 项�
 - `git revert` 本提交。
 
 ---
+
+## R23 — CI 第三跑 + ETXTBSY 生产事故复盘（2026-10-21）
+
+1. **`0611948` 的 rust job 挂在 Clippy**：CI 的 clippy lint 的是 **Linux 目标**，
+   `#[cfg(unix)]` 分支 Windows 本地永远看不到（2026-10-05「本地绿 CI 红」的同一陷阱，
+   这次是 cfg 而非 clippy 版本）。core_secret unix 分支的 `return Ok(secret)` 是
+   match 尾表达式 → needless_return。修复 + **新增本地门禁**：
+   `cargo clippy --target x86_64-unknown-linux-gnu --workspace --all-targets
+   --all-features -- -D warnings` 必须零告警（`0ccb690`）。
+   python job 在 `0611948` 已转绿（framing 裸 socket 修复生效）。
+2. **`0ccb690` 与部署二进制的行为差异为零**（去掉一个尾位置 return 关键字）；
+   线上 `c92304…` 对应 `0611948` 的树，行为上等价 HEAD。
+
+### ⚠️ ETXTBSY 生产事故（两次，均已恢复）：部署程序缺陷
+
+- **现象**：v3 二进制 swap 后 probe-api 反复 `203/EXEC`，journal 写
+  `Failed to execute …: Text file busy`；systemd 每 5s 重启一次，服务全停。
+- **根因**：分片断点续传的 SFTP 上传在服务端留下 **sftp-server 进程持有 `.new`
+  的写句柄**（客户端侧 sftp.close()/连接断开并不能保证服务端句柄立即释放；
+  被 kill 的连接留下孤儿句柄）。`mv .new → probe-cli` 把**被写句柄钉住的 inode**
+  换到服务路径上 → 任何 execve 都吃 ETXTBSY。**二进制本身没有问题**——两次都是
+  上传机制造成的。
+- **恢复**（两次都立即生效）：`cp 备份 probe-cli.tmp && mv probe-cli.tmp probe-cli`
+  ——rename 换出**新 inode**，孤儿句柄继续钉着旧 inode，新文件可 exec。
+- **新部署规则**（写进流程）：swap 前必须 ① `pkill -f sftp-server`（此刻不应有
+  活客户端）② `fuser -v <root>/bin/probe-cli.new` 证明**无写句柄** ③ swap 后
+  `systemctl is-active` + `healthz` 双检，**不健康立即 rename 回滚**。
+- 事故时间线：21:48 首次 swap 即 ETXTBSY（30 分钟后恢复）；22:25 第二次 swap
+  仍是孤儿句柄（90 秒内 rename 恢复）；22:37 按新规则 swap 成功，
+  round 44 全绿（ok 203/293、inconclusive=false、导出+push 正常）。
+
+### 影响 / 遗留
+- ct186 现运行 `c92304…`（= `0611948` 树，行为等价 HEAD `0ccb690`）。
+  secret 文件 0600，护栏链与基线正常（round 44 基线 203）。
+- `0ccb690` 待推送的网络窗口（本地出网故障期间用重试循环）。
+
+---
   Python 侧无影响。
