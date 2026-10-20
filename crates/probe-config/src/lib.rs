@@ -576,7 +576,7 @@ impl Config {
                     file.write_all(secret.as_bytes()).map_err(|e| {
                         DomainError::Config(format!("cannot write {}: {e}", path.display()))
                     })?;
-                    return Ok(secret);
+                    Ok(secret)
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Someone created it between the failed read and here --
