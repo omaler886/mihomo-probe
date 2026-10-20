@@ -1,113 +1,203 @@
-//! Hand-built DNS wire format, port of `mihomo_test/doh.py`.
+//! Bounded DNS wire encoding and response validation for A/AAAA DoH queries.
 //!
-//! ECS needs the wire format -- the JSON DoH APIs do not accept a client
-//! subnet -- so queries are built and answers parsed by hand.
-//!
-//! Three hardening deltas against the Python original, recorded in
-//! workstreams/05:
-//!
-//! * the name skipper is explicitly bounded by [`MAX_NAME_JUMPS`]. Like the
-//!   Python one it never dereferences a pointer: a pointer ends the walk in one
-//!   step, so a self-pointing one is not a loop at all -- the bound actually
-//!   guards a corrupt *label* chain. Python's `while True` stopped such a chain
-//!   on its `offset >= len(data)` check and returned the (out-of-range) offset;
-//!   here the stop is a named bound and the result is `None`, which the callers
-//!   map to `Truncated`.
-//! * a truncated packet is an error ([`WireError::Truncated`]) rather than a
-//!   partial answer. Python's `break` on a short record returned whatever it
-//!   had already collected; a corrupt response now yields an empty view
-//!   instead of a silently short one.
-//! * the response RCODE is checked: NXDOMAIN and SERVFAIL return an error
-//!   instead of an empty answer list, so callers can distinguish "no records"
-//!   from "the lookup failed". The caller's observable behaviour is unchanged
-//!   -- `resolve_views` skips a failed query either way, so a dead lookup and
-//!   a lookup with no records both leave the view empty.
+//! A response is validated in full before any addresses are returned. Only
+//! records at the end of the question's CNAME chain contribute addresses.
+
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use thiserror::Error;
 
 pub const TYPE_A: u16 = 1;
 pub const TYPE_AAAA: u16 = 28;
+/// The two-byte DNS-over-TCP length field bounds a DoH DNS message too.
+pub const MAX_DNS_MESSAGE_SIZE: usize = 65_535;
+
+const TYPE_NS: u16 = 2;
+const TYPE_CNAME: u16 = 5;
+const TYPE_SOA: u16 = 6;
 const OPT_TYPE: u16 = 41;
 const ECS_OPTION: u16 = 8;
-
+const CLASS_IN: u16 = 1;
+const HEADER_LEN: usize = 12;
+const MAX_NAME_LEN: usize = 255;
+const MAX_NAME_STEPS: usize = 256;
+const MAX_RECORDS: usize = 1024;
+const MAX_CNAME_CHAIN: usize = 128;
 const FLAG_RD: u16 = 0x0100;
 
-/// How many steps the walk will take before treating a name as malformed. A
-/// name of N labels needs N steps for the labels plus one for the terminating
-/// zero, so this allows 63 labels -- generous on purpose. Pointers are stepped
-/// over, not followed, so it bounds a corrupt label chain rather than a
-/// pointer chain.
-const MAX_NAME_JUMPS: usize = 64;
+/// A validated address answer; a zero TTL means it must not be cached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsAnswer {
+    /// Stable, deduplicated addresses of the requested family and canonical name.
+    pub ips: Vec<String>,
+    /// Ordered CNAME targets, excluding the original question; no trailing dots.
+    pub cname_chain: Vec<String>,
+    /// Minimum address/alias TTL, or SOA-derived negative TTL including aliases.
+    pub ttl_secs: u32,
+    /// NXDOMAIN or NODATA. A negative answer without an applicable SOA has TTL 0.
+    pub negative: bool,
+}
 
+/// Parse/encoding failures contain fixed reasons, never queried names or URLs.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WireError {
-    #[error("bad label {0:?}")]
+    #[error("invalid DNS label: {0}")]
     BadLabel(String),
-    #[error("truncated packet")]
+    #[error("DNS name exceeds 255 wire bytes")]
+    NameTooLong,
+    #[error("invalid ECS address or prefix")]
+    InvalidEcs,
+    #[error("only A and AAAA questions are supported")]
+    UnsupportedQuestion,
+    #[error("truncated DNS packet")]
     Truncated,
+    #[error("DNS message exceeds 65535 bytes")]
+    MessageTooLarge,
+    #[error("invalid DNS response: {0}")]
+    InvalidResponse(&'static str),
+    #[error("DNS response ID mismatch")]
+    IdMismatch,
+    #[error("DNS response question mismatch")]
+    QuestionMismatch,
+    #[error("invalid DNS compression pointer")]
+    InvalidPointer,
+    #[error("DNS compression cycle or step limit")]
+    CompressionLoop,
+    #[error("DNS record count exceeds limit")]
+    RecordLimit,
+    #[error("invalid DNS record: {0}")]
+    InvalidRecord(&'static str),
+    #[error("DNS CNAME cycle or chain limit")]
+    CnameLoop,
     #[error("dns rcode {0}")]
     Rcode(u16),
 }
 
-/// `_encode_name`: length-prefixed labels terminated by the zero label.
-///
-/// Python idna-encodes a non-ASCII label here; this port rejects one instead
-/// (see [`encode_label`]), so the doc names what this function does rather than
-/// what the original does.
+/// Canonical wire labels retain binary DNS names without ambiguous dot joining.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Name(Vec<Vec<u8>>);
+
+impl Name {
+    /// Render these labels as lowercase presentation text, escaping binary bytes.
+    fn to_text(&self) -> String {
+        if self.0.is_empty() {
+            return ".".to_string();
+        }
+        self.0
+            .iter()
+            .map(|label| {
+                let mut text = String::new();
+                for &byte in label {
+                    if byte.is_ascii_graphic() && byte != b'.' && byte != b'\\' {
+                        text.push(char::from(byte));
+                    } else {
+                        text.push_str(&format!("\\{byte:03}"));
+                    }
+                }
+                text
+            })
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    /// Return whether this name lies within `zone`, comparing whole wire labels.
+    fn is_within(&self, zone: &Name) -> bool {
+        self.0.ends_with(&zone.0)
+    }
+}
+
+/// Normalize a user name with URL's IDNA implementation, returning bounded labels.
+fn normalize_name(name: &str) -> Result<Name, WireError> {
+    if name.len() > MAX_NAME_LEN * 4 {
+        return Err(WireError::NameTooLong);
+    }
+    let mapped = name.replace(['\u{3002}', '\u{ff0e}', '\u{ff61}'], ".");
+    if mapped == "." {
+        return Ok(Name(Vec::new()));
+    }
+    let bare = mapped.strip_suffix('.').unwrap_or(&mapped);
+    if bare.split('.').any(str::is_empty) {
+        return Err(WireError::BadLabel("empty label".to_string()));
+    }
+    if bare
+        .bytes()
+        .any(|byte| byte.is_ascii() && !byte.is_ascii_alphanumeric() && !b"-_.".contains(&byte))
+    {
+        return Err(WireError::BadLabel("invalid name character".to_string()));
+    }
+    // The suffix prevents WHATWG's IPv4 shorthand rewriting (e.g. "127.1").
+    let mut url = reqwest::Url::parse("http://idna.invalid/")
+        .map_err(|_| WireError::BadLabel("IDNA setup".to_string()))?;
+    url.set_host(Some(&format!("{bare}.invalid")))
+        .map_err(|_| WireError::BadLabel("IDNA conversion".to_string()))?;
+    let host = url
+        .host_str()
+        .and_then(|host| host.strip_suffix(".invalid"))
+        .ok_or_else(|| WireError::BadLabel("IDNA conversion".to_string()))?;
+    let mut labels = Vec::new();
+    let mut wire_len = 1;
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(WireError::BadLabel("label length".to_string()));
+        }
+        wire_len += label.len() + 1;
+        labels.push(label.as_bytes().to_ascii_lowercase());
+    }
+    if wire_len > MAX_NAME_LEN {
+        return Err(WireError::NameTooLong);
+    }
+    Ok(Name(labels))
+}
+
+/// Encode `name` as IDNA wire labels; accept one absolute trailing dot or root.
 pub fn encode_name(name: &str) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::new();
-    for label in name.trim_end_matches('.').split('.') {
-        let raw = encode_label(label)?;
-        if raw.is_empty() || raw.len() >= 64 {
-            return Err(WireError::BadLabel(label.to_string()));
-        }
-        out.push(raw.len() as u8);
-        out.extend_from_slice(&raw);
+    for label in normalize_name(name)?.0 {
+        out.push(label.len() as u8);
+        out.extend_from_slice(&label);
     }
     out.push(0);
     Ok(out)
 }
 
-/// Python `label.encode("idna")`: ASCII passes through, non-ASCII is
-/// punycode-mapped. The `idna` crate is not a dependency here, so a non-ASCII
-/// label is rejected instead. That is a real divergence, not an equivalent
-/// failure: Python would punycode-encode `\u{4f8b}\u{3048}.jp` and resolve it,
-/// whereas this port returns `BadLabel` and the view comes back empty. Names in
-/// a subscription are ASCII in practice, so the path is not exercised -- it is
-/// recorded as a known limitation in workstreams/05.
-fn encode_label(label: &str) -> Result<Vec<u8>, WireError> {
-    if label.is_ascii() {
-        Ok(label.as_bytes().to_vec())
-    } else {
-        Err(WireError::BadLabel(label.to_string()))
-    }
+/// Return the same canonical ASCII name used in questions, for cache and TLS identity.
+pub fn canonical_name(name: &str) -> Result<String, WireError> {
+    Ok(normalize_name(name)?.to_text())
 }
 
-/// `ecs_option`: the EDNS Client Subnet option for one address
-/// (`family, source_prefix, scope(0) + the address' leading bytes`).
+/// Encode an ECS option for `address`; `source_prefix` overrides a valid CIDR suffix.
 fn ecs_option(address: &str, source_prefix: u8) -> Result<Vec<u8>, WireError> {
-    let net = address.split('/').next().unwrap_or(address);
-    let ip: std::net::IpAddr = net
-        .parse()
-        .map_err(|_| WireError::BadLabel(address.to_string()))?;
-    let family: u16 = if ip.is_ipv4() { 1 } else { 2 };
-    let packed = match ip {
-        std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
-        std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+    let (address, cidr) = match address.split_once('/') {
+        Some((address, prefix)) => (
+            address,
+            Some(prefix.parse::<u8>().map_err(|_| WireError::InvalidEcs)?),
+        ),
+        None => (address, None),
     };
-    let nbytes = (source_prefix as usize).div_ceil(8);
-    let mut payload = Vec::with_capacity(4 + nbytes);
-    payload.extend_from_slice(&family.to_be_bytes());
-    payload.push(source_prefix);
-    payload.push(0);
-    payload.extend_from_slice(&packed[..nbytes.min(packed.len())]);
-    let mut out = (ECS_OPTION.to_be_bytes()).to_vec();
-    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    out.extend_from_slice(&payload);
+    let ip: IpAddr = address.parse().map_err(|_| WireError::InvalidEcs)?;
+    let (family, mut packed, max_prefix): (u16, Vec<u8>, u8) = match ip {
+        IpAddr::V4(ip) => (1, ip.octets().to_vec(), 32),
+        IpAddr::V6(ip) => (2, ip.octets().to_vec(), 128),
+    };
+    if source_prefix > max_prefix || cidr.is_some_and(|prefix| prefix > max_prefix) {
+        return Err(WireError::InvalidEcs);
+    }
+    packed.truncate(usize::from(source_prefix).div_ceil(8));
+    if !source_prefix.is_multiple_of(8) {
+        if let Some(last) = packed.last_mut() {
+            *last &= 0xff << (8 - source_prefix % 8);
+        }
+    }
+    let mut out = ECS_OPTION.to_be_bytes().to_vec();
+    out.extend_from_slice(&(4 + packed.len() as u16).to_be_bytes());
+    out.extend_from_slice(&family.to_be_bytes());
+    out.extend_from_slice(&[source_prefix, 0]);
+    out.extend_from_slice(&packed);
     Ok(out)
 }
 
-/// `build_query`: one question plus an OPT record carrying the client subnet.
+/// Build one IN A/AAAA question with `qid`, RD, and optional validated ECS.
 pub fn build_query(
     name: &str,
     qtype: u16,
@@ -115,339 +205,615 @@ pub fn build_query(
     ecs_prefix: u8,
     qid: u16,
 ) -> Result<Vec<u8>, WireError> {
-    let has_ecs = ecs_address.is_some();
+    validate_qtype(qtype)?;
     let mut out = Vec::with_capacity(64);
-    out.extend_from_slice(&qid.to_be_bytes());
-    out.extend_from_slice(&FLAG_RD.to_be_bytes());
-    out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
-    out.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
-    out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
-    out.extend_from_slice(&(u16::from(has_ecs)).to_be_bytes()); // ARCOUNT
+    for value in [qid, FLAG_RD, 1, 0, 0, u16::from(ecs_address.is_some())] {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
     out.extend_from_slice(&encode_name(name)?);
     out.extend_from_slice(&qtype.to_be_bytes());
-    out.extend_from_slice(&1u16.to_be_bytes()); // IN
+    out.extend_from_slice(&CLASS_IN.to_be_bytes());
     if let Some(address) = ecs_address {
         let option = ecs_option(address, ecs_prefix)?;
-        out.push(0); // root name
+        out.push(0);
         out.extend_from_slice(&OPT_TYPE.to_be_bytes());
-        out.extend_from_slice(&4096u16.to_be_bytes()); // UDP payload size
-        out.extend_from_slice(&0u32.to_be_bytes()); // extended rcode, no EDNS version
+        out.extend_from_slice(&4096u16.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
         out.extend_from_slice(&(option.len() as u16).to_be_bytes());
         out.extend_from_slice(&option);
     }
     Ok(out)
 }
 
-/// Skip over one (possibly pointer-terminated) name, returning the offset just
-/// past it. Used for the question names and the answer owner names alike: a
-/// pointer is stepped over, never followed -- its target holds a name this
-/// parser does not need, because only the fixed-size fields after it
-/// (type/class/ttl/rdlen and then the A/AAAA rdata) are read. Python has the
-/// same single helper; keeping one here avoids two copies that could drift.
-fn skip_name(data: &[u8], mut offset: usize) -> Option<usize> {
-    for _ in 0..MAX_NAME_JUMPS {
-        let byte = *data.get(offset)?;
-        if byte == 0 {
-            return Some(offset + 1);
-        }
-        if byte & 0xC0 == 0xC0 {
-            // Compression pointer: two bytes, then the record's fixed fields
-            // continue right after the pointer.
-            return data.get(offset + 1).map(|_| offset + 2);
-        }
-        offset += 1 + byte as usize;
+/// Accept supported address `qtype`s or return a fixed, non-sensitive error.
+fn validate_qtype(qtype: u16) -> Result<(), WireError> {
+    match qtype {
+        TYPE_A | TYPE_AAAA => Ok(()),
+        _ => Err(WireError::UnsupportedQuestion),
     }
-    None
 }
 
-/// `parse_ips`: the A/AAAA addresses in the answer section, in order.
+/// Read `length` bytes at `offset`, rejecting overflow and packet truncation.
+fn read_bytes(data: &[u8], offset: usize, length: usize) -> Result<&[u8], WireError> {
+    let end = offset.checked_add(length).ok_or(WireError::Truncated)?;
+    data.get(offset..end).ok_or(WireError::Truncated)
+}
+
+/// Read a big-endian u16 at `offset`, or report a truncated packet.
+fn read_u16(data: &[u8], offset: usize) -> Result<u16, WireError> {
+    let bytes = read_bytes(data, offset, 2)?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+/// Read a big-endian u32 at `offset`, or report a truncated packet.
+fn read_u32(data: &[u8], offset: usize) -> Result<u32, WireError> {
+    let bytes = read_bytes(data, offset, 4)?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// Decode a bounded name at `start`; return its labels and encoded-field end.
 ///
-/// Hardened per workstreams/05: a nonzero RCODE is an error and a packet that
-/// runs short is an error, where Python returned a partial (or empty) list
-/// instead. The remaining Python behaviour is kept: records of any other type
-/// are skipped, and an A/AAAA record whose rdlength is not 4/16 is skipped
-/// rather than failing the whole answer. A name is stepped over, never
-/// dereferenced, so a pointer loop just ends the walk -- see [`skip_name`].
-pub fn parse_ips(data: &[u8]) -> Result<Vec<String>, WireError> {
-    if data.len() < 12 {
-        return Err(WireError::Truncated);
-    }
-    let rcode = u16::from_be_bytes([data[2], data[3]]) & 0x000F;
-    if rcode != 0 {
-        return Err(WireError::Rcode(rcode));
-    }
-    let questions = u16::from_be_bytes([data[4], data[5]]);
-    let answers = u16::from_be_bytes([data[6], data[7]]);
-    let mut offset = 12usize;
-    for _ in 0..questions {
-        offset = skip_name(data, offset).ok_or(WireError::Truncated)?;
-        offset += 4;
-    }
-    let mut ips = Vec::new();
-    for _ in 0..answers {
-        offset = skip_name(data, offset).ok_or(WireError::Truncated)?;
-        if offset + 10 > data.len() {
-            return Err(WireError::Truncated);
+/// `name_offsets` tracks label boundaries across this packet, preventing pointers
+/// into header integers, label interiors, and opaque non-name RDATA.
+fn read_name(
+    data: &[u8],
+    start: usize,
+    field_end: usize,
+    name_offsets: &mut HashSet<usize>,
+) -> Result<(Name, usize), WireError> {
+    let mut cursor = start;
+    let mut boundary = field_end.min(data.len());
+    let mut encoded_end = None;
+    let mut visited = HashSet::new();
+    let mut labels = Vec::new();
+    let mut wire_len = 1;
+    for _ in 0..MAX_NAME_STEPS {
+        if !visited.insert(cursor) {
+            return Err(WireError::CompressionLoop);
         }
-        let rtype = u16::from_be_bytes([data[offset], data[offset + 1]]);
-        let rdlength = u16::from_be_bytes([data[offset + 8], data[offset + 9]]) as usize;
-        offset += 10;
-        let end = offset + rdlength;
-        if end > data.len() {
-            return Err(WireError::Truncated);
-        }
-        let rdata = &data[offset..end];
-        offset = end;
-        match rtype {
-            TYPE_A if rdlength == 4 => ips.push(format!(
-                "{}.{}.{}.{}",
-                rdata[0], rdata[1], rdata[2], rdata[3]
-            )),
-            TYPE_AAAA if rdlength == 16 => {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(rdata);
-                let v6 = std::net::Ipv6Addr::from(octets);
-                ips.push(v6.to_string());
+        let byte = *data
+            .get(cursor)
+            .filter(|_| cursor < boundary)
+            .ok_or(WireError::Truncated)?;
+        name_offsets.insert(cursor);
+        if byte & 0xc0 == 0xc0 {
+            if cursor + 2 > boundary {
+                return Err(WireError::Truncated);
             }
-            _ => {}
+            let target = usize::from(read_u16(data, cursor)? & 0x3fff);
+            // RFC 1035 compression refers to a prior occurrence, never the header.
+            if target < HEADER_LEN || target >= cursor || !name_offsets.contains(&target) {
+                return Err(WireError::InvalidPointer);
+            }
+            encoded_end.get_or_insert(cursor + 2);
+            cursor = target;
+            boundary = data.len();
+            continue;
+        }
+        if byte & 0xc0 != 0 {
+            return Err(WireError::BadLabel("reserved label tag".to_string()));
+        }
+        if byte == 0 {
+            return Ok((Name(labels), encoded_end.unwrap_or(cursor + 1)));
+        }
+        let end = cursor + 1 + usize::from(byte);
+        if end > boundary {
+            return Err(WireError::Truncated);
+        }
+        wire_len += usize::from(byte) + 1;
+        if wire_len > MAX_NAME_LEN {
+            return Err(WireError::NameTooLong);
+        }
+        labels.push(read_bytes(data, cursor + 1, usize::from(byte))?.to_ascii_lowercase());
+        cursor = end;
+    }
+    Err(WireError::CompressionLoop)
+}
+
+/// Header fields retained after validating the message envelope and record budget.
+struct Header {
+    id: u16,
+    rcode: u16,
+    counts: [usize; 3],
+}
+
+/// Validate `data`'s size, flags, question count, and aggregate record count.
+fn read_header(data: &[u8]) -> Result<Header, WireError> {
+    read_bytes(data, 0, HEADER_LEN)?;
+    if data.len() > MAX_DNS_MESSAGE_SIZE {
+        return Err(WireError::MessageTooLarge);
+    }
+    let flags = read_u16(data, 2)?;
+    if flags & 0x8000 == 0 || flags & 0x7800 != 0 || flags & 0x0040 != 0 {
+        return Err(WireError::InvalidResponse("QR/opcode/reserved flags"));
+    }
+    if flags & 0x0200 != 0 {
+        return Err(WireError::InvalidResponse("truncated response flag"));
+    }
+    if read_u16(data, 4)? != 1 {
+        return Err(WireError::QuestionMismatch);
+    }
+    let counts = [
+        usize::from(read_u16(data, 6)?),
+        usize::from(read_u16(data, 8)?),
+        usize::from(read_u16(data, 10)?),
+    ];
+    if counts.iter().sum::<usize>() > MAX_RECORDS {
+        return Err(WireError::RecordLimit);
+    }
+    Ok(Header {
+        id: read_u16(data, 0)?,
+        rcode: flags & 0x000f,
+        counts,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Answer,
+    Authority,
+    Additional,
+}
+
+enum RecordData {
+    Address(IpAddr),
+    Cname(Name),
+    Soa(u32),
+    Opt(u16),
+    Other,
+}
+
+struct Record {
+    owner: Name,
+    rtype: u16,
+    ttl: u32,
+    data: RecordData,
+}
+
+struct Message {
+    answers: Vec<Record>,
+    authority: Vec<Record>,
+    rcode: u16,
+}
+
+/// Treat a high-bit TTL as zero, as required by RFC 2181 section 8.
+fn cache_ttl(ttl: u32) -> u32 {
+    if ttl & 0x8000_0000 != 0 {
+        0
+    } else {
+        ttl
+    }
+}
+
+/// Decode one name RDATA at `start`, requiring it to consume exactly `end`.
+fn read_exact_name(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    name_offsets: &mut HashSet<usize>,
+) -> Result<Name, WireError> {
+    let (name, next) = read_name(data, start, end, name_offsets)?;
+    if next != end {
+        return Err(WireError::InvalidRecord("name RDATA length"));
+    }
+    Ok(name)
+}
+
+/// Read two adjacent names within `end`, updating `name_offsets` and returning their end.
+fn read_name_pair(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    name_offsets: &mut HashSet<usize>,
+) -> Result<usize, WireError> {
+    let (_, next) = read_name(data, start, end, name_offsets)?;
+    let (_, next) = read_name(data, next, end, name_offsets)?;
+    Ok(next)
+}
+
+/// Validate SOA names and five integers, returning min(RR TTL, SOA MINIMUM).
+fn read_soa(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    ttl: u32,
+    name_offsets: &mut HashSet<usize>,
+) -> Result<u32, WireError> {
+    let next = read_name_pair(data, start, end, name_offsets)?;
+    if next + 20 != end {
+        return Err(WireError::InvalidRecord("SOA RDATA length"));
+    }
+    Ok(ttl.min(cache_ttl(read_u32(data, next + 16)?)))
+}
+
+/// Validate TXT's sequence of length-prefixed strings, returning no payload.
+fn validate_txt(data: &[u8]) -> Result<(), WireError> {
+    if data.is_empty() {
+        return Err(WireError::InvalidRecord("empty TXT RDATA"));
+    }
+    let mut offset = 0;
+    while offset < data.len() {
+        offset += 1 + usize::from(data[offset]);
+        if offset > data.len() {
+            return Err(WireError::InvalidRecord("TXT string length"));
         }
     }
-    Ok(ips)
+    Ok(())
+}
+
+/// Decode supported RDATA inside `[start, end)` and validate known record lengths.
+fn read_record_data(
+    data: &[u8],
+    rtype: u16,
+    start: usize,
+    end: usize,
+    ttl: u32,
+    name_offsets: &mut HashSet<usize>,
+) -> Result<RecordData, WireError> {
+    let bytes = read_bytes(data, start, end - start)?;
+    match rtype {
+        TYPE_A => {
+            let octets: [u8; 4] = bytes
+                .try_into()
+                .map_err(|_| WireError::InvalidRecord("A RDATA length"))?;
+            Ok(RecordData::Address(Ipv4Addr::from(octets).into()))
+        }
+        TYPE_AAAA => {
+            let octets: [u8; 16] = bytes
+                .try_into()
+                .map_err(|_| WireError::InvalidRecord("AAAA RDATA length"))?;
+            Ok(RecordData::Address(Ipv6Addr::from(octets).into()))
+        }
+        TYPE_CNAME => Ok(RecordData::Cname(read_exact_name(
+            data,
+            start,
+            end,
+            name_offsets,
+        )?)),
+        TYPE_SOA => Ok(RecordData::Soa(read_soa(
+            data,
+            start,
+            end,
+            ttl,
+            name_offsets,
+        )?)),
+        TYPE_NS | 3 | 4 | 7 | 8 | 9 | 12 | 39 => {
+            read_exact_name(data, start, end, name_offsets)?;
+            Ok(RecordData::Other)
+        }
+        14 | 17 => {
+            if read_name_pair(data, start, end, name_offsets)? != end {
+                return Err(WireError::InvalidRecord("paired-name RDATA length"));
+            }
+            Ok(RecordData::Other)
+        }
+        15 | 18 | 21 | 33 | 36 => {
+            let prefix = if rtype == 33 { 6 } else { 2 };
+            read_exact_name(data, start + prefix, end, name_offsets)?;
+            Ok(RecordData::Other)
+        }
+        16 => {
+            validate_txt(bytes)?;
+            Ok(RecordData::Other)
+        }
+        0 | 251..=255 => Err(WireError::InvalidRecord("reserved or question-only type")),
+        _ => Ok(RecordData::Other),
+    }
+}
+
+/// Validate an ECS response payload's family, prefixes, length, and unused bits.
+fn validate_ecs(data: &[u8]) -> Result<(), WireError> {
+    read_bytes(data, 0, 4)?;
+    let max_prefix = match read_u16(data, 0)? {
+        1 => 32,
+        2 => 128,
+        _ => return Err(WireError::InvalidEcs),
+    };
+    let source_prefix = data[2];
+    if source_prefix > max_prefix || data[3] > max_prefix {
+        return Err(WireError::InvalidEcs);
+    }
+    if data.len() != 4 + usize::from(source_prefix).div_ceil(8) {
+        return Err(WireError::InvalidEcs);
+    }
+    if !source_prefix.is_multiple_of(8) {
+        let unused_mask = (1u8 << (8 - source_prefix % 8)) - 1;
+        if data.last().is_some_and(|last| last & unused_mask != 0) {
+            return Err(WireError::InvalidEcs);
+        }
+    }
+    Ok(())
+}
+
+/// Validate EDNS version/options in `data`, returning the extended RCODE bits.
+fn read_opt(data: &[u8], ttl: u32) -> Result<u16, WireError> {
+    if ttl & 0x00ff_7fff != 0 {
+        return Err(WireError::InvalidRecord("EDNS version or reserved flags"));
+    }
+    let mut offset = 0;
+    let mut has_ecs = false;
+    while offset < data.len() {
+        let code = read_u16(data, offset)?;
+        let length = usize::from(read_u16(data, offset + 2)?);
+        let payload = read_bytes(data, offset + 4, length)?;
+        if code == ECS_OPTION {
+            if has_ecs {
+                return Err(WireError::InvalidRecord("duplicate ECS option"));
+            }
+            validate_ecs(payload)?;
+            has_ecs = true;
+        }
+        offset += 4 + length;
+    }
+    Ok(((ttl >> 24) as u16) << 4)
+}
+
+/// Read one record in `section`, advancing `offset` only after complete validation.
+fn read_record(
+    data: &[u8],
+    offset: &mut usize,
+    section: Section,
+    name_offsets: &mut HashSet<usize>,
+) -> Result<Record, WireError> {
+    let (owner, fields) = read_name(data, *offset, data.len(), name_offsets)?;
+    read_bytes(data, fields, 10)?;
+    let rtype = read_u16(data, fields)?;
+    let class = read_u16(data, fields + 2)?;
+    let raw_ttl = read_u32(data, fields + 4)?;
+    let length = usize::from(read_u16(data, fields + 8)?);
+    let start = fields + 10;
+    let bytes = read_bytes(data, start, length)?;
+    let end = start + length;
+    let ttl = cache_ttl(raw_ttl);
+    let record_data = if rtype == OPT_TYPE {
+        if section != Section::Additional || !owner.0.is_empty() || fields != *offset + 1 {
+            return Err(WireError::InvalidRecord("OPT owner or section"));
+        }
+        RecordData::Opt(read_opt(bytes, raw_ttl)?)
+    } else {
+        if class != CLASS_IN {
+            return Err(WireError::InvalidRecord("non-IN class"));
+        }
+        read_record_data(data, rtype, start, end, ttl, name_offsets)?
+    };
+    *offset = end;
+    Ok(Record {
+        owner,
+        rtype,
+        ttl,
+        data: record_data,
+    })
+}
+
+/// Validate all sections from `offset`; reject duplicate OPT and trailing bytes.
+fn read_message(
+    data: &[u8],
+    header: &Header,
+    mut offset: usize,
+    name_offsets: &mut HashSet<usize>,
+) -> Result<Message, WireError> {
+    let mut message = Message {
+        answers: Vec::new(),
+        authority: Vec::new(),
+        rcode: header.rcode,
+    };
+    let mut has_opt = false;
+    let sections = [Section::Answer, Section::Authority, Section::Additional];
+    for (section, count) in sections.into_iter().zip(header.counts) {
+        for _ in 0..count {
+            let record = read_record(data, &mut offset, section, name_offsets)?;
+            if has_opt && matches!(record.data, RecordData::Opt(_)) {
+                return Err(WireError::InvalidRecord("duplicate OPT record"));
+            }
+            if let RecordData::Opt(rcode) = record.data {
+                has_opt = true;
+                message.rcode |= rcode;
+            }
+            match section {
+                Section::Answer => message.answers.push(record),
+                Section::Authority => message.authority.push(record),
+                Section::Additional => {}
+            }
+        }
+    }
+    if offset != data.len() {
+        return Err(WireError::InvalidResponse("trailing bytes"));
+    }
+    Ok(message)
+}
+
+type Aliases = HashMap<Name, (Name, u32)>;
+
+/// Index answer CNAMEs, rejecting conflicting targets and prohibited owner data.
+fn collect_aliases(records: &[Record]) -> Result<Aliases, WireError> {
+    let mut aliases: Aliases = HashMap::new();
+    for record in records {
+        if let RecordData::Cname(target) = &record.data {
+            let entry = aliases
+                .entry(record.owner.clone())
+                .or_insert_with(|| (target.clone(), record.ttl));
+            if entry.0 != *target {
+                return Err(WireError::InvalidRecord("conflicting CNAME targets"));
+            }
+            entry.1 = entry.1.min(record.ttl);
+        }
+    }
+    if records.iter().any(|record| {
+        !matches!(record.rtype, TYPE_CNAME | 24 | 25 | 30 | 46 | 47)
+            && aliases.contains_key(&record.owner)
+    }) {
+        return Err(WireError::InvalidRecord(
+            "CNAME and other data share an owner",
+        ));
+    }
+    validate_alias_graph(&aliases)?;
+    Ok(aliases)
+}
+
+/// Validate every path in `aliases`, memoizing lengths to bound work linearly.
+fn validate_alias_graph(aliases: &Aliases) -> Result<(), WireError> {
+    let mut lengths = HashMap::new();
+    for owner in aliases.keys() {
+        let mut current = owner;
+        let mut path = Vec::new();
+        let mut seen = HashSet::new();
+        let mut length = 0;
+        while let Some((target, _)) = aliases.get(current) {
+            if let Some(&known_length) = lengths.get(current) {
+                length = known_length;
+                break;
+            }
+            if path.len() >= MAX_CNAME_CHAIN || !seen.insert(current) {
+                return Err(WireError::CnameLoop);
+            }
+            path.push(current);
+            current = target;
+        }
+        for owner in path.into_iter().rev() {
+            length += 1;
+            if length > MAX_CNAME_CHAIN {
+                return Err(WireError::CnameLoop);
+            }
+            lengths.insert(owner.clone(), length);
+        }
+    }
+    Ok(())
+}
+
+/// Follow `question` through `aliases`, returning terminal name, targets, and TTL.
+fn follow_aliases(
+    question: &Name,
+    aliases: &Aliases,
+) -> Result<(Name, Vec<String>, Option<u32>), WireError> {
+    let mut current = question.clone();
+    let mut seen = HashSet::from([current.clone()]);
+    let mut chain = Vec::new();
+    let mut ttl: Option<u32> = None;
+    while let Some((target, alias_ttl)) = aliases.get(&current) {
+        if chain.len() >= MAX_CNAME_CHAIN || !seen.insert(target.clone()) {
+            return Err(WireError::CnameLoop);
+        }
+        ttl = Some(ttl.map_or(*alias_ttl, |ttl| ttl.min(*alias_ttl)));
+        chain.push(target.to_text());
+        current = target.clone();
+    }
+    Ok((current, chain, ttl))
+}
+
+/// Collect terminal `name`'s requested addresses in wire order and their minimum TTL.
+fn collect_addresses(records: &[Record], name: &Name, qtype: u16) -> (Vec<String>, Option<u32>) {
+    let mut ips = Vec::new();
+    let mut seen = HashSet::new();
+    let mut ttl: Option<u32> = None;
+    for record in records {
+        if record.owner != *name || record.rtype != qtype {
+            continue;
+        }
+        if let RecordData::Address(ip) = &record.data {
+            ttl = Some(ttl.map_or(record.ttl, |ttl| ttl.min(record.ttl)));
+            if seen.insert(*ip) {
+                ips.push(ip.to_string());
+            }
+        }
+    }
+    (ips, ttl)
+}
+
+/// Derive a negative TTL from enclosing authority SOAs; absent proof is uncacheable.
+fn negative_ttl(message: &Message, name: &Name) -> Result<u32, WireError> {
+    let ttl = message
+        .authority
+        .iter()
+        .filter(|record| name.is_within(&record.owner))
+        .filter_map(|record| match record.data {
+            RecordData::Soa(ttl) => Some(ttl),
+            _ => None,
+        })
+        .min();
+    if ttl.is_none()
+        && message.rcode == 0
+        && message
+            .authority
+            .iter()
+            .any(|record| record.rtype == TYPE_NS)
+    {
+        return Err(WireError::InvalidResponse(
+            "referral is not a negative answer",
+        ));
+    }
+    Ok(ttl.unwrap_or(0))
+}
+
+/// Build an answer for `question`/`qtype` only after complete message validation.
+fn answer_message(message: Message, question: &Name, qtype: u16) -> Result<DnsAnswer, WireError> {
+    if !matches!(message.rcode, 0 | 3) {
+        return Err(WireError::Rcode(message.rcode));
+    }
+    let aliases = collect_aliases(&message.answers)?;
+    let (terminal, cname_chain, alias_ttl) = follow_aliases(question, &aliases)?;
+    let (ips, address_ttl) = collect_addresses(&message.answers, &terminal, qtype);
+    if message.rcode == 3
+        && message
+            .answers
+            .iter()
+            .any(|record| record.owner == terminal && matches!(record.data, RecordData::Address(_)))
+    {
+        return Err(WireError::InvalidResponse(
+            "NXDOMAIN contains terminal addresses",
+        ));
+    }
+    let negative = ips.is_empty();
+    let ttl = match address_ttl {
+        Some(ttl) => ttl,
+        None => negative_ttl(&message, &terminal)?,
+    };
+    Ok(DnsAnswer {
+        ips,
+        cname_chain,
+        ttl_secs: alias_ttl.map_or(ttl, |alias_ttl| ttl.min(alias_ttl)),
+        negative,
+    })
+}
+
+/// Validate `data` against the sent ID, normalized name, and IN A/AAAA question.
+///
+/// All advertised records must fit and validate. NXDOMAIN/NODATA are successful
+/// negative answers; other RCODEs, referrals, ambiguity, and malformed data fail.
+/// TTL zero is preserved, including negative replies without an enclosing SOA.
+pub fn parse_response(
+    data: &[u8],
+    expected_id: u16,
+    expected_name: &str,
+    expected_qtype: u16,
+) -> Result<DnsAnswer, WireError> {
+    validate_qtype(expected_qtype)?;
+    let header = read_header(data)?;
+    if header.id != expected_id {
+        return Err(WireError::IdMismatch);
+    }
+    let expected_name = normalize_name(expected_name)?;
+    let mut name_offsets = HashSet::new();
+    let (question, next) = read_name(data, HEADER_LEN, data.len(), &mut name_offsets)?;
+    if question != expected_name
+        || read_u16(data, next)? != expected_qtype
+        || read_u16(data, next + 2)? != CLASS_IN
+    {
+        return Err(WireError::QuestionMismatch);
+    }
+    let message = read_message(data, &header, next + 4, &mut name_offsets)?;
+    answer_message(message, &question, expected_qtype)
+}
+
+/// Legacy packet-only wrapper returning IPs after strict structural validation.
+///
+/// Its expected ID/question are inferred from `data`, so it cannot authenticate
+/// a reply to a sent query. Transports must use [`parse_response`] instead.
+pub fn parse_ips(data: &[u8]) -> Result<Vec<String>, WireError> {
+    let header = read_header(data)?;
+    let (name, next) = read_name(data, HEADER_LEN, data.len(), &mut HashSet::new())?;
+    let qtype = read_u16(data, next)?;
+    Ok(parse_response(data, header.id, &name.to_text(), qtype)?.ips)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A DNS response header: rcode 0, one question, `answers` answers.
-    fn header(answers: u16) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&0x1234u16.to_be_bytes());
-        out.extend_from_slice(&0x8180u16.to_be_bytes()); // QR|RD|RA, rcode 0
-        out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
-        out.extend_from_slice(&answers.to_be_bytes()); // ANCOUNT
-        out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
-        out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
-        out
-    }
-
-    /// The question section for one name.
-    fn question(name: &str) -> Vec<u8> {
-        let mut out = encode_name(name).unwrap();
-        out.extend_from_slice(&TYPE_A.to_be_bytes());
-        out.extend_from_slice(&1u16.to_be_bytes()); // IN
-        out
-    }
-
-    /// One answer record: owner name (label form), type IN, ttl 0, rdata.
-    fn answer(name: &str, rtype: u16, rdata: &[u8]) -> Vec<u8> {
-        let mut out = encode_name(name).unwrap();
-        out.extend_from_slice(&rtype.to_be_bytes());
-        out.extend_from_slice(&1u16.to_be_bytes()); // IN
-        out.extend_from_slice(&0u32.to_be_bytes()); // TTL
-        out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-        out.extend_from_slice(rdata);
-        out
-    }
-
-    #[test]
-    fn the_query_carries_rd_a_question_and_the_ecs_option() {
-        let packet =
-            build_query("example.com", TYPE_A, Some("114.114.114.0/24"), 24, 0xBEEF).unwrap();
-        assert_eq!(&packet[0..2], &[0xBE, 0xEF], "the caller's id");
-        assert_eq!(&packet[2..4], &[0x01, 0x00], "RD set");
-        assert_eq!(&packet[4..6], &[0, 1], "one question");
-        assert_eq!(&packet[10..12], &[0, 1], "one additional (the OPT)");
-        let name = encode_name("example.com").unwrap();
-        assert_eq!(&packet[12..12 + name.len()], &name[..]);
-        let qtype_at = 12 + name.len();
-        assert_eq!(&packet[qtype_at..qtype_at + 2], &TYPE_A.to_be_bytes());
-        let opt = &packet[qtype_at + 4..];
-        // OPT record: NAME(root) TYPE(41) CLASS=udpsize TTL RDLEN, then the
-        // EDNS options -- the ECS option is code 8, its payload family,
-        // source prefix, scope(0), then the address' leading bytes.
-        assert_eq!(opt[0], 0, "root name");
-        assert_eq!(&opt[1..3], &OPT_TYPE.to_be_bytes());
-        assert_eq!(&opt[3..5], &4096u16.to_be_bytes(), "UDP payload size");
-        let rdlen = u16::from_be_bytes([opt[9], opt[10]]) as usize;
-        assert_eq!(
-            rdlen, 11,
-            "option header 4 + family 2 + prefix 1 + scope 1 + 3 address bytes"
-        );
-        assert_eq!(
-            &opt[11..13],
-            &ECS_OPTION.to_be_bytes(),
-            "the ECS option code"
-        );
-        assert_eq!(
-            &opt[13..15],
-            &7u16.to_be_bytes(),
-            "the option payload length"
-        );
-        assert_eq!(&opt[15..17], &[0, 1], "family 1 (IPv4)");
-        assert_eq!(opt[17], 24, "source prefix");
-        assert_eq!(opt[18], 0, "scope 0 in a query");
-        assert_eq!(
-            &opt[19..22],
-            &[114, 114, 114],
-            "the first 3 bytes of the address"
-        );
-    }
-
-    #[test]
-    fn a_query_without_ecs_has_no_additional_section() {
-        let packet = build_query("example.com", TYPE_A, None, 24, 1).unwrap();
-        assert_eq!(&packet[10..12], &[0, 0]);
-    }
-
-    #[test]
-    fn a_non_ascii_label_is_rejected() {
-        // A real divergence, not an equivalent failure: Python idna-maps
-        // `例え.jp` to punycode and resolves it; this port returns BadLabel,
-        // so the view comes back empty where Python's would not.
-        // Subscriptions are ASCII in practice (workstreams/05, known
-        // limitation).
-        assert!(encode_name("\u{4f8b}\u{3048}.jp").is_err());
-        assert!(encode_name("example.com").is_ok());
-    }
-
-    #[test]
-    fn parse_ips_reads_a_records_in_order() {
-        let mut packet = header(2);
-        packet.extend(question("a.example"));
-        packet.extend(answer("a.example", TYPE_A, &[1, 2, 3, 4]));
-        packet.extend(answer("b.example", TYPE_A, &[9, 9, 9, 9]));
-        assert_eq!(parse_ips(&packet).unwrap(), vec!["1.2.3.4", "9.9.9.9"]);
-    }
-
-    #[test]
-    fn parse_ips_reads_aaaa_records() {
-        let rdata = [
-            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
-        ];
-        let mut packet = header(1);
-        packet.extend(question("v6.example"));
-        packet.extend(answer("v6.example", TYPE_AAAA, &rdata));
-        assert_eq!(parse_ips(&packet).unwrap(), vec!["2001:db8::1"]);
-    }
-
-    #[test]
-    fn other_record_types_are_skipped() {
-        let mut packet = header(2);
-        packet.extend(question("c.example"));
-        packet.extend(answer("c.example", 5, &[0x61, 0x62, 0x63])); // CNAME
-        packet.extend(answer("c.example", TYPE_A, &[1, 2, 3, 4]));
-        assert_eq!(parse_ips(&packet).unwrap(), vec!["1.2.3.4"]);
-    }
-
-    #[test]
-    fn a_nonzero_rcode_is_an_error_not_an_empty_answer() {
-        let mut packet = header(0);
-        packet[3] = 0x83; // RCODE 3 = NXDOMAIN
-        packet.extend(question("gone.example"));
-        assert_eq!(parse_ips(&packet), Err(WireError::Rcode(3)));
-    }
-
-    #[test]
-    fn truncated_packets_are_errors() {
-        assert_eq!(parse_ips(&[]), Err(WireError::Truncated));
-        assert_eq!(parse_ips(&[0u8; 11]), Err(WireError::Truncated));
-    }
-
-    #[test]
-    fn a_self_pointing_pointer_terminates_rather_than_hanging() {
-        // The question name is a pointer to itself. The skipper never
-        // dereferences pointers -- it steps past the two bytes, and the loop is
-        // bounded by MAX_NAME_JUMPS -- so a malicious self-loop costs a single
-        // step and the walk then ends on the packet's own bounds. Python's
-        // unbounded loop reached the same place via its buffer check.
-        let mut packet = vec![0u8; 16];
-        packet[4..6].copy_from_slice(&1u16.to_be_bytes());
-        packet[12] = 0xC0;
-        packet[13] = 0x0C; // pointer to offset 12 -- itself
-        assert_eq!(parse_ips(&packet), Ok(vec![]));
-    }
-
-    #[test]
-    fn an_answer_owner_name_may_be_a_pointer_into_the_question() {
-        let question_name = encode_name("x.example").unwrap();
-        let mut packet = header(1);
-        packet.extend(&question_name);
-        packet.extend_from_slice(&TYPE_A.to_be_bytes());
-        packet.extend_from_slice(&1u16.to_be_bytes());
-        // Answer: owner name is a pointer to offset 12 (the question name).
-        packet.push(0xC0);
-        packet.push(12);
-        packet.extend_from_slice(&TYPE_A.to_be_bytes());
-        packet.extend_from_slice(&1u16.to_be_bytes());
-        packet.extend_from_slice(&0u32.to_be_bytes());
-        packet.extend_from_slice(&4u16.to_be_bytes());
-        packet.extend_from_slice(&[7, 7, 7, 7]);
-        assert_eq!(parse_ips(&packet).unwrap(), vec!["7.7.7.7"]);
-    }
-
-    /// The committed binary fixtures (regenerate with
-    /// `python tools/make_dns_fixtures.py`). They pin the byte-level shapes
-    /// workstreams/05 asks for -- a well-formed answer behind a compression
-    /// pointer, an AAAA answer, a CNAME to skip, NXDOMAIN, a lying rdlength,
-    /// a self-pointing question name, a bad label length, and a packet with no
-    /// header -- so a parser change that shifts an offset fails here rather
-    /// than in production. The lying rdlength and the bad label are the two
-    /// shapes the inline tests above do not cover.
-    mod fixtures {
-        use super::*;
-
-        const A_ANSWER: &[u8] = include_bytes!("../fixtures/dns-packets/a-answer-compressed.bin");
-        const AAAA_ANSWER: &[u8] = include_bytes!("../fixtures/dns-packets/aaaa-answer.bin");
-        const CNAME_THEN_A: &[u8] = include_bytes!("../fixtures/dns-packets/cname-then-a.bin");
-        const NXDOMAIN: &[u8] = include_bytes!("../fixtures/dns-packets/nxdomain.bin");
-        const TRUNCATED_ANSWER: &[u8] =
-            include_bytes!("../fixtures/dns-packets/truncated-answer.bin");
-        const POINTER_LOOP: &[u8] =
-            include_bytes!("../fixtures/dns-packets/pointer-loop-question.bin");
-        const BAD_LABEL: &[u8] = include_bytes!("../fixtures/dns-packets/bad-label-overrun.bin");
-        const SHORT_HEADER: &[u8] = include_bytes!("../fixtures/dns-packets/short-header.bin");
-
-        #[test]
-        fn a_well_formed_answer_parses_through_its_pointer() {
-            assert_eq!(parse_ips(A_ANSWER).unwrap(), vec!["1.2.3.4"]);
-        }
-
-        #[test]
-        fn an_aaaa_answer_parses() {
-            assert_eq!(parse_ips(AAAA_ANSWER).unwrap(), vec!["2001:db8::1"]);
-        }
-
-        #[test]
-        fn a_cname_is_skipped_to_reach_the_a_record_behind_it() {
-            assert_eq!(parse_ips(CNAME_THEN_A).unwrap(), vec!["1.2.3.4"]);
-        }
-
-        #[test]
-        fn nxdomain_is_an_error() {
-            assert_eq!(parse_ips(NXDOMAIN), Err(WireError::Rcode(3)));
-        }
-
-        #[test]
-        fn a_lying_rdlength_is_an_error_not_a_partial_answer() {
-            assert_eq!(parse_ips(TRUNCATED_ANSWER), Err(WireError::Truncated));
-        }
-
-        #[test]
-        fn a_self_pointing_question_name_terminates() {
-            assert_eq!(parse_ips(POINTER_LOOP), Ok(vec![]));
-        }
-
-        #[test]
-        fn a_bad_label_length_runs_off_the_end_and_is_rejected() {
-            // 0x41 is neither a label (max 63) nor a pointer (0xC0 mask), so
-            // the walk claims a 65-byte label and leaves the packet.
-            assert_eq!(parse_ips(BAD_LABEL), Err(WireError::Truncated));
-        }
-
-        #[test]
-        fn a_packet_shorter_than_the_header_is_an_error() {
-            assert_eq!(parse_ips(SHORT_HEADER), Err(WireError::Truncated));
-        }
-    }
-}
+mod tests;

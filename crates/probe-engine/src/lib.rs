@@ -12,13 +12,31 @@
 pub mod collect;
 pub mod limits;
 pub mod measure;
+pub mod network;
+pub mod preflight;
+pub mod publish;
 pub mod round;
+pub mod round_lock;
+pub mod scheduler;
+pub mod verify;
 
 pub use collect::{backend_from_env, collect, Collected};
 
-pub use limits::{Gate, Job, LimitError, Limits, Permit, RoundCtx};
+pub use limits::{Gate, Job, LimitError, Limits, Permit, RoundCtx, RoundDeadline};
 pub use measure::{Dialer, TestOne, TestPolicy, TERMINAL_REASONS};
+pub use preflight::{make_testable, KernelValidator, MihomoValidator, PreflightVerdict, MAX_PRUNE};
+pub use publish::{
+    publish_export, publish_round, push_round_exports, rollback_export, select_source_exports,
+    ExportDrop, ExportDropReason, PublishDecision, PublishError, PublishOutcome, PublishPolicy,
+    PublishRequest, PublishRoundOutcome, PublishRoundRequest, PushRecord, SkipReason, SourceExport,
+    SourcePublication,
+};
 pub use round::{
     run_round, run_round_with_ctx, ControllerPrep, KernelPrep, KernelState, Ledger, NodeTester,
     NodeVerdict, NotPrepared, RoundCounts, RoundOutcome, RoundPlan, RoundSettings, Verdict,
+};
+pub use round_lock::RoundLock;
+pub use scheduler::{
+    decide, parse_stored_instant, reap_orphan_rounds, OrphanLedger, SchedulerDecision, ORPHAN_NOTE,
+    STARTUP_GRACE,
 };

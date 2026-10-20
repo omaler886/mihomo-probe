@@ -24,7 +24,7 @@ use serde_json::Value;
 
 /// Parse a Clash document and return its `proxies` entries.
 pub fn parse_proxies(text: &str) -> DomainResult<Vec<Value>> {
-    let parsed: Value = serde_yaml::from_str(text)
+    let parsed: Value = serde_norway::from_str(text)
         .map_err(|err| DomainError::Config(format!("subscription is not valid YAML: {err}")))?;
     // Python: `parsed.get("proxies")` where `parsed` may be any shape; a
     // non-mapping document has no `proxies` and falls through to the same
@@ -41,6 +41,60 @@ pub fn parse_proxies(text: &str) -> DomainResult<Vec<Value>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Hostile subscription bodies must not panic and must never yield a
+    /// non-object entry.
+    ///
+    /// Deterministic (fixed seed, fixed mutation schedule); the libFuzzer
+    /// variant is documented in TEST_REPORT_RUST.md.
+    #[test]
+    fn subscription_parsing_survives_random_input() {
+        const SEEDS: [&str; 4] = [
+            "proxies:\n  - {name: a, type: ss}\n  - not-a-mapping\n",
+            "proxies: []\n",
+            "proxies: 3\n",
+            "",
+        ];
+        let mut state = 0xfeed_face_2468_1357u64;
+        let mut next = |bound: usize| -> usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % (bound.max(1) as u64)) as usize
+        };
+        for iteration in 0..1_000 {
+            let seed = SEEDS[next(SEEDS.len())];
+            let mut bytes = seed.as_bytes().to_vec();
+            match next(4) {
+                0 => {
+                    if !bytes.is_empty() {
+                        let at = next(bytes.len());
+                        bytes[at] = next(256) as u8;
+                    }
+                }
+                1 => {
+                    let cut = next(bytes.len() + 1);
+                    bytes.truncate(cut);
+                }
+                2 => {
+                    let at = next(bytes.len() + 1);
+                    bytes.insert(at, b':');
+                }
+                _ => bytes.extend_from_slice(&[0x00, 0x09, b'-', b' ', 0xc3, 0x28]),
+            }
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let outcome = std::panic::catch_unwind(|| parse_proxies(&text));
+            let Ok(result) = outcome else {
+                panic!("parse_proxies panicked on iteration {iteration} with {text:?}");
+            };
+            if let Ok(proxies) = result {
+                assert!(
+                    proxies.iter().all(|proxy| proxy.is_object()),
+                    "iteration {iteration}: a non-object entry escaped from {text:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_clash_document_yields_its_proxies() {

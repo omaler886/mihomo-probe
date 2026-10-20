@@ -15,7 +15,7 @@
 //!   learned this the hard way (`engine._orig_fp`); the fingerprint therefore
 //!   travels on the entry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -99,7 +99,15 @@ pub struct Prepared {
 /// parse it.
 pub fn prepare(entries: &[RawEntry], keep_dialer: &[String], strip_ech: bool) -> Prepared {
     let mut out = Prepared::default();
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    // Pool aliases must stay available even when a subscription chose the same name.
+    let mut reserved: HashSet<String> = entries
+        .iter()
+        .filter(|entry| entry.role == Role::Front)
+        .filter_map(|entry| entry.proxy.get("name").and_then(Value::as_str))
+        .filter(|name| keep_dialer.iter().any(|dialer| dialer.as_str() == *name))
+        .map(str::to_string)
+        .collect();
+    let mut seen: HashMap<String, usize> = reserved.iter().map(|name| (name.clone(), 1)).collect();
 
     for entry in entries {
         let mut proxy = serde_json::Map::new();
@@ -162,7 +170,11 @@ pub fn prepare(entries: &[RawEntry], keep_dialer: &[String], strip_ech: bool) ->
         } else {
             base
         };
-        let name = unique_name(&mut seen, &base);
+        let name = if entry.role == Role::Front && reserved.remove(&base) {
+            base
+        } else {
+            unique_name(&mut seen, &base)
+        };
         proxy.insert("name".to_string(), Value::from(name.clone()));
 
         out.nodes.push(PreparedNode {
@@ -201,10 +213,13 @@ pub fn prepare(entries: &[RawEntry], keep_dialer: &[String], strip_ech: bool) ->
 /// ledger's `dropped` reason differs. Recorded in workstreams/13.
 fn coerce_port(value: Option<&Value>) -> Option<i64> {
     match value? {
-        Value::Number(number) => number
-            .as_i64()
-            // Python `int(443.7)` truncates toward zero.
-            .or_else(|| number.as_f64().map(|f| f as i64)),
+        Value::Number(number) => number.as_i64().or_else(|| {
+            // Python `int(443.7)` truncates toward zero. `.nan`/`.inf` parse
+            // as floats; Python raises ValueError, while Rust's saturating
+            // cast would turn NaN into port 0 and infinity into 65535 --
+            // both garbage a node should be dropped for, not dialed against.
+            number.as_f64().filter(|f| f.is_finite()).map(|f| f as i64)
+        }),
         Value::String(text) => text.trim().parse::<i64>().ok(),
         // bool / array / object / null: Python raises or passes garbage on.
         _ => None,
@@ -410,6 +425,46 @@ mod tests {
     }
 
     #[test]
+    fn a_nan_or_infinite_port_never_reaches_the_kernel() {
+        // serde_json::Value cannot represent NaN/infinity, so serde_norway
+        // drops the `port` key entirely and prepare drops the node as
+        // "missing port" -- the same safe outcome as Python's ValueError
+        // ("bad port"), never a saturating cast to 0/65535. `coerce_port`
+        // additionally filters non-finite floats, so a future switch to a
+        // Value type that CAN represent them stays safe too.
+        for bad in [".nan", "-.nan", ".inf", "-.inf"] {
+            let yaml = format!(
+                "- name: b\n  type: ss\n  server: example.com\n  port: {bad}\n  cipher: a\n  password: b\n"
+            );
+            let parsed: Vec<Value> = serde_norway::from_str(&yaml).expect("yaml parses to a list");
+            let entries = parsed
+                .into_iter()
+                .enumerate()
+                .map(|(i, proxy)| RawEntry {
+                    source: "air".into(),
+                    index: i,
+                    name: "b".into(),
+                    proxy,
+                    fingerprint: "fp".into(),
+                    category: "direct".into(),
+                    role: Role::default(),
+                    front: None,
+                })
+                .collect::<Vec<_>>();
+            let prepared = prepare(&entries, &[], false);
+            assert!(
+                prepared.nodes.is_empty(),
+                "port {bad} must not reach the kernel"
+            );
+            assert!(
+                prepared.dropped[0].why == "missing port" || prepared.dropped[0].why == "bad port",
+                "port {bad} must be dropped, not coerced (got {:?})",
+                prepared.dropped[0].why
+            );
+        }
+    }
+
+    #[test]
     fn a_blank_name_falls_back_to_the_entry_index() {
         let proxy = json!({"name": "   ", "type": "ss", "server": "1.1.1.1", "port": 1});
         let prepared = prepare(&[entry("   ", 7, proxy)], &[], false);
@@ -430,5 +485,23 @@ mod tests {
             "the transformed copy must NOT reproduce the identity -- that is \
              exactly why the entry carries it"
         );
+    }
+
+    /// A subscription alias cannot steal the reserved dialer identity of a real front.
+    #[test]
+    fn front_aliases_survive_upstream_name_collisions() {
+        let direct = entry("__FRONT0__", 0, ss("__FRONT0__", "192.0.2.1", json!(443)));
+        let mut front = entry("real front", 1, ss("__FRONT0__", "192.0.2.2", json!(443)));
+        front.role = Role::Front;
+        let mut chained = entry("landing", 2, ss("landing", "192.0.2.3", json!(443)));
+        chained.proxy["dialer-proxy"] = json!("__FRONT0__");
+        let output = prepare(&[direct, front, chained], &["__FRONT0__".into()], false);
+        assert_ne!(output.nodes[0].proxy_name, "__FRONT0__");
+        assert_eq!(output.nodes[1].proxy_name, "__FRONT0__");
+        assert_eq!(
+            output.nodes[2].proxy["dialer-proxy"],
+            output.nodes[1].proxy_name
+        );
+        assert_eq!(output.nodes[1].original_name, "real front");
     }
 }

@@ -57,7 +57,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 rusqlite = { version = "0.32", features = ["bundled"] }
 # probe-source parses Sub-Store's ClashMeta output. See its `subscription`
 # module for the YAML-1.1-vs-1.2 caveat against PyYAML.
-serde_yaml = "0.9"
+serde_norway = "0.9"
 # Node identity: sha256 of the canonical connection-parameter JSON, first 8
 # bytes. Must match `mihomo_test.core.fingerprint_proxy` byte for byte.
 sha2 = "0.10"

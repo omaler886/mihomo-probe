@@ -27,7 +27,7 @@ pub mod prepare;
 pub mod source;
 pub mod subscription;
 
-pub use fetch::{content_digest, Fetcher, SubAdmin, SubStoreClient};
+pub use fetch::{content_digest, Fetcher, SubAdmin, SubEntry, SubStoreClient};
 pub use identity::{fingerprint_proxy, variant_fingerprint, DROP_FIELDS, REQUIRED};
 pub use prepare::{prepare, DroppedNode, PreparedNode, RawEntry, Role};
 pub use source::{collect_entries, FetchedSource, CAT_CHAIN, CAT_DIRECT, CAT_RELAY};

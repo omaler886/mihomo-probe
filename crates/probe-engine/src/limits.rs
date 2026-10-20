@@ -141,6 +141,16 @@ pub struct Job {
     /// kernel name. `None` there means the pool was empty: the runner fails
     /// the job `front_dead` without dialling it.
     pub front: Option<String>,
+    /// Original subscription metadata, not the temporary per-IP kernel alias.
+    pub display: String,
+    pub original_server: Option<String>,
+    pub protocol: Option<String>,
+    /// Destination endpoint; separate from the front address used by the gate.
+    pub test_ip: Option<String>,
+    /// Some DNS views failed, so a negative observation cannot prove node death.
+    pub dns_incomplete: bool,
+    /// A classified exclusion is recorded without opening a proxy connection.
+    pub excluded_reason: Option<String>,
 }
 
 impl Job {
@@ -151,14 +161,22 @@ impl Job {
         variant: impl Into<String>,
         server_ip: impl Into<String>,
     ) -> Self {
+        let proxy_name = proxy_name.into();
+        let server_ip = server_ip.into();
         Self {
             source_id: source_id.into(),
             fingerprint: fingerprint.into(),
-            proxy_name: proxy_name.into(),
+            display: proxy_name.clone(),
+            original_server: Some(server_ip.clone()),
+            proxy_name,
             variant: variant.into(),
-            server_ip: server_ip.into(),
+            server_ip,
             role: probe_source::Role::Direct,
             front: None,
+            protocol: None,
+            test_ip: None,
+            dns_incomplete: false,
+            excluded_reason: None,
         }
     }
 
@@ -167,6 +185,19 @@ impl Job {
     pub fn with_role(mut self, role: probe_source::Role, front: Option<String>) -> Self {
         self.role = role;
         self.front = front;
+        self
+    }
+
+    /// Attach original name/server/protocol metadata for ledger and export attribution.
+    pub fn with_origin(
+        mut self,
+        display: String,
+        server: Option<String>,
+        protocol: Option<String>,
+    ) -> Self {
+        self.display = display;
+        self.original_server = server;
+        self.protocol = protocol;
         self
     }
 }
@@ -193,6 +224,27 @@ impl Permit {
 }
 
 type Registry = Mutex<HashMap<String, Arc<Semaphore>>>;
+
+/// Cancels a round after its total budget; dropping the guard retires the timer.
+pub struct RoundDeadline(tokio::task::JoinHandle<()>);
+
+impl RoundDeadline {
+    /// Arm `ctx` for `budget`, returning an ownership guard that must span the pipeline.
+    pub fn arm(ctx: &RoundCtx, budget: std::time::Duration) -> Self {
+        let cancel = ctx.cancel_token().clone();
+        let deadline = tokio::time::Instant::now() + budget;
+        Self(tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            cancel.cancel();
+        }))
+    }
+}
+
+impl Drop for RoundDeadline {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// The four semaphores, shared by every task in a round.
 #[derive(Debug)]

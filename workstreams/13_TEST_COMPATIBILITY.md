@@ -84,15 +84,16 @@ CI 需归档：JUnit XML、上述 JSON 汇总、覆盖率文件、Benchmark 基�
 Golden Test 差异。Rust 侧落地方式（`cargo test --format json` / nextest JUnit 输出）在 R10 定。
 
 ## 已知口径差异（双跑对账时按此折算）
-- R6（06）：轮行 `total` Python 按 (source, fp) 去重 vs Rust 按变体数；
-  `results` 行两侧都按变体写。
+- R6（06）计数差异已于 2026-10-09 修正：两侧轮行 `total/ok/failed`
+  均按 (source, fp) 去重；`results` 仍逐变体记录，明细数量不等于节点数量。
 - R7（03）：收敛折叠暂不更新 `nodes.proto` / `server` / `country` /
   `ip_alive` / `ip_total` 展示列（等 R4 per-address 变体与 ipmap 切片落地），
   死活状态机列（status/consec_fail/total_*/last_*）已对齐；折叠口径 =
   `_score_bucket` 的 `domain_pass="any"`（任一变体活即活、活者最小延迟、
   category 跟随通过变体），`domain_pass="all"` 到 R4 再接。
-- R7（ADR-0005）：`rounds.inconclusive` 列为 Rust 侧新增；Python 读方将其
-  当作「ok=0 的完成轮」——suspect 护栏因此保守触发，方向安全，无需改 Python。
+- R7（ADR-0005）：`rounds.inconclusive` 列仍由 Rust 迁移添加；Python 读方
+  已于 2026-10-09 增加可选列检测，并跳过异常轮次。此前将其描述为
+  「自然回溯、保守兼容」不准确，旧实现会接受异常轮次的 0 或部分计数。
 
 ## 待办清单
 - [x] R0：基线记录

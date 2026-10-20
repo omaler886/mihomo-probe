@@ -8,10 +8,12 @@ actually observed, then assert the property that rules it out.
 Run with the rest of the offline suite:
     python3 -m unittest discover -s tests
 """
+import http.client
 import json
 import os
 import re
 import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -333,6 +335,23 @@ class _LiveServer:
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read().decode("utf-8"), dict(exc.headers)
 
+    def raw_post(self, path, body=b"", headers=None, end_body=True):
+        """Send exact body/framing bytes; return status, JSON and headers."""
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            connection.putrequest("POST", path)
+            connection.putheader("X-Auth-Token", self.cfg["auth"]["token"])
+            for name, value in headers or [("Content-Length", str(len(body)))]:
+                connection.putheader(name, value)
+            connection.endheaders(body)
+            # EOF bounds malformed-length tests even against the old reader.
+            if end_body:
+                connection.sock.shutdown(socket.SHUT_WR)
+            response = connection.getresponse()
+            return response.status, json.loads(response.read()), dict(response.headers)
+        finally:
+            connection.close()
+
     def close(self):
         self.httpd.shutdown()
         self.httpd.server_close()
@@ -575,6 +594,84 @@ class HttpSurfaceTest(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIn("nodes", json.loads(body))
 
+    def test_invalid_json_never_starts_a_round(self):
+        """Malformed/non-object bodies return 400 without invoking the engine."""
+        with unittest.mock.patch.object(server, "run_in_background") as start:
+            for body in (b"{", b"\xff", b"[]", b"null", b'"text"', b"true",
+                         b'{"value":NaN}', b'{"value":Infinity}', b'{"value":-Infinity}'):
+                with self.subTest(body=body):
+                    code, _, headers = self.srv.raw_post("/api/run", body)
+                    self.assertEqual(code, 400)
+                    self.assertEqual(headers.get("Connection"), "close")
+            start.assert_not_called()
+
+    def test_invalid_body_framing_never_starts_a_round(self):
+        """Reject ambiguous or negative lengths instead of reading until EOF."""
+        cases = [
+            [("Content-Length", "-1")],
+            [("Content-Length", "invalid")],
+            [("Content-Length", "2,2")],
+            [("Content-Length", "")],
+            [("Content-Length", "2"), ("Content-Length", "2")],
+            [("Content-Length", "2"), ("Transfer-Encoding", "chunked")],
+            [("Transfer-Encoding", "chunked")],
+        ]
+        with unittest.mock.patch.object(server, "run_in_background") as start:
+            for headers in cases:
+                with self.subTest(headers=headers):
+                    code, _, response_headers = self.srv.raw_post("/api/run", b"{}", headers)
+                    self.assertEqual(code, 400)
+                    self.assertEqual(response_headers.get("Connection"), "close")
+            start.assert_not_called()
+
+    def test_an_oversized_body_is_rejected_before_reading(self):
+        """A declared oversized request returns 413 without waiting for its body."""
+        with unittest.mock.patch.object(server, "run_in_background") as start:
+            code, _, _ = self.srv.raw_post(
+                "/api/run", headers=[("Content-Length", str(100 * 1024 * 1024))],
+                end_body=False)
+        self.assertEqual(code, 413)
+        start.assert_not_called()
+
+    def test_a_truncated_body_is_not_an_empty_command(self):
+        """EOF before Content-Length returns 400, never an implicit run request."""
+        with unittest.mock.patch.object(server, "run_in_background") as start:
+            code, _, _ = self.srv.raw_post(
+                "/api/run", b"{}", [("Content-Length", "10")])
+        self.assertEqual(code, 400)
+        start.assert_not_called()
+
+    def test_an_empty_body_remains_a_valid_command(self):
+        """Keep the established POST-without-options command compatible."""
+        with unittest.mock.patch.object(server, "run_in_background") as start:
+            code, body, _ = self.srv.raw_post("/api/run")
+        self.assertEqual(code, 200)
+        self.assertTrue(body["started"])
+        start.assert_called_once()
+
+    def test_a_stalled_body_times_out_without_starting_a_round(self):
+        """An authenticated connection cannot hold a reader indefinitely."""
+        with unittest.mock.patch.object(server, "BODY_TIMEOUT_SECONDS", 0.05), \
+                unittest.mock.patch.object(server, "run_in_background") as start:
+            code, _, headers = self.srv.raw_post(
+                "/api/run", headers=[("Content-Length", "2")], end_body=False)
+        self.assertEqual(code, 408)
+        self.assertEqual(headers.get("Connection"), "close")
+        start.assert_not_called()
+
+    def test_a_config_save_response_keeps_credentials_masked(self):
+        """Persist submitted secrets but do not echo them back with every setting."""
+        with unittest.mock.patch.object(engine, "drop_manual_front_sub"):
+            code, payload = self.srv.post(
+                f"/api/config?token={self.ADMIN}",
+                {"substore": {"backend": "https://sub.example.invalid/dummy-private-path"}})
+        self.assertEqual(code, 200)
+        self.assertNotIn(self.ADMIN, json.dumps(payload))
+        self.assertNotIn("dummy-private-path", json.dumps(payload))
+        self.assertEqual(
+            self.srv.stored_config()["substore"]["backend"],
+            "https://sub.example.invalid/dummy-private-path")
+
 
 class RoundLockTest(unittest.TestCase):
     """`BUSY` must be acquired atomically, and released only by its owner."""
@@ -624,6 +721,112 @@ class RoundLockTest(unittest.TestCase):
                     break
                 time.sleep(0.05)
             self.assertFalse(server.BUSY.locked())
+
+    def test_a_worker_that_cannot_start_releases_the_lock(self):
+        """Thread construction/start failure must leave later rounds admissible."""
+        for failure in ("construct", "start"):
+            with self.subTest(failure=failure):
+                lock = threading.Lock()
+                with unittest.mock.patch.object(server, "BUSY", lock), \
+                        unittest.mock.patch.object(server.threading, "Thread") as worker:
+                    if failure == "construct":
+                        worker.side_effect = RuntimeError("thread unavailable")
+                    else:
+                        worker.return_value.start.side_effect = RuntimeError("thread unavailable")
+                    with self.assertRaisesRegex(RuntimeError, "thread unavailable"):
+                        server.run_in_background(self.cfg)
+                    self.assertFalse(lock.locked())
+
+
+class SchedulerStartupTest(unittest.TestCase):
+    """Use a fake clock to prove that an empty ledger eventually gets a round."""
+
+    def run_schedule(self, last=None, enabled=True, busy=False):
+        """Simulate three 20-second polls; return scheduled calls and their time."""
+        stop = threading.Event()
+        clock = [1000.0]
+        calls = []
+        lock = threading.Lock()
+        if busy:
+            lock.acquire()
+
+        def advance(_seconds):
+            """Advance the simulated poll clock; stop after the third poll."""
+            clock[0] += 20
+            if clock[0] >= 1060:
+                stop.set()
+
+        def start(_cfg, **kwargs):
+            """Record one simulated launch and stop the bounded test loop."""
+            calls.append((clock[0], kwargs))
+            stop.set()
+
+        cfg = {"schedule": {"enabled": enabled, "interval_minutes": 1}}
+        with unittest.mock.patch.object(server._State, "cfg", cfg), \
+                unittest.mock.patch.object(server, "_next_run", {"at": None}), \
+                unittest.mock.patch.object(server, "BUSY", lock), \
+                unittest.mock.patch.object(engine, "reap_orphan_rounds"), \
+                unittest.mock.patch.object(db, "last_round", return_value=last), \
+                unittest.mock.patch.object(server, "run_in_background", side_effect=start), \
+                unittest.mock.patch.object(server.time, "time", side_effect=lambda: clock[0]), \
+                unittest.mock.patch.object(stop, "wait", side_effect=advance):
+            server.scheduler_loop(stop)
+        return calls
+
+    def test_the_first_deadline_does_not_move_with_each_poll(self):
+        """A new deployment runs at the first poll after its five-second grace."""
+        self.assertEqual(self.run_schedule(), [(1020.0, {"trigger": "schedule"})])
+
+    def test_an_invalid_previous_timestamp_uses_the_startup_deadline(self):
+        """An unreadable legacy timestamp must not starve scheduling forever."""
+        self.assertEqual(
+            self.run_schedule({"started_at": "invalid"}),
+            [(1020.0, {"trigger": "schedule"})])
+
+    def test_a_disabled_or_busy_scheduler_does_not_start(self):
+        """Startup handling must still respect the enable switch and round lock."""
+        self.assertEqual(self.run_schedule(enabled=False), [])
+        self.assertEqual(self.run_schedule(busy=True), [])
+
+    def test_an_existing_round_keeps_its_interval(self):
+        """A persisted round at t=990 is due at t=1050, not at startup+5."""
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(990))
+        self.assertEqual(self.run_schedule({"started_at": stamp}), [])
+
+
+class SharedRoundBaselineTest(unittest.TestCase):
+    """Python must respect Rust's optional round-level inconclusive marker."""
+
+    def test_inconclusive_rounds_never_replace_a_valid_baseline(self):
+        """Skip both empty and partially measured Rust rounds in a shared ledger."""
+        for alive in (0, 2):
+            with self.subTest(alive=alive), _TempRoot():
+                previous = db.start_round("test")
+                db.finish_round(previous, ok=10)
+                db.execute("ALTER TABLE rounds ADD COLUMN inconclusive INTEGER NOT NULL DEFAULT 0")
+                interrupted = db.start_round("rust")
+                db.finish_round(interrupted, ok=alive, inconclusive=1)
+                self.assertEqual(engine._previous_alive_count(), 10)
+
+    def test_a_legacy_ledger_keeps_its_schema_and_guard_behavior(self):
+        """No Rust column is needed to skip suspect and unfinished Python rounds."""
+        with _TempRoot():
+            previous = db.start_round("test")
+            db.finish_round(previous, ok=10)
+            suspect = db.start_round("test")
+            db.finish_round(suspect, ok=1, suspect=1)
+            db.start_round("still-running")
+            self.assertEqual(engine._previous_alive_count(), 10)
+            columns = {row["name"] for row in db.query("PRAGMA table_info(rounds)")}
+            self.assertNotIn("inconclusive", columns)
+
+    def test_only_inconclusive_history_has_no_baseline(self):
+        """With no trustworthy completed round, return zero without trusting counts."""
+        with _TempRoot():
+            round_id = db.start_round("rust")
+            db.execute("ALTER TABLE rounds ADD COLUMN inconclusive INTEGER NOT NULL DEFAULT 0")
+            db.finish_round(round_id, ok=2, inconclusive=1)
+            self.assertEqual(engine._previous_alive_count(), 0)
 
 
 class WatchdogTest(unittest.TestCase):
@@ -1388,6 +1591,27 @@ class StatusRedactionTest(unittest.TestCase):
         out = server.redacted_config(self.cfg)
         self.assertEqual(out["substore"]["backend"], "http://127.0.0.1:3000")
 
+    def test_backend_credentials_never_survive_in_the_authority(self):
+        """Keep only scheme/host/port; hide userinfo, path, query and fragment."""
+        cases = [
+            ("https://operator:dummy-password@sub.example.invalid",
+             "https://sub.example.invalid/***"),
+            ("https://sub.example.invalid#dummy-fragment",
+             "https://sub.example.invalid/***"),
+            ("https://operator:dummy-password@[::1]:3000/private?key=dummy#fragment",
+             "https://[::1]:3000/***"),
+        ]
+        for backend, expected in cases:
+            with self.subTest(backend=backend):
+                self.assertEqual(server._mask_backend(backend), expected)
+
+    def test_an_invalid_backend_is_fully_masked(self):
+        """Malformed/non-HTTP URLs must not fall back to echoing the input."""
+        for backend in ("not-a-url", "file://host/private", "https://[bad",
+                        "https://host:invalid", "https://user@/"):
+            with self.subTest(backend=backend):
+                self.assertEqual(server._mask_backend(backend), cfgmod.SECRET_MASK)
+
 
 class MaskablePatchTest(unittest.TestCase):
     """A save that round-trips the masked payload must not write the mask.
@@ -1422,6 +1646,24 @@ class MaskablePatchTest(unittest.TestCase):
             {"substore": {"backend": cfgmod.SECRET_MASK}})
         self.assertNotIn("backend", clean.get("substore", {}))
         self.assertTrue(any("substore.backend" in n for n in notes), notes)
+
+    def test_the_host_preserving_backend_mask_is_dropped(self):
+        """The actual polling representation must be treated as unchanged too."""
+        clean, notes = cfgmod.validate_patch(
+            {"substore": {"backend": "https://sub.example.invalid/***"}})
+        self.assertNotIn("backend", clean.get("substore", {}))
+        self.assertTrue(any("substore.backend" in note for note in notes))
+
+    def test_a_backend_mask_round_trip_preserves_the_stored_url(self):
+        """A read/save cycle must retain the original backend authentication."""
+        with _TempRoot():
+            cfg = cfgmod.load()
+            cfg["substore"]["backend"] = "https://sub.example.invalid/dummy-private-path"
+            cfgmod.save(cfg)
+            redacted = server.redacted_config(cfg)
+            clean, _ = cfgmod.validate_patch({"substore": redacted["substore"]})
+            saved = cfgmod.update(clean)
+            self.assertEqual(saved["substore"]["backend"], cfg["substore"]["backend"])
 
     def test_a_settings_round_trip_preserves_the_stored_credentials(self):
         """The end-to-end shape of the bug: form read → save → file intact."""

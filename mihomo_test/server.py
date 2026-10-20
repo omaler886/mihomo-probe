@@ -58,6 +58,22 @@ SECURITY_HEADERS = {
 # hostile page managed to make.
 CORS_ALLOW_HEADERS = "X-Auth-Token, Content-Type, Authorization"
 CORS_ALLOW_METHODS = "GET, POST, OPTIONS"
+MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
+BODY_TIMEOUT_SECONDS = 15
+
+
+class RequestBodyError(ValueError):
+    """A rejected request body, with an HTTP status safe to return to clients."""
+
+    def __init__(self, status, message):
+        """Store a status and public message for the request handler."""
+        super().__init__(message)
+        self.status = status
+
+
+def _reject_json_constant(_value):
+    """Reject non-JSON numeric constants instead of persisting NaN/Infinity."""
+    raise ValueError("non-finite JSON number")
 
 
 def _publish_scoped(path):
@@ -230,23 +246,21 @@ def exports_summary(cfg):
 
 
 def _mask_backend(url):
-    """The Sub-Store backend URL with its path hidden, scheme and host kept.
-
-    The path is where deployments embed the secret (an unguessable segment in
-    lieu of auth), so that is what must not ride along on a five-second poll;
-    the host is what the operator needs to recognise which backend this is.
-    A URL with no path carries nothing to hide and is returned unchanged.
-    """
+    """Return the backend's HTTP origin with any credential-bearing parts masked."""
     try:
         parsed = urllib.parse.urlsplit(str(url or ""))
+        host, port = parsed.hostname, parsed.port
     except ValueError:
         return cfgmod.SECRET_MASK
-    if not parsed.netloc:
+    if parsed.scheme not in ("http", "https") or not host:
         return cfgmod.SECRET_MASK
-    if parsed.path in ("", "/") and not parsed.query:
-        return str(url)
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc,
-                                    cfgmod.SECRET_MASK, "", ""))
+    authority = f"[{host}]" if ":" in host else host
+    if port is not None:
+        authority += f":{port}"
+    has_secret = (parsed.username is not None or parsed.password is not None
+                  or parsed.path not in ("", "/") or parsed.query or parsed.fragment)
+    path = "/" + cfgmod.SECRET_MASK if has_secret else parsed.path
+    return urllib.parse.urlunsplit((parsed.scheme, authority, path, "", ""))
 
 
 def redacted_config(cfg):
@@ -329,8 +343,13 @@ def run_in_background(cfg, trigger="manual", only_source=None, mode=None):
             # is what raised for everyone else.
             BUSY.release()
 
-    thread = threading.Thread(target=work, name="round", daemon=True)
-    thread.start()
+    try:
+        thread = threading.Thread(target=work, name="round", daemon=True)
+        thread.start()
+    except Exception:
+        # No worker owns the lock until start succeeds.
+        BUSY.release()
+        raise
     return thread
 
 
@@ -351,6 +370,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", cache)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         # Unconditionally, not only when echoing an origin: the response body
         # *does* depend on the Origin header, so a shared cache that ignored
         # `Vary` could hand one origin's answer to another.
@@ -363,14 +384,57 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _json_body(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        if not length:
-            return {}
+    def _body_length(self):
+        """Return a bounded content length, rejecting ambiguous HTTP framing."""
+        if self.headers.get_all("Transfer-Encoding"):
+            raise RequestBodyError(400, "Transfer-Encoding is not supported")
+        lengths = self.headers.get_all("Content-Length", [])
+        if not lengths:
+            return 0
+        if len(lengths) != 1:
+            raise RequestBodyError(400, "multiple Content-Length headers")
+        value = lengths[0].strip()
+        if not value.isascii() or not value.isdigit():
+            raise RequestBodyError(400, "invalid Content-Length")
+        value = value.lstrip("0") or "0"
+        if len(value) > len(str(MAX_JSON_BODY_BYTES)) or int(value) > MAX_JSON_BODY_BYTES:
+            raise RequestBodyError(413, "request body too large")
+        return int(value)
+
+    def _read_body(self, length):
+        """Read exactly length bytes within one deadline; raise on timeout or EOF."""
+        previous_timeout = self.connection.gettimeout()
+        deadline = time.monotonic() + BODY_TIMEOUT_SECONDS
+        raw = bytearray()
         try:
-            return json.loads(self.rfile.read(length).decode("utf-8"))
-        except ValueError:
+            while len(raw) < length:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RequestBodyError(408, "request body timed out")
+                self.connection.settimeout(remaining)
+                chunk = self.rfile.read1(min(65536, length - len(raw)))
+                if not chunk:
+                    raise RequestBodyError(400, "incomplete request body")
+                raw.extend(chunk)
+        except TimeoutError as exc:
+            raise RequestBodyError(408, "request body timed out") from exc
+        finally:
+            self.connection.settimeout(previous_timeout)
+        return raw
+
+    def _json_body(self):
+        """Return a JSON object; empty commands remain valid, malformed ones fail."""
+        length = self._body_length()
+        if length == 0:
             return {}
+        raw = self._read_body(length)
+        try:
+            body = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+        except (ValueError, RecursionError) as exc:
+            raise RequestBodyError(400, "invalid JSON body") from exc
+        if not isinstance(body, dict):
+            raise RequestBodyError(400, "JSON body must be an object")
+        return body
 
     def _path(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -531,6 +595,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             kind = auth_kind(self, cfg, path)
             if kind is None:
+                self.close_connection = True
                 return self._send(401, {"error": "unauthorized"})
             _note_query_token_admin(kind)
             body = self._json_body()
@@ -636,7 +701,7 @@ class Handler(BaseHTTPRequestHandler):
                                                         store_client(cfg))
                         except StoreError as exc:
                             sync = [f"联动同步失败: {exc}"]
-                return self._send(200, {"saved": True, "config": new_cfg,
+                return self._send(200, {"saved": True, "config": redacted_config(new_cfg),
                                         "sources": new_cfg.get("sources", []),
                                         "link": sync, "notes": notes})
             if path == "/api/reload":
@@ -644,6 +709,10 @@ class Handler(BaseHTTPRequestHandler):
                 _State.cfg = cfgmod.load()
                 return self._send(200, {"reloaded": True})
             return self._send(404, {"error": "not found", "path": path})
+        except RequestBodyError as exc:
+            # Unread or ambiguously framed bytes cannot become the next request.
+            self.close_connection = True
+            return self._send(exc.status, {"error": str(exc)})
         except Exception as exc:
             return self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
 
@@ -656,7 +725,8 @@ def serve(cfg, host="127.0.0.1", port=8088):
 
 
 def scheduler_loop(stop_event, poll_seconds=20):
-    """Trigger rounds on the configured interval."""
+    """Poll until stop_event is set, launching due rounds at the configured interval."""
+    first_due = None
     while not stop_event.is_set():
         cfg = _State.cfg
         try:
@@ -668,16 +738,24 @@ def scheduler_loop(stop_event, poll_seconds=20):
             schedule = cfg["schedule"]
             if not schedule.get("enabled", True):
                 _next_run["at"] = None
+                first_due = None
             else:
                 interval = max(1, int(schedule.get("interval_minutes", 30))) * 60
                 last = db.last_round()
                 last_ts = _parse(last["started_at"]) if last else 0
-                due = (last_ts or time.time()) + interval
-                if last_ts == 0:
-                    due = time.time() + 5
+                now = time.time()
+                if last_ts:
+                    due = last_ts + interval
+                    first_due = None
+                else:
+                    # Keep the startup deadline stable across empty-ledger polls.
+                    if first_due is None:
+                        first_due = now + 5
+                    due = first_due
                 _next_run["at"] = time.strftime("%H:%M:%S", time.localtime(due))
-                if time.time() >= due and not BUSY.locked():
+                if now >= due and not BUSY.locked():
                     run_in_background(cfg, trigger="schedule")
+                    first_due = now + interval
         except Exception as exc:
             db.log("error", f"调度器异常: {type(exc).__name__}: {exc}")
         stop_event.wait(poll_seconds)

@@ -13,6 +13,25 @@
   字节码缓存实测评估为不建（见 09）。
 - 原则：Python 实现保持为默认运行路径；Rust 以 shadow 双跑方式逐步逼近门禁。
 - 总控需求文档：`GLM_5.3_Flash_mihomo_probe_Rust_full_rewrite.md`（已入库）。
+- 完整交付目标持续执行中；全范围计划、并行所有权和逐项完成证据统一维护于
+  `17_COMPLETION_AUDIT.md`。本页既有局部修复不代表完整目标已经完成。
+
+## 当前工作区补丁（2026-10-09，未提交）
+- 沿安全与后端核心方向补缺，不切换默认运行实现，不新增 R 阶段完成声明。
+- Python：首次定时任务不再不断推迟；线程启动失败释放 BUSY；严格校验 POST
+  正文与读取预算；后端 URL 完整脱敏、脱敏回写保留凭据；共享账本读取跳过
+  Rust `inconclusive` 轮次，旧 Python 库无需迁移。
+- Rust：拒绝加载新配置时不测旧别名；取消覆盖内核准备阶段；空测量、工作线程
+  崩溃、控制器中途故障不推进节点状态；账本错误仍尝试关闭轮次；
+  results/nodes/history 原子提交；轮次计数按节点去重，失败保留分类，
+  变体结果按计划顺序汇总。
+- Rust API/控制器：状态仅返回解析后的 host/port，传输错误去掉请求 URL；
+  密钥不可用时不生成空认证配置；成功和错误响应均带私有缓存/安全头。
+- 验证：Python **592 总计 / 590 通过 / 2 跳过**；Rust **257 通过**；
+  轮次测试 28 项连续 **10/10** 次通过；fmt、Clippy、凭据扫描通过。
+  证据与边界见 `TEST_REPORT_RUST.md` 的 2026-10-09 节。
+- 后续顺序：R4 DNS/ECS 接入与缓存 → 出口/链式真实流量验证 → R8 发布闭环 →
+  质量评分与实时状态；真实内核、shadow 对账和部署门禁仍未完成。
 
 ## 基线事实（2026-09-30）
 - commit SHA：03cb6ea（R0 之前）；分支 main。
@@ -83,14 +102,17 @@
 - R4 probe-dns（补做批）——`wire`（手写报文：`build_query`/`parse_ips`/`skip_name`，
   三处有意硬化见 05）、`resolver`（DoH GET + `resolve_views`）、`geo`（ip-api 批量
   查询，45s 超时 + 一次重试 + 错误文本 80 字符）、`fixtures/dns-packets/`（8 个二进制包
-  + `tools/make_dns_fixtures.py`）。**未接 engine**，无调用方。Rust 测试 219 → 221
-  （车道分桶修复 +2）→ **243**。
+  + `tools/make_dns_fixtures.py`）。**已接 engine**（2026-10-20 复核：
+  `probe-engine/src/network.rs:694 prepare_network` ← `collect.rs:357`；本行原写「未接 engine，无调用方」，
+  已被工作区代码推翻）。Rust 测试 219 → 221（车道分桶修复 +2）→ **243**。
 
 ## 当前失败测试
-- 无。Python 568 通过 / 2 跳过；Rust **243 通过**（R3 后 45，R5 并发 +13，
-  R5 编排 +17，R5 采集 +56，Sub-Store +16，cron +8，R6 链式 +37，
-  R7 护栏 +23，车道分桶修复 +2，R4 probe-dns +22，axum/tokio net feature 为
-  probe-source stub 测试引入）。
+- 无（2026-10-20 复跑）。当前工作区：Rust **435 通过 / 0 失败**，
+  `cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 均退出 0；
+  Python **596 总计 / 594 通过 / 2 跳过**。
+  同日修掉 4 项失败用例（导出根逃逸 F2、host_port 显示、config_check native 断言、migration 快照），
+  证据见 `TEST_REPORT_RUST.md` 的 2026-10-20 节。
+  （本节上一版写「Python 592 / Rust 257」，是 2026-10-09 的数字；该批之后测试数已增至 435，且 CI 曾全红。）
 
 ## ADR 索引
 - ADR-0001 存储驱动：切片用 rusqlite(bundled)，R2 迁移落地时复评 sqlx（理由见 08）。
@@ -111,5 +133,6 @@
 - R8：发布与 PublishDecision（suspect 轮保留上轮发布的执行面；export_snapshots
   表已就位）。
 - 前端适配 /api/v1（依赖 10 契约冻结）。
-- 口径差异待对账（见 13「已知口径差异」）：轮行 total 去重口径、收敛折叠
-  展示列（proto/server/country/ip）暂缺、inconclusive 列 Python 保守兼容。
+- 口径差异待对账（见 13「已知口径差异」）：收敛折叠展示列
+  （proto/server/country/ip）暂缺；轮行 total/ok 去重与 Python 对
+  inconclusive 的读取已由 2026-10-09 补丁修正，真机双跑仍待验证。

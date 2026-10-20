@@ -9,6 +9,8 @@ probe-domain = { path = "../probe-domain" }
 # migrate` for its automatic pre-migration snapshot.
 rusqlite = { workspace = true, features = ["backup"] }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 

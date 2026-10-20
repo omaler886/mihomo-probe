@@ -50,3 +50,132 @@ SQL migration 体系 + Python SQLite 无损迁移（总控 §11）。
 
 ## 下一步
 - R2。
+
+## Cache Storage Handoff (2026-10-09)
+
+Storage-worker scope is implemented and locally verified. Parent integration and
+overall acceptance remain pending; this entry does not close the wider R5/R10 work.
+
+### Changed Files
+
+- `crates/probe-storage/src/cache.rs`: exported cache records, five `Storage`
+  methods, input validation, UTC conversion, and transactional geo writes.
+- `crates/probe-storage/src/cache/tests.rs`: cache and compatibility regressions.
+- `crates/probe-storage/src/lib.rs`: only the cache module declaration and record
+  re-exports were added by this worker. Pre-existing atomic measurement commits,
+  category preservation, and rollback regression tests were retained unchanged.
+- `crates/probe-storage/src/migrations.rs`: version 4 registration, required-table
+  registration, and a version-3 upgrade regression.
+- `migrations/0004_dns_cache.sql`: additive `dns_cache` table with key/payload/time
+  constraints and an expiry index. Migrations 0001-0003 and `ip_geo` are unchanged.
+- `workstreams/08_STORAGE_MIGRATION.md`: this handoff.
+
+No dependencies, manifests, root lockfile, other crates, Python, global settings,
+credentials, or deployment data were changed. No commits or deployments were made.
+
+### Public Contract
+
+Both records are available from `probe_storage` and `probe_storage::cache`:
+
+```rust
+pub struct DnsCacheRecord {
+    pub value_json: String,
+    pub stored_at: i64,
+    pub expires_at: i64,
+}
+pub struct GeoCacheRecord {
+    pub ip: String,
+    pub country: Option<String>,
+    pub isp: Option<String>,
+    pub checked_at: i64,
+}
+```
+
+The following inherent methods return the existing `probe_domain::DomainResult`:
+
+```rust
+read_dns_cache(&self, key: &str, now: i64) -> DomainResult<Option<DnsCacheRecord>>
+write_dns_cache(&self, key: &str, record: &DnsCacheRecord) -> DomainResult<()>
+prune_dns_cache(&self, now: i64) -> DomainResult<usize>
+read_ip_geo(&self, ips: &[String], now: i64, max_age_secs: u64) -> DomainResult<Vec<GeoCacheRecord>>
+write_ip_geo(&self, records: &[GeoCacheRecord]) -> DomainResult<usize>
+```
+
+- DNS keys must contain exactly 64 ASCII hexadecimal characters. Case is preserved;
+  the engine should produce one consistent digest representation. Validation errors
+  never echo the supplied key, so an accidentally supplied resolver URL is not logged.
+- `cache::MAX_DNS_CACHE_VALUE_BYTES` is 1,048,576 UTF-8 bytes. Bundled SQLite validates
+  JSON syntax; neither storage nor the migration reserializes payloads. Positive,
+  negative, empty-answer, and JSON `null` payloads round-trip byte-for-byte.
+- UTC Unix timestamps must be in `0..=253402300799`; DNS expiry must follow storage
+  time. A hit requires `stored_at <= now < expires_at`. Missing, expired, and
+  future-dated rows are misses. Invalid timestamp metadata and corrupt/oversized
+  live payloads return `DomainError::Storage`, as do invalid arguments and SQL errors.
+  Pruning deletes rows with `expires_at <= now` and returns the deleted count.
+- `ip_geo(ip,country,isp,checked_at)` retains Python's exact schema. SQLite converts
+  `checked_at` to/from UTC `YYYY-MM-DDTHH:MM:SS`; a normalized round-trip rejects
+  malformed dates, calendar overflow, offsets, fractions, and other formats.
+- Geo freshness requires `0 <= now - checked_at < max_age_secs`; zero max age yields
+  no hits, and `u64::MAX` does not overflow. Future, expired, malformed, unknown-country,
+  wrong-type, and invalid-UTF-8 legacy rows are skipped. Database operation errors
+  remain errors. Invalid requested IPs are skipped; valid input strings are
+  deduplicated and queried in 400-IP chunks.
+- Geo writes validate literal IPv4/IPv6 addresses, assigned uppercase ISO 3166-1
+  alpha-2 country codes, and timestamps. `country: None` is not cached and cannot
+  overwrite a known record. Invalid nonempty country codes are errors. Duplicate
+  IPs use the last known-country record; the count reports successful upsert
+  operations, not distinct IPs. One transaction covers the batch and rolls back
+  both preceding inserts and updates on validation or SQL failure. Empty batches
+  are no-ops. IP text is preserved for compatibility with Python's keys.
+
+### Verification
+
+The default rustup Cargo shim could not initialize its home in the restricted
+sandbox (`os error 183`). The installed 1.99.0 MSVC toolchain worked directly;
+the environment overrides below were process-local, not global configuration.
+Commands were run from the repository root with the existing lockfile:
+
+```powershell
+$toolchain = 'C:\Users\ckai7\.rustup\toolchains\1.99.0-x86_64-pc-windows-msvc\bin'
+$env:RUSTC = "$toolchain\rustc.exe"
+$env:RUSTDOC = "$toolchain\rustdoc.exe"
+$env:PATH = "$toolchain;$env:PATH"
+& "$toolchain\cargo.exe" test --locked --offline -p probe-storage
+& "$toolchain\cargo.exe" check --locked --offline -p probe-storage --all-targets
+& "$toolchain\cargo.exe" clippy --locked --offline -p probe-storage --all-targets --no-deps -- -D warnings
+& "$toolchain\rustfmt.exe" --check --edition 2021 crates/probe-storage/src/cache.rs crates/probe-storage/src/migrations.rs
+git diff --check -- crates/probe-storage migrations/0004_dns_cache.sql workstreams/08_STORAGE_MIGRATION.md
+```
+
+- Baseline before this worker's edits: 21 tests passed, including the existing
+  atomic measurement rollback regressions.
+- Final storage tests: **45 passed, 0 failed**; doc-tests: 0 tests, successful.
+- All-targets check, strict Clippy, focused rustfmt check, and scoped whitespace
+  check: passed. Formatting was limited to the cache module (including its tests)
+  and migration runner; the shared `lib.rs` was not reformatted.
+- Coverage includes fresh files, legacy Python schema/data, v3-to-v4 migration
+  without changing prior schema objects, repeated opens, DNS TTL boundaries,
+  separate resolver digest keys/upserts, invalid/future timestamps, negative
+  payloads, byte-size bounds, direct-SQL constraints, and corrupt rows.
+- Geo coverage includes exact Python UTC text, strict age boundaries, invalid
+  legacy rows, 2,405 unique IPs requested three times with SQLite forcibly capped
+  at 999 variables, empty batches, unknown results, and rollback after a later
+  invalid row or an actual SQLite trigger failure.
+- A newly added invalid-UTF-8 legacy-row regression first reproduced a batch read
+  error, then passed after conversion failures were made row-level cache misses.
+
+### Parent Integration And Limits
+
+- The engine still owns SHA-256 key derivation across domain/type/view/resolver/ECS,
+  JSON payload serialization/deserialization and semantic validation, cache policy,
+  and prune scheduling. Storage tests prove isolation of distinct supplied keys,
+  not correctness of engine key derivation or prevention of secrets inside payloads.
+- Country validation deliberately rejects lowercase, reserved/unknown codes such
+  as `ZZ`, and unassigned provider-specific codes. Callers should normalize valid
+  codes and represent failed/unknown lookups with `None`, not a fabricated country.
+- Future timestamps may be written because write APIs do not accept a reference
+  clock; neither cache returns those rows before the read caller's `now` reaches them.
+- No live database, network, Python runtime, or workspace-wide test/format run was
+  performed. Compatibility was verified using temporary SQLite fixtures matching
+  the Python schema and timestamp format. Parent owns engine wiring, wider
+  integration, live acceptance, and the remaining R5/R10 requirements above.

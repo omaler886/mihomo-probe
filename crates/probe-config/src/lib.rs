@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 use probe_domain::{DomainError, DomainResult};
 use serde_json::Value;
 
+pub mod network;
+pub use network::{
+    DnsSection, DnsView, PayloadScope, PayloadSection, VerifySection, WatchdogSection,
+};
+
 /// Defaults for the `core` section; keys mirror `config.DEFAULTS["core"]`.
 ///
 /// `mixed_port` gained a default on the Python side in R0 (2026-09-30): the
@@ -52,11 +57,19 @@ impl CoreConfig {
 
     fn from_value(value: &Value) -> Self {
         let defaults = Self::defaults();
-        let get_u16 = |key: &str, fallback: u16| -> u16 {
+        // A port of 0 parses but binds nothing usable: `mixed-port: 0` makes
+        // the kernel pick an ephemeral port and `base_port: 0` puts the lane
+        // listeners on 0..lanes-1, which are not dialable. Python bounds
+        // mixed_port at (1024, 65535); the narrower repair here is to treat
+        // 0 like any other invalid value and fall back to the default.
+        // (`lanes` is separately clamped at every consumer, so 0 lanes
+        // cannot reach the kernel either.)
+        let get_port = |key: &str, fallback: u16| -> u16 {
             value
                 .get(key)
                 .and_then(|v| v.as_u64())
                 .and_then(|v| u16::try_from(v).ok())
+                .filter(|v| *v != 0)
                 .unwrap_or(fallback)
         };
         Self {
@@ -65,9 +78,9 @@ impl CoreConfig {
                 .and_then(|v| v.as_str())
                 .unwrap_or(DEFAULT_API)
                 .to_string(),
-            lanes: get_u16("lanes", defaults.lanes),
-            base_port: get_u16("base_port", defaults.base_port),
-            mixed_port: get_u16("mixed_port", defaults.mixed_port),
+            lanes: get_port("lanes", defaults.lanes),
+            base_port: get_port("base_port", defaults.base_port),
+            mixed_port: get_port("mixed_port", defaults.mixed_port),
             container: value
                 .get("container")
                 .and_then(|v| v.as_str())
@@ -247,6 +260,11 @@ pub struct SourceSpec {
     /// the operator un-ticked on both sides still gets measured -- and still
     /// shows up in the ledger -- instead of silently losing its history.
     pub chain: bool,
+    /// Produce a subscription export for this source. Python
+    /// `normalize_sources`: `entry.get("export") is not False`, so only an
+    /// explicit JSON `false` turns it off -- a hand-edited `0` or `"no"`
+    /// still exports, matching the Python identity check.
+    pub export: bool,
 }
 
 impl SourceSpec {
@@ -308,6 +326,7 @@ impl SourceSpec {
                 relay: map.get("relay") == Some(&Value::Bool(true)),
                 direct: map.get("direct") != Some(&Value::Bool(false)),
                 chain: map.get("chain") != Some(&Value::Bool(false)),
+                export: map.get("export") != Some(&Value::Bool(false)),
                 key,
                 kind,
                 name,
@@ -391,8 +410,68 @@ pub struct Config {
     pub chain: ChainSection,
     /// `publish.prefix`: the manual-front subscription is named from it.
     pub publish_prefix: String,
+    /// The `publish` section (R8): export root, prefix, region tags, publish token.
+    pub publish: PublishSection,
+    /// The `schedule` section: the in-process round timer (R9).
+    pub schedule: ScheduleSection,
     /// The `policy` section: convergence thresholds and the round guard.
     pub policy: PolicySection,
+    pub dns: DnsSection,
+    pub verify: VerifySection,
+    pub watchdog: WatchdogSection,
+    /// G07 quality sampling: bounded throughput transfers for a subset of
+    /// alive nodes. Off by default -- it spends real traffic on top of the
+    /// verification the round already did.
+    pub quality: QualitySection,
+}
+
+/// `quality`: per-round throughput sampling for a small, spread subset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualitySection {
+    pub enabled: bool,
+    /// Alive nodes sampled per round; 0 reads as "disabled".
+    pub sample_size: usize,
+    /// Hard cap on the bytes one sample may transfer.
+    pub max_bytes: usize,
+    pub timeout_s: u64,
+}
+
+impl Default for QualitySection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_size: 5,
+            max_bytes: 262_144,
+            timeout_s: 15,
+        }
+    }
+}
+
+impl QualitySection {
+    fn from_value(value: &Value) -> Self {
+        let defaults = Self::default();
+        Self {
+            enabled: value
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(defaults.enabled),
+            sample_size: value
+                .get("sample_size")
+                .and_then(Value::as_u64)
+                .map(|size| size.min(64) as usize)
+                .unwrap_or(defaults.sample_size),
+            max_bytes: value
+                .get("max_bytes")
+                .and_then(Value::as_u64)
+                .map(|bytes| bytes.clamp(1024, 4 * 1024 * 1024) as usize)
+                .unwrap_or(defaults.max_bytes),
+            timeout_s: value
+                .get("timeout_s")
+                .and_then(Value::as_u64)
+                .map(|secs| secs.clamp(1, 120))
+                .unwrap_or(defaults.timeout_s),
+        }
+    }
 }
 
 impl Config {
@@ -401,9 +480,21 @@ impl Config {
     /// defaults -- including the `sources` list -- survive; `Value::Null`
     /// would instead replace the whole tree and silently drop them.
     pub fn load(config_path: &Path) -> DomainResult<Self> {
-        let stored = match std::fs::read_to_string(config_path) {
-            Ok(text) => serde_json::from_str::<Value>(&text).unwrap_or(json_object()),
-            Err(_) => json_object(),
+        let text = std::fs::read_to_string(config_path).unwrap_or_default();
+        Ok(Self::parse(&text)?.0)
+    }
+
+    /// Parse a stored config document without touching the filesystem.
+    ///
+    /// The boolean is `json_valid`: `false` means the text was not JSON at all
+    /// and the returned configuration is therefore the defaults. `load` takes
+    /// that same silent-fallback path (Python `stored = {}`), so the only way
+    /// an operator can notice a broken file is by asking -- which is what the
+    /// self-check endpoint does.
+    pub fn parse(text: &str) -> DomainResult<(Self, bool)> {
+        let (stored, json_valid) = match serde_json::from_str::<Value>(text) {
+            Ok(value) => (value, true),
+            Err(_) => (json_object(), false),
         };
         let mut cfg = default_tree();
         deep_merge(&mut cfg, &stored);
@@ -413,34 +504,43 @@ impl Config {
             .map(|list| SourceSpec::normalize(list))
             .transpose()?
             .unwrap_or_default();
-        Ok(Self {
-            core: CoreConfig::from_value(cfg.get("core").unwrap_or(&Value::Null)),
-            test: TestConfig::from_value(cfg.get("test").unwrap_or(&Value::Null)),
-            sources,
-            auth_token: cfg
-                .pointer("/auth/token")
-                .and_then(|v| v.as_str())
-                .filter(|t| !t.trim().is_empty())
-                .map(str::to_string),
-            substore: SubStoreSection::from_value(cfg.get("substore").unwrap_or(&Value::Null)),
-            chain: ChainSection::from_value(cfg.get("chain").unwrap_or(&Value::Null)),
-            publish_prefix: cfg
-                .pointer("/publish/prefix")
-                .and_then(|v| v.as_str())
-                .filter(|p| !p.trim().is_empty())
-                .unwrap_or(DEFAULT_PUBLISH_PREFIX)
-                .to_string(),
-            policy: PolicySection::from_value(cfg.get("policy").unwrap_or(&Value::Null)),
-        })
+        let publish = PublishSection::from_value(cfg.get("publish").unwrap_or(&Value::Null));
+        let schedule = ScheduleSection::from_value(cfg.get("schedule").unwrap_or(&Value::Null));
+        Ok((
+            Self {
+                core: CoreConfig::from_value(cfg.get("core").unwrap_or(&Value::Null)),
+                test: TestConfig::from_value(cfg.get("test").unwrap_or(&Value::Null)),
+                sources,
+                auth_token: cfg
+                    .pointer("/auth/token")
+                    .and_then(|v| v.as_str())
+                    .filter(|t| !t.trim().is_empty())
+                    .map(str::to_string),
+                substore: SubStoreSection::from_value(cfg.get("substore").unwrap_or(&Value::Null)),
+                chain: ChainSection::from_value(cfg.get("chain").unwrap_or(&Value::Null)),
+                publish_prefix: publish.prefix.clone(),
+                publish,
+                schedule,
+                policy: PolicySection::from_value(cfg.get("policy").unwrap_or(&Value::Null)),
+                dns: DnsSection::from_value(cfg.get("dns").unwrap_or(&Value::Null)),
+                verify: VerifySection::from_value(cfg.get("verify").unwrap_or(&Value::Null)),
+                watchdog: WatchdogSection::from_value(cfg.get("watchdog").unwrap_or(&Value::Null)),
+                quality: QualitySection::from_value(cfg.get("quality").unwrap_or(&Value::Null)),
+            },
+            json_valid,
+        ))
     }
 
     /// Read the kernel API secret, creating it on first use -- the Python
     /// `config.core_secret()` contract: one secret file, 0600, generated once.
+    /// Python chmods on every read, so an existing file with the wrong mode
+    /// (a plain `fs::write` used to create it 0644) is repaired here too.
     pub fn core_secret(data_dir: &Path) -> DomainResult<String> {
         let path = data_dir.join(CORE_SECRET_FILE);
         if let Ok(existing) = std::fs::read_to_string(&path) {
             let trimmed = existing.trim();
             if !trimmed.is_empty() {
+                restrict_secret_permissions(&path);
                 return Ok(trimmed.to_string());
             }
         }
@@ -448,11 +548,63 @@ impl Config {
         std::fs::create_dir_all(data_dir).map_err(|e| {
             DomainError::Config(format!("cannot create {}: {e}", data_dir.display()))
         })?;
-        std::fs::write(&path, &secret)
-            .map_err(|e| DomainError::Config(format!("cannot write {}: {e}", path.display())))?;
+        // create_new + mode 0600: the secret must never be world-readable,
+        // and two processes generating it concurrently must not interleave
+        // writes -- the loser reads the winner's value back.
+        #[cfg(unix)]
+        let write_result = {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut file) => file.write_all(secret.as_bytes()).map_err(|e| {
+                    DomainError::Config(format!("cannot write {}: {e}", path.display()))
+                }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    restrict_secret_permissions(&path);
+                    Ok(())
+                }
+                Err(err) => Err(DomainError::Config(format!(
+                    "cannot create {}: {err}",
+                    path.display()
+                ))),
+            }
+        };
+        #[cfg(not(unix))]
+        let write_result = std::fs::write(&path, &secret)
+            .map_err(|e| DomainError::Config(format!("cannot write {}: {e}", path.display())));
+        write_result?;
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            let trimmed = existing.trim();
+            if !trimmed.is_empty() {
+                // A concurrent writer created the file between the read above
+                // and our create_new: its value is the one the other process
+                // is using, so return that one, not our unsaved candidate.
+                return Ok(trimmed.to_string());
+            }
+        }
         Ok(secret)
     }
 }
+
+/// Python parity (`config.py` chmods the file on every access): force 0600 on
+/// the secret file, repairing files created world-readable by earlier builds.
+/// Best effort -- a failure to chmod must not break a working secret, but it
+/// is reported by the caller's own diagnostics (the API self-check shows the
+/// effective mode side nowhere else, and an unwritable dir is already a
+/// deployment error).
+#[cfg(unix)]
+fn restrict_secret_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_secret_permissions(_path: &Path) {}
 
 /// The `substore` section: Rust-only (the Python service has no embedded
 /// Sub-Store). `embedded: true` makes `probe-cli serve` start the embedded
@@ -563,6 +715,13 @@ pub const MAX_FRONT_TEXT: usize = 262_144;
 pub const MAX_FRONT_PICK: usize = 500;
 
 pub const DEFAULT_PUBLISH_PREFIX: &str = "probe";
+/// Python `schedule.interval_minutes` default.
+pub const DEFAULT_SCHEDULE_MINUTES: i64 = 30;
+/// `config.PATCH_RANGES["schedule.interval_minutes"]`: clamped, never rejected.
+pub const MIN_SCHEDULE_MINUTES: i64 = 1;
+pub const MAX_SCHEDULE_MINUTES: i64 = 1440;
+/// Python `publish.hostname` default (`MIHOMO_TEST_HOSTNAME` or this).
+pub const DEFAULT_PUBLISH_HOSTNAME: &str = "probe.example.com";
 
 impl Default for ChainSection {
     fn default() -> Self {
@@ -748,6 +907,160 @@ impl PolicySection {
     }
 }
 
+/// The `publish` section (R8): what gets exported, where it lands, and which
+/// credential may read it back.
+///
+/// `token` is the read-only publish credential, kept separate from
+/// `auth.token` on purpose: the export URL is pasted into Sub-Store and shown
+/// in dashboards, so it leaks by design -- and the admin token also drives the
+/// host's container runtime. An absent/empty token denies every export
+/// download (never "auth off"), the same rule `auth.token` follows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishSection {
+    /// Master switch for producing exports. Off = the round writes no files
+    /// and activates no snapshot.
+    pub enabled: bool,
+    /// Keep pushing exports into Sub-Store as `<prefix>-<key>-local`.
+    pub push_to_substore: bool,
+    /// Subscription name prefix (`<prefix>-<key>-local`).
+    pub prefix: String,
+    /// Hostname used when building export URLs for display/push.
+    pub hostname: String,
+    /// Rewrite the `[CC]` region tag from the measured exit country.
+    pub add_region_tag: bool,
+    /// Read-only credential for `GET /api/export/<key>.yaml`. `None` (or an
+    /// empty/whitespace value) means no export download is authorized.
+    pub token: Option<String>,
+    /// Export root. `None` = `<root>/exports` (see [`PublishSection::export_root`]).
+    pub dir: Option<String>,
+    /// Snapshots kept per key; the active one is always kept. `None` keeps
+    /// everything, which is what the publication module assumes by default:
+    /// deleting history is an operator decision, not a silent default.
+    pub keep_snapshots: Option<usize>,
+}
+
+/// Directory under the service root that holds exports by default.
+pub const EXPORT_DIR_NAME: &str = "exports";
+
+impl PublishSection {
+    /// The absolute export root every caller must agree on: the configured
+    /// `dir`, else `<service root>/exports`.
+    pub fn export_root(&self, root: &Path) -> PathBuf {
+        match self.dir.as_deref() {
+            Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir.trim()),
+            _ => root.join(EXPORT_DIR_NAME),
+        }
+    }
+}
+
+impl Default for PublishSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            push_to_substore: false,
+            prefix: DEFAULT_PUBLISH_PREFIX.to_string(),
+            hostname: DEFAULT_PUBLISH_HOSTNAME.to_string(),
+            add_region_tag: true,
+            token: None,
+            dir: None,
+            keep_snapshots: None,
+        }
+    }
+}
+
+impl PublishSection {
+    fn from_value(value: &Value) -> Self {
+        let defaults = Self::default();
+        let get_bool = |key: &str, fallback: bool| -> bool {
+            value.get(key).and_then(Value::as_bool).unwrap_or(fallback)
+        };
+        let text = |key: &str, fallback: &str| -> String {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .unwrap_or(fallback)
+                .to_string()
+        };
+        Self {
+            enabled: get_bool("enabled", defaults.enabled),
+            push_to_substore: get_bool("push_to_substore", defaults.push_to_substore),
+            prefix: text("prefix", &defaults.prefix),
+            hostname: text("hostname", &defaults.hostname),
+            add_region_tag: get_bool("add_region_tag", defaults.add_region_tag),
+            token: value
+                .get("token")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(str::to_string),
+            dir: value
+                .get("dir")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|dir| !dir.is_empty())
+                .map(str::to_string),
+            // Below one the pass would have nothing to keep, so a zero reads
+            // as "not configured" rather than "delete everything".
+            keep_snapshots: value
+                .get("keep_snapshots")
+                .and_then(Value::as_u64)
+                .filter(|keep| *keep >= 1)
+                .map(|keep| keep as usize),
+        }
+    }
+}
+
+/// The `schedule` section: the in-process round timer (Python `scheduler_loop`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleSection {
+    /// Off = no round is ever started by the timer (manual and API rounds still work).
+    pub enabled: bool,
+    /// Minutes between scheduled rounds; Python clamps to 1..=1440.
+    pub interval_minutes: i64,
+}
+
+impl Default for ScheduleSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_minutes: DEFAULT_SCHEDULE_MINUTES,
+        }
+    }
+}
+
+impl ScheduleSection {
+    fn from_value(value: &Value) -> Self {
+        let defaults = Self::default();
+        Self {
+            enabled: value
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(defaults.enabled),
+            interval_minutes: value
+                .get("interval_minutes")
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_f64().map(|f| f as i64))
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                })
+                .unwrap_or(defaults.interval_minutes)
+                .clamp(MIN_SCHEDULE_MINUTES, MAX_SCHEDULE_MINUTES),
+        }
+    }
+
+    /// The clamped interval. Every caller must use this instead of the raw
+    /// field so a hand-edited zero cannot turn the timer into a busy loop.
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.interval_minutes
+                .clamp(MIN_SCHEDULE_MINUTES, MAX_SCHEDULE_MINUTES) as u64
+                * 60,
+        )
+    }
+}
+
 pub fn default_tree() -> Value {
     serde_json::json!({
         "core": {
@@ -766,6 +1079,15 @@ pub fn default_tree() -> Value {
             "concurrency": DEFAULT_CONCURRENCY,
             "max_attempts": DEFAULT_MAX_ATTEMPTS,
             "retry_pause_s": DEFAULT_RETRY_PAUSE_S,
+        },
+        "dns": DnsSection::default(),
+        "verify": VerifySection::default(),
+        "watchdog": WatchdogSection::default(),
+        "quality": {
+            "enabled": false,
+            "sample_size": 5,
+            "max_bytes": 262144,
+            "timeout_s": 15,
         },
         // Mirrors config.DEFAULTS["sources"]. A stored list replaces it
         // wholesale (`deep_merge` replaces arrays rather than merging them),
@@ -797,10 +1119,22 @@ pub fn default_tree() -> Value {
             "max_fronts": 8,
             "test_plain_nodes": false,
         },
-        // Only the field the Rust slice reads; the rest of Python's `publish`
-        // defaults stay Python-side until R8.
+        // Python's `publish` defaults; `dir` is Rust-only (Python derives the
+        // export root from its data directory).
         "publish": {
+            "enabled": true,
+            "push_to_substore": false,
             "prefix": DEFAULT_PUBLISH_PREFIX,
+            "hostname": DEFAULT_PUBLISH_HOSTNAME,
+            "add_region_tag": true,
+            "token": "",
+            "dir": null,
+            "keep_snapshots": null,
+        },
+        // Mirrors config.DEFAULTS["schedule"] (the Rust serve loop reads it).
+        "schedule": {
+            "interval_minutes": DEFAULT_SCHEDULE_MINUTES,
+            "enabled": true,
         },
         // Mirrors config.DEFAULTS["policy"].
         "policy": {
@@ -959,6 +1293,48 @@ mod tests {
         assert_eq!(first, second, "a regenerated secret would break the kernel");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn core_secret_file_is_never_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let secret = Config::core_secret(tmp.path()).unwrap();
+        let mode = std::fs::metadata(tmp.path().join("core.secret"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the kernel bearer secret must not be readable by other local users"
+        );
+        // A file left world-readable by an older build is repaired on read,
+        // exactly like Python's chmod-on-every-access.
+        let path = tmp.path().join("core.secret");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let again = Config::core_secret(tmp.path()).unwrap();
+        assert_eq!(again, secret);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "an inherited 0644 secret is repaired");
+    }
+
+    #[test]
+    fn zero_ports_fall_back_to_defaults_instead_of_binding_nothing() {
+        // Python bounds mixed_port at (1024, 65535); `mixed-port: 0` in the
+        // kernel config picks an ephemeral port and `base_port: 0` puts the
+        // lane listeners on privileged ports 0..7. Zero is not a usable
+        // port here, so it reads as unset.
+        let core = CoreConfig::from_value(&serde_json::json!({
+            "mixed_port": 0,
+            "base_port": 0,
+            "lanes": 0,
+        }));
+        let defaults = CoreConfig::defaults();
+        assert_eq!(core.mixed_port, defaults.mixed_port);
+        assert_eq!(core.base_port, defaults.base_port);
+        assert_eq!(core.lanes, defaults.lanes);
+    }
+
     #[test]
     fn deep_merge_recurses_into_maps_but_replaces_scalars() {
         let mut base = serde_json::json!({"a": {"x": 1, "y": 2}, "b": [1]});
@@ -1069,6 +1445,158 @@ mod tests {
         assert_eq!(cfg.chain, ChainSection::default());
         assert!(!cfg.chain.is_configured());
         assert_eq!(cfg.publish_prefix, DEFAULT_PUBLISH_PREFIX);
+    }
+
+    #[test]
+    fn the_publish_section_defaults_match_python_and_deny_downloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&tmp.path().join("absent.json")).unwrap();
+        assert!(cfg.publish.enabled);
+        assert!(!cfg.publish.push_to_substore);
+        assert_eq!(cfg.publish.prefix, DEFAULT_PUBLISH_PREFIX);
+        assert_eq!(cfg.publish.hostname, DEFAULT_PUBLISH_HOSTNAME);
+        assert!(cfg.publish.add_region_tag);
+        assert_eq!(
+            cfg.publish.token, None,
+            "an empty token must deny export downloads, never allow them"
+        );
+        assert_eq!(cfg.publish.dir, None);
+        assert_eq!(cfg.publish_prefix, cfg.publish.prefix);
+    }
+
+    #[test]
+    fn the_publish_section_reads_a_stored_block_without_inventing_values() {
+        let publish = PublishSection::from_value(&serde_json::json!({
+            "enabled": false,
+            "push_to_substore": true,
+            "prefix": "  mx  ",
+            "hostname": "probe.example.net",
+            "add_region_tag": false,
+            "token": "  secret-token  ",
+            "dir": "  /srv/exports  ",
+        }));
+        assert!(!publish.enabled);
+        assert!(publish.push_to_substore);
+        assert_eq!(publish.prefix, "mx");
+        assert_eq!(publish.hostname, "probe.example.net");
+        assert!(!publish.add_region_tag);
+        assert_eq!(publish.token.as_deref(), Some("secret-token"));
+        assert_eq!(publish.dir.as_deref(), Some("/srv/exports"));
+        // A whitespace-only token is not a token.
+        let blank = PublishSection::from_value(&serde_json::json!({"token": "   "}));
+        assert_eq!(blank.token, None);
+    }
+
+    /// Retention is off by default: deleting publication history is an
+    /// operator decision, and zero must never read as "delete everything".
+    /// Deterministic mini-fuzz: `Config::parse` must never panic on hostile
+    /// text, only ever answer `Ok`/`Err`.
+    ///
+    /// Stable-toolchain stand-in for libFuzzer (the real campaign procedure is
+    /// in TEST_REPORT_RUST.md): a fixed seed and a fixed mutation schedule mean
+    /// any failure is reproducible from the report alone.
+    #[test]
+    fn config_parsing_survives_random_input() {
+        const SEEDS: [&str; 4] = [
+            r#"{"sources":[],"publish":{"keep_snapshots":3}}"#,
+            r#"{"dns":{"views":[]},"verify":{"chain_payload":{"scope":"all"}}}"#,
+            "{\"publish\": {\"prefix\": \"pr",
+            "",
+        ];
+        let mut state = 0x5eed_1234_abcd_9876u64;
+        let mut next = |bound: usize| -> usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % (bound.max(1) as u64)) as usize
+        };
+        for iteration in 0..2_000 {
+            let seed = SEEDS[next(SEEDS.len())];
+            let mut bytes = seed.as_bytes().to_vec();
+            match next(5) {
+                0 => {
+                    if !bytes.is_empty() {
+                        let at = next(bytes.len());
+                        bytes[at] = next(256) as u8;
+                    }
+                }
+                1 => {
+                    let cut = next(bytes.len() + 1);
+                    bytes.truncate(cut);
+                }
+                2 => {
+                    let at = next(bytes.len() + 1);
+                    let byte = next(256) as u8;
+                    bytes.insert(at, byte);
+                }
+                3 => bytes.extend_from_slice(&[0x00, 0xff, 0xfe, b'{', b'}', b'\"']),
+                _ => bytes.reverse(),
+            }
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let outcome = std::panic::catch_unwind(|| Config::parse(&text));
+            assert!(
+                outcome.is_ok(),
+                "Config::parse panicked on iteration {iteration} with {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_retention_is_opt_in_and_rejects_zero() {
+        assert_eq!(PublishSection::default().keep_snapshots, None);
+        assert_eq!(
+            PublishSection::from_value(&serde_json::json!({"keep_snapshots": 7})).keep_snapshots,
+            Some(7)
+        );
+        assert_eq!(
+            PublishSection::from_value(&serde_json::json!({"keep_snapshots": 0})).keep_snapshots,
+            None,
+            "zero would prune everything, so it reads as unset"
+        );
+    }
+
+    #[test]
+    fn the_schedule_section_clamps_like_the_python_patch_ranges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&tmp.path().join("absent.json")).unwrap();
+        assert!(cfg.schedule.enabled);
+        assert_eq!(cfg.schedule.interval_minutes, DEFAULT_SCHEDULE_MINUTES);
+        assert_eq!(cfg.schedule.interval().as_secs(), 1800);
+
+        let zero = ScheduleSection::from_value(&serde_json::json!({
+            "interval_minutes": 0,
+            "enabled": false,
+        }));
+        assert!(!zero.enabled);
+        assert_eq!(
+            zero.interval_minutes, MIN_SCHEDULE_MINUTES,
+            "0 clamps up: the timer must never become a busy loop"
+        );
+        assert_eq!(zero.interval().as_secs(), 60);
+
+        let huge = ScheduleSection::from_value(&serde_json::json!({
+            "interval_minutes": 99999,
+        }));
+        assert_eq!(huge.interval_minutes, MAX_SCHEDULE_MINUTES);
+        assert!(huge.enabled, "a missing enabled key keeps the default");
+    }
+
+    #[test]
+    fn only_an_explicit_false_disables_a_source_export() {
+        let stored = serde_json::json!([
+            {"key": "a", "name": "a"},
+            {"key": "b", "name": "b", "export": false},
+            {"key": "c", "name": "c", "export": 0},
+            {"key": "d", "name": "d", "export": "no"},
+        ]);
+        let sources = SourceSpec::normalize(stored.as_array().unwrap()).unwrap();
+        let flags: Vec<bool> = sources.iter().map(|s| s.export).collect();
+        assert_eq!(
+            flags,
+            vec![true, false, true, true],
+            "Python uses `is not False`: only JSON false turns export off"
+        );
+        assert!(sources[1].enabled, "export off does not disable measuring");
     }
 
     #[test]

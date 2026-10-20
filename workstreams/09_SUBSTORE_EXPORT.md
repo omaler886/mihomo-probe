@@ -11,8 +11,13 @@
 - 快照/回滚：现状仅 meta（count/时间），无版本快照与 diff/rollback——总控要求的 export_snapshots 落 R2/R8。
 
 ## 待办清单
-- [ ] R2：export_snapshots 表
-- [ ] R8：Rust 导出 + POST /api/v1/exports/{key}/rollback + diff
+- [x] R2：export_snapshots 表（0002 已有；0006 active pointer 待父任务注册）
+- [x] R8：Rust 导出 + POST /api/v1/exports/{key}/rollback + diff（2026-10-20 接线完成，见下）
+      `select_source_exports` + `publish_round`（engine）→ CLI/API 轮末调用 →
+      `GET /api/export/<key>.yaml`（publish token，原文返回 active snapshot）→
+      `GET /api/v1/exports`、`/history`、`POST /rollback`（admin）。
+      线上 ct186 实测：round 22 发布 pokenmen 18 / prologue 83 / purens 19 / 233pio 2，
+      Sub-Store collection `probe` 拉回 122 条（= 四份导出之和），标签 [CC] 按实测出口覆写。
 - [ ] R8：Script Operator 契约测试（fixtures/expected/）
 
 ## 内嵌 Sub-Store（probe-substore crate，2026-10-02，路线 C 先行落地）
@@ -59,5 +64,133 @@ release 二进制单进程实测（embedded 形态，30 次串行请求/路由�
 - Rust 新增：probe-substore 23 测（引擎回显/异常文本/KV 往返/$httpClient 本地桥/URL 全形态/runaway 中断/真 bundle env/cron 8 测）。
 
 ## 下一步
-- R2 快照表；R8 导出引擎；`$notification` 推送补 Apprise 渠道。
+- R8 发布原语已交接，待父任务接线与运行测试（见下）；`$notification` 推送补 Apprise 渠道。
 - 部署形态待拍板：hk3 compose 把 `substore.embedded` 打开并停独立 Sub-Store（需先备份迁移现有 subs/collections/air 脚本），或双轨并存。
+
+## Publication Worker Handoff (2026-10-09, Not Integrated)
+
+### Scope And Inputs
+- Read specification sections 10-12, migrations 0001-0003, storage conventions,
+  Python `_publish_sources`, `_apply_and_publish`, `_resolve_chain_dialers`,
+  `_export_proxies`, scalar quoting, and `_write_export`.
+- Read current `Collected`, `Job`, `NodeVerdict`, and round guard/outcome types.
+  Selection remains the parent's responsibility: use the complete round verdict,
+  original domain dictionaries from `Collected::originals`, measured form/region
+  labels, and explicit front remapping. Never export per-IP kernel aliases.
+- Owned changes only: `probe-storage/src/publication.rs` and its `publication/tests.rs`,
+  `probe-engine/src/publish.rs` and its `publish/tests.rs`, migration 0006, this document.
+  No module registration, manifests, old migrations, round/config/API/Python edits,
+  commits, deployment, additional agents, or credential-file reads.
+
+### Storage Contract
+- `Storage::list_exports(limit, after_key)` lists active metadata by ascending key.
+  `Storage::export_history(key, limit, before_id)` lists metadata by descending ID.
+  Neither query selects content. Pages must contain 1..=100 requested rows.
+- `current_export(key)` returns validated authoritative content in a consistent
+  SQLite read transaction; `export_snapshot(key, id)` returns validated same-key
+  content or `None`. `ExportSnapshot` deliberately has no Debug/Serialize.
+- `publish_export(PublicationInput)` uses an IMMEDIATE transaction for exact-byte
+  snapshot reuse/insertion, pointer activation, and an allowlisted audit record.
+  `expected_active: None` means "expect no active snapshot", not "skip CAS".
+- `rollback_export(key, target_id, actor, expected_active)` is explicit, same-key,
+  content/hash/count validated, CAS-protected, and audited in one transaction.
+  Materialize through the engine before calling this low-level activation API.
+- Audit kinds: `export_publish`, `export_force_publish`, `export_rollback`.
+  Details contain only key, snapshot ID, previous ID, hash, count, and actor.
+  Actor must be a non-secret principal label (ASCII alphanumeric / `_.@-`, max 64
+  bytes), never a credential. Forced no-ops still generate an audit record.
+- Limits: 8 MiB UTF-8 content, 1..=50,000 proxy dictionaries, 48-character keys.
+  Key checks reject path separators, control characters, leading/trailing dots,
+  outer whitespace, and unsafe filename punctuation; ordinary Unicode is retained.
+- Content for new primitives is a JSON ClashMeta document, also valid YAML.
+  Hash is lowercase SHA-256 over exact content bytes; count must equal `proxies.len()`.
+  Old snapshots/audits are never deleted or rewritten. Non-JSON legacy snapshots
+  remain stored but cannot activate until explicitly imported as validated JSON.
+- Migration 0006 adds `active_exports`, ownership/active-immutability triggers, and
+  indexes. It does not infer active state from the newest legacy row. Triggers
+  enforce ownership even with SQLite foreign keys disabled.
+- History is bounded by query pagination, not destructive retention. Repeated
+  identical same-key content reuses an existing snapshot, including after rollback.
+  Different keys never share snapshot IDs. Audit growth remains append-only.
+
+### Engine Contract
+- `render_clash_meta(proxies, groups)` returns a secret-bearing `RenderedExport`
+  without Debug/Serialize. JSON quoting preserves string short IDs, booleans,
+  Unicode, hashes, domains, SNI, unknown proxy fields, and explicit group order.
+  Dictionary keys are canonicalized; arrays are not reordered.
+- The renderer requires unique names across proxies/groups and rejects reserved
+  target collisions, dangling references, cycles, numeric REALITY short IDs,
+  ambiguous `dialer_proxy` aliases, empty groups, and dynamic provider membership.
+  Supported explicit group types: select, url-test, fallback, load-balance, relay.
+  A group/dialer must close inside the export or use a recognized builtin target.
+  Nothing silently drops proxies, removes dialers, or invents a replacement group.
+- `compare_snapshots(previous, current)` returns added/removed/changed opaque
+  identities (`proxy:` or `group:` plus SHA-256 of the name), counts, and a change
+  ratio. No raw names, connection fields, or credential values enter the diff.
+  A rename is add/remove; a credential or topology change under a name is changed.
+  Ratio is changed identities divided by the identity union, rounded upward in
+  basis points; complete replacement is 10,000. Group changes count as changes.
+- `decide_publication(policy, count, diff, force)` explicitly returns Disabled,
+  Empty, Guarded, DiffLimit, or Publish. Only guard/diff limits can be overridden;
+  disabled/zero-node output cannot be forced. First publication has no diff baseline.
+- `publish_export(storage, root, PublishRequest)` performs decision, render, diff,
+  immutable materialization, then CAS activation/audit. Parent supplies enabled/
+  guarded state, optional absolute/basis-point diff limits, and authenticated
+  authorization for the explicit force flag. Skips do not write files or snapshots.
+- `rollback_export(storage, root, key, target_id, actor, expected_active)` validates
+  topology and materializes exact stored bytes before the audited storage rollback.
+  It does not reserialize rollback content or change its hash.
+- `materialize_export(root, key, rendered)` returns an immutable
+  `<SHA256(key)>-<SHA256(content)>.yaml` path. Root must already exist, be absolute,
+  and have no symlink/reparse ancestors. Unix requires an owner-only root (0700).
+  The service must exclusively control the root and prevent hostile concurrent
+  mutation of its ancestors; path checks are not an OS sandbox for a hostile owner.
+- Unix files are created 0600 with CREATE_NEW, synced, installed by no-clobber
+  hard-link, staging-unlinked, and directory-synced. Windows uses a protected
+  owner-rights DACL at creation plus no-clobber write-through rename. Existing
+  files are checked for type, privacy, exact size/content, and unsafe links.
+  Unsupported platforms fail closed for private file creation.
+- DB activation is authoritative. Serve `current_export(key).content` or resolve
+  the matching immutable file, never a newest-file guess or mutable `.meta.json`.
+  Write/activation failures preserve the previous pointer/file. A failed DB
+  activation may leave a harmless immutable orphan; no automatic file GC is added.
+  Authenticated download content must never be embedded in list/status responses.
+- Official Sub-Store producer/conversion code is untouched. The parent must still
+  validate the real download path, especially groups that official subscription
+  conversion may omit. Native Mihomo acceptance is also a parent integration gate.
+
+### Parent Integration Checklist
+- [ ] Add `pub mod publication;` to probe-storage and `pub mod publish;` to probe-engine.
+- [ ] Add workspace `serde_json` and `sha2` dependencies to probe-storage.
+  Engine uses dependencies already present; no extra test dependency is required.
+- [ ] Register migration 0006, advance migration version, and include `active_exports`
+  in schema verification. Preserve the existing automatic pre-migration backup.
+- [ ] Wire full-round/source selection and guards, region/front remapping, private
+  root provisioning, actor authorization, safe DTOs, authenticated download, history,
+  diff, and explicit rollback APIs. Handle stale CAS by recomputing the decision.
+- [ ] Format, compile, and run both new test modules, then native Mihomo and official
+  Sub-Store validation. Run on Unix and Windows for platform-specific file behavior.
+
+### Verification And Remaining Risk
+- Added 31 test definitions: 16 storage and 15 engine (one engine case is Unix-only).
+  Coverage includes metadata-only paging, old-data preservation, same-content reuse,
+  hash/count/size rejection, cross-key rollback, actual SQLite trigger failures and
+  deferred COMMIT failure, independent-connection CAS, safe audit/diff payloads,
+  scalar YAML round-trips, topology, skipped/forced decisions, immutable files,
+  failed materialization/activation, successful rollback, and Unix link/privacy checks.
+- **Tests not executed:** modules/migration are intentionally unregistered in this
+  handoff. No unrelated green test run is claimed as publication coverage.
+- Attempted `rustfmt --edition 2021` on the four owned Rust files. The launcher
+  failed before formatting because it could not create its configured Rust home
+  (OS error 183). No toolchain search or environment/global change was attempted.
+- Owned-path `git diff --check` reported no tracked whitespace errors. Explicit
+  trailing-whitespace scanning of the new untracked Rust/SQL files found no matches.
+- Win32 FFI compilation, exact DACL behavior, write-through durability, and all
+  runtime/SQLite tests remain unverified until the parent runs the registered code.
+
+Parent commands after registration (not executed here):
+```text
+rustfmt --edition 2021 crates/probe-storage/src/publication.rs crates/probe-storage/src/publication/tests.rs crates/probe-engine/src/publish.rs crates/probe-engine/src/publish/tests.rs
+cargo test -p probe-storage publication::tests
+cargo test -p probe-engine publish::tests
+```

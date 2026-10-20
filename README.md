@@ -494,7 +494,13 @@ Token 存在 `data/config.json`，**分成两个**：
 - CORS 默认空数组（同源部署不需要）；CDN 部署时把前端 origin 精确加进白名单——
   **不做通配**，通配子域意味着任何一个 `evil.<你的域>` 都能读到带令牌的响应；
   `OPTIONS` 预检免鉴权（预检根本带不了自定义头）；
-- `/api/status` 返回的 `config` 里两个面板 token 已打码为 `***`。
+- `/api/status` 与配置保存响应中的 `config` 会掩码面板 token、告警凭据和
+  Sub-Store 后端的用户名/密码、密钥路径、query、fragment；后端保留可识别的
+  scheme/host/port。`***` 和 `https://主机/***` 回写时均表示「未修改」。
+- POST 请求体必须是 UTF-8 JSON 对象，上限 **2 MiB**，读取总预算 **15 秒**；
+  空请求体仍兼容无参数命令。畸形 JSON、负数/重复长度、截断正文或
+  `Transfer-Encoding` 返回 400，超时返回 408，超限返回 413，并关闭连接，
+  不会把解析失败当作空命令启动测活。
 
 ### 前后端分离（前端可部署到 CDN）
 

@@ -30,6 +30,13 @@ dist/
 # Workspace / assistant metadata (project notes may quote credentials)
 .workbuddy-ai/
 
+# Local cross-compile toolchain glue: .cargo/config.toml points at machine-
+# specific zig wrapper scripts under .tmp_diag/ (CI builds natively on Linux).
+.cargo/
+
+# Stray scratch ledger from an ad-hoc test run (unreferenced by any test).
+busy_test.db
+
 # Other AI tooling's workspace config
 .zcodeignore
 

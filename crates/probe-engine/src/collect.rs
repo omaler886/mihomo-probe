@@ -55,7 +55,8 @@ pub const FRONT_NAME_PREFIX: &str = "__FRONT";
 pub struct Collected {
     /// Kernel-ready proxies, in `prepare` order (unique names).
     pub proxies: Vec<Value>,
-    /// One job per proxy, aligned with `proxies` by index.
+    /// Aligned with proxies before network preparation. Afterwards exclusions
+    /// have a job but no kernel proxy; ready jobs map to proxies by unique name.
     pub jobs: Vec<Job>,
     /// Per-source fetch failures (`"<key>: <reason>"`). A failed source is
     /// skipped, never fatal: one dead subscription must not cost the round.
@@ -70,6 +71,12 @@ pub struct Collected {
     /// Chained nodes that got front variants (one count per node, not per
     /// variant).
     pub chained: usize,
+    /// Original domain-form proxies, indexed by ledger identity, for publication.
+    /// These contain credentials and must never be serialized into an API DTO.
+    pub originals: HashMap<(String, String), Value>,
+    /// Sources that could not be collected or completely classified this round.
+    pub preserved_sources: Vec<String>,
+    pub network: crate::network::NetworkSummary,
 }
 
 /// What `collect_fronts` produced.
@@ -192,10 +199,14 @@ pub async fn collect(
 ) -> Collected {
     let mut fetched = Vec::new();
     let mut errors = Vec::new();
+    let mut preserved_sources = Vec::new();
     for source in sources.iter().filter(|s| s.enabled) {
         match fetcher.fetch(source).await {
             Ok(proxies) => fetched.push(FetchedSource::from_spec(source, proxies)),
-            Err(err) => errors.push(format!("{}: {err}", source.key)),
+            Err(err) => {
+                errors.push(format!("{}: {err}", source.key));
+                preserved_sources.push(source.key.clone());
+            }
         }
     }
 
@@ -257,6 +268,31 @@ pub async fn collect(
     if plain_too && !chain.section.is_configured() {
         tracing::warn!("chain.test_plain_nodes 已开启但链式未生效，普通节点本轮仍按直连测");
     }
+    // The originals map carries the UPSTREAM dictionaries, not the probe's
+    // kernel forms: `expand_chains` attaches `dialer-proxy: __FRONT0__` to
+    // every chain variant and strips upstream dialers from direct twins, so
+    // keying by the expanded entries (first-wins, as this used to) made the
+    // chain variant's mutated proxy the node's "original" -- and publishing
+    // it dropped every chain-verified node as an unclosed dialer, because a
+    // front alias is not a published name. The direct twin's derived
+    // fingerprint is covered too: when the twin wins the fold, the publish
+    // pass looks the node up by that key. Phantom keys for entries that
+    // never got a twin are never read.
+    let mut originals = HashMap::new();
+    for entry in &entries {
+        let upstream = entry.proxy.clone();
+        originals.insert(
+            (entry.source.clone(), entry.fingerprint.clone()),
+            upstream.clone(),
+        );
+        originals.insert(
+            (
+                entry.source.clone(),
+                probe_source::variant_fingerprint(&entry.fingerprint, "direct"),
+            ),
+            upstream,
+        );
+    }
     let (expanded, chained) = expand_chains(
         entries,
         &front_names,
@@ -303,7 +339,12 @@ pub async fn collect(
                 node.category.clone(),
                 server_ip,
             )
-            .with_role(node.role, node.front.clone()),
+            .with_role(node.role, node.front.clone())
+            .with_origin(
+                node.original_name.clone(),
+                node.server.clone(),
+                node.proto.clone(),
+            ),
         );
         proxies.push(node.proxy);
     }
@@ -315,6 +356,36 @@ pub async fn collect(
         fronts,
         fronts_over_cap: pool.dropped_over_cap,
         chained,
+        originals,
+        preserved_sources,
+        network: crate::network::NetworkSummary::default(),
+    }
+}
+
+/// Collect and resolve one round under the stage budget and shared cancellation token.
+pub async fn collect_and_resolve(
+    fetcher: &dyn Fetcher,
+    sources: &[SourceSpec],
+    settings: &crate::RoundSettings,
+    chain: ChainContext<'_>,
+    services: &crate::network::NetworkServices,
+    ctx: &crate::RoundCtx,
+) -> probe_domain::DomainResult<Collected> {
+    let prepare = async {
+        let collected = collect(fetcher, sources, settings.verify.strip_ech, chain).await;
+        crate::network::prepare_network(collected, &settings.dns, &settings.verify, services, ctx)
+            .await
+    };
+    tokio::select! {
+        biased;
+        _ = ctx.cancel_token().cancelled() => {
+            Err(probe_domain::DomainError::Kernel("round preparation cancelled".into()))
+        }
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(settings.watchdog.stage_timeout_seconds), prepare,
+        ) => {
+            result.unwrap_or_else(|_| Err(probe_domain::DomainError::Kernel("round preparation timed out".into())))
+        }
     }
 }
 
@@ -372,6 +443,8 @@ pub async fn collect_fronts(
             relay: false,
             direct: true,
             chain: true,
+            // The front pool is infrastructure, never a subscription export.
+            export: false,
         };
         match fetcher.fetch(&spec).await {
             Ok(proxies) => resource = proxies,
@@ -529,6 +602,8 @@ async fn manual_fronts(
         relay: false,
         direct: true,
         chain: true,
+        // Manual fronts are infrastructure, never a subscription export.
+        export: false,
     };
     match fetcher.fetch(&spec).await {
         Ok(proxies) => proxies,
@@ -779,6 +854,7 @@ mod tests {
             relay: false,
             direct: true,
             chain: true,
+            export: true,
         }
     }
 
@@ -980,6 +1056,7 @@ mod tests {
                 relay: false,
                 direct: *direct,
                 chain: *chain,
+                export: true,
             })
             .collect()
     }
@@ -1323,6 +1400,60 @@ mod tests {
         // The kernel config holds the front proxy too, or the dialer dangles.
         assert!(out.proxies.iter().any(|p| p["name"] == json!("__FRONT0__")));
         assert_eq!(out.chained, 1);
+    }
+
+    /// The originals map is the publish pass's input contract: upstream
+    /// dictionaries, never the probe's kernel forms. `expand_chains` attaches
+    /// `dialer-proxy: __FRONT0__` to the chain variant and strips the
+    /// upstream dialer from the direct twin; keying by the expanded entries
+    /// (the old first-wins) handed publish the mutated variant, and
+    /// `close_dialers` dropped every chain-verified node as an unclosed
+    /// dialer. Both fold keys -- the chain variant's and the twin's derived
+    /// one -- must map to the node's upstream dictionary.
+    #[tokio::test]
+    async fn originals_carry_upstream_dicts_for_both_fold_keys() {
+        let fetcher = StubFetcher {
+            ok: vec![
+                ("air".into(), vec![chained("n", "1.2.3.4").proxy]),
+                ("pool".into(), vec![ss("front-a", "9.9.9.9")]),
+            ],
+            fail: vec![],
+        };
+        let admin = FakeAdmin::default();
+        let cache = manual();
+        let section = chain_section("", "pool", &[], 8);
+        let context = ChainContext {
+            section: &section,
+            publish_prefix: "probe",
+            admin: &admin,
+            manual: &cache,
+            mode: None,
+        };
+        let sources = vec![spec("air", "collection", "air", true)];
+        let out = collect(&fetcher, &sources, true, context).await;
+
+        let chain_fp = out.jobs[0].fingerprint.clone();
+        let twin_fp = out.jobs[1].fingerprint.clone();
+        assert_ne!(chain_fp, twin_fp);
+
+        for fp in [chain_fp, twin_fp] {
+            let original = out
+                .originals
+                .get(&("air".to_string(), fp.clone()))
+                .unwrap_or_else(|| panic!("no original for {fp}"));
+            assert_eq!(
+                original["dialer-proxy"],
+                json!("upstream-front"),
+                "the upstream dialer survives, not the kernel alias"
+            );
+            assert_eq!(original["name"], json!("n"));
+        }
+        assert!(
+            !out.originals
+                .values()
+                .any(|proxy| proxy.get("dialer-proxy") == Some(&json!("__FRONT0__"))),
+            "no kernel front alias may leak into an original"
+        );
     }
 
     #[tokio::test]

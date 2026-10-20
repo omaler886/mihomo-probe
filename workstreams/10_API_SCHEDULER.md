@@ -22,9 +22,17 @@ GET /healthz, /readyz, /metrics, /api/v1/status, /api/v1/nodes, /api/v1/nodes/{f
 - [x] R5：`POST /api/v1/rounds` 改为驱动 `probe-engine::run_round`
       （轮次行由 handler 同步开启以便在响应里返回 `round_id`，由 runner 关闭；
       响应体形状不变，仍是 `{"round_id": <id>, "started": true}`）
-- [ ] R9：`POST /api/v1/rounds/{id}/cancel`（runner 与闸门的取消语义已具备并已测，
-      缺的只是对外入口）
-- [ ] R8：补全 v1 其余端点 + OpenAPI schema
+- [x] R9：`POST /api/v1/rounds/{id}/cancel`（2026-10-20：`AppState` 注册在飞 `RoundCtx`，
+      在飞且匹配 200，无在飞 409 `no_round`，不匹配/非法 404；顺带修了开行失败不释放 in-flight 标志）
+- [x] R9：**进程内调度器**（Python `scheduler_loop` 对齐）——`probe-engine::scheduler::{decide, reap_orphan_rounds}`
+      + `probe-api::spawn_scheduler`（20s tick，serve 启动时拉起）；`GET /api/v1/status` 暴露
+      `schedule:{enabled,interval_minutes,next_run}`；孤儿轮按 watchdog 预算回收（note 与 duration_s=0 对齐 Python）
+- [x] R8：v1 其余端点 —— `GET /api/v1/nodes`、`/nodes/{fp}`、`/rounds`、`/rounds/{id}` 全部落地
+      （keyset 分页、字段白名单、publish token 一律 401）；导出面见 workstreams/09
+- [x] G16 `/metrics`（2026-10-20）：Prometheus 文本，全部数字在抓取时从账本现算（没有第二份计数器可漂移）——
+      轮次 finished/suspect/inconclusive/with_duration、节点按状态、活跃导出数、调度开关与间隔、上一轮 total/ok/failed/duration；
+      标签只有 `status`（≤5 值），key/指纹/主机名/凭据绝不进标签；admin 鉴权 + `no-store`；标签转义有专测
+- [ ] 剩余：OpenAPI schema、UI 适配
 - [ ] R8+：UI 适配（先复用静态页）
 
 ## 测试证据

@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import threading
+import urllib.parse
 from pathlib import Path
 
 # ROOT is where the app looks for its own files; HOST_ROOT is where those same
@@ -609,6 +610,21 @@ def _pop_path(cfg, path):
         node.pop(parts[-1], None)
 
 
+def _is_secret_mask(path, value):
+    """Return whether a submitted value is an unchanged credential placeholder."""
+    if value == SECRET_MASK:
+        return True
+    if path != "substore.backend" or not isinstance(value, str):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        return (parsed.scheme in ("http", "https") and bool(parsed.hostname)
+                and parsed.path == "/" + SECRET_MASK and not parsed.query
+                and not parsed.fragment and parsed.username is None)
+    except ValueError:
+        return False
+
+
 def validate_patch(patch):
     """Return (clean_patch, notes) for a config patch coming from the UI.
 
@@ -640,7 +656,7 @@ def validate_patch(patch):
         # The settings form round-trips the redacted /api/status payload; a
         # mask arriving here is the form saying "this field was not edited",
         # so the stored value must survive the save untouched.
-        if _get_path(clean, path) == SECRET_MASK:
+        if _is_secret_mask(path, _get_path(clean, path)):
             _pop_path(clean, path)
             notes.append(f"{path} 为掩码占位，已按未改动处理")
     for path, (low, high) in NUMERIC_BOUNDS.items():

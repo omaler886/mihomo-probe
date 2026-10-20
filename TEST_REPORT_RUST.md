@@ -5,6 +5,360 @@ Python 基线见 `workstreams/13_TEST_COMPATIBILITY.md`（R0: 568 通过 / 2 跳
 
 ---
 
+## CI 基线修复 + 线上部署复核 — 2026-10-20（工作区，未提交）
+
+起点：同一工作区 CI 三门全红——`cargo test --workspace --no-fail-fast` = 429 passed / 4 failed，
+`cargo fmt --all -- --check` 在 `crates/probe-api/src/lib.rs:12` 报 use 顺序，
+`cargo clippy --workspace --all-targets -- -D warnings` 在 `crates/probe-mihomo/src/exit.rs:138`
+报 needless_borrow。本文档上一节写的「Rust 257 通过」已过期（该工作区实为 433 项）。
+
+### 修复（每项都先复现失败，再验证通过）
+1. F1 `probe-api/src/lib.rs:657`——`host_port()` 对含凭据/query/fragment 的 URL 返回空。
+   改为显示专用 `display_host_port`（`probe-mihomo/src/controller.rs`）：容忍这些部分但绝不回显，
+   严格解析仍是请求 URL 的唯一来源；旧断言「一律 None」按新语义改写，另加 10 组对照用例。
+2. F2（安全）`probe-engine/src/publish/tests.rs:379`——导出根逃逸未被拦截。根因是 Windows verbatim
+   路径上 `PathBuf::join("..")` 会词法弹出父目录，旧检查看不到 ParentDir。落盘入口收敛到 `CheckedRoot`
+   （绝对路径 + 逐级 reparse 检查 + 独占所有权 + component 级前缀比较）。
+3. F3 `probe-mihomo/src/config_check/tests/native.rs:165`——用例把非规范临时路径喂给内核校验器，
+   helper 的契约断言直接 panic 提前退出，runner 于是返回 Ok。改为传 canonical 路径，并把断言加强为
+   「错误原因必须是 deadline」，意外早退不能再假绿。
+4. F4 `probe-storage/src/migrations.rs:255`——v3→v8 的旧表 SQL 逐字节快照随 0007/0008 加列过期。
+   改为 `nodes`/`results` 断言声明列清单（PRAGMA table_info，cid 顺序），其余表保留逐字节强断言。
+   反证：删掉 0007 对 nodes 的两条 ALTER → 8 个用例失败（7 个真实读写报 no such column: exit_ip）。
+
+### 最终门禁（2026-10-20，工作区）
+```text
+cargo fmt --all -- --check                              -> 退出 0
+cargo clippy --workspace --all-targets -- -D warnings    -> 退出 0
+cargo test --workspace --no-fail-fast                    -> 435 passed / 0 failed
+  probe-api 9 / probe-config 28 / probe-dns 60 / probe-domain 41 / probe-engine 122
+  probe-mihomo 44 / probe-source 47 / probe-storage 61 / probe-substore 23 / probe-cli 0
+python -X utf8 -m unittest discover -s tests             -> Ran 596 tests, OK (skipped=2)
+cargo check --target x86_64-unknown-linux-gnu -p probe-engine -p probe-mihomo --all-targets
+                                                          -> 退出 0（部署目标平台；覆盖 cfg(unix) 分支）
+```
+
+### 线上部署复核（ct186 = 216.167.28.249:10052）
+- 部署面：`probe-cli` sha256 `b0dd462a…` 与本工作区 `target/x86_64-unknown-linux-gnu/release/probe-cli`
+  逐字节一致；systemd = probe-kernel(mihomo v1.19.32) / probe-api(127.0.0.1:8088) /
+  probe-tunnel(probe.bucher.dpdns.org) / probe-round.timer（每小时一轮）。
+- 断点：round 7–18（2026-10-19T16:54Z 起）每轮 0 节点。原因：Sub-Store 组合订阅 `probe` 的 5 条
+  remote 成员指向已失效域名 `probe.eminet.ggff.net`（CF 530 / error 1033），而接替域名
+  `probe.bucher.dpdns.org` 没有 `/api/export/*`（R8 发布面未实现，404）。
+- 恢复（用户授权的数据源改指）：把该 collection 的成员改指 5 条 `-local`（318 条代理，与账本
+  round 6 的 312 个名字重叠 265 个）→ 手动触发 round 19：
+  `tested 462/462 variants: 314 nodes, ok 64, failed 249, inconclusive 1`，14 分 12 秒完成；
+  节点状态由 unknown 247 收敛为 dead 242 / alive 65 / pending 3 / unknown 4，exit_history 新增 75 行。
+- 未验证：真内核 L2/L3 真流量端到端仍只有 mock 证据；`probe-*-local` 快照的生成轮次未考据。
+
+### R8 发布闭环接线 + 线上落地（同日第二批）
+- 接口冻结（`probe-config`）：`PublishSection{enabled,push_to_substore,prefix,hostname,add_region_tag,token,dir}`、
+  `PublishSection::export_root(root)`、`SourceSpec.export`（Python 语义：只有显式 `false` 才关）。
+- 引擎：`select_source_exports`（只导出存活节点的**原始域名字典**、同名变体折叠、`[CC]` 幂等覆写、
+  dialer 必须在本文件内闭合，否则连同依赖者一起丢弃并记 `UnclosedDialer`）+ `publish_round`
+  （`PublishRoundRequest{publish,sources,collected,verdicts,guard,measured,actor}`）。
+- 跳过口径与 Python 对齐（engine.py:2275-2313）：只有 `enabled=false`、`guard==PreservePreviousState`
+  （存活下限护栏）或 `MarkRoundInconclusive && !measured` 才整轮不发布；**部分覆盖照常发布**
+  （线上教训：round 19/20 有 1 个 inconclusive 节点就整轮跳过 → 永远不产出）。
+- API：`GET /api/export/{key}.yaml`（publish token 或 admin，常量时间；空 token 一律 401；正文为 active snapshot 原文）、
+  `GET /api/v1/exports`、`/api/v1/exports/{key}/history`、`POST /api/v1/exports/{key}/rollback`（admin，CAS）。
+- 线上验证（ct186=216.167.28.249:10052，二进制 sha256 `3aaf4400…`）：
+  - 配置改为 5 个真实上游源（pokenmen/prologue/purens/233pio/saki）+ `publish.dir=/opt/probe/exports`（0700）。
+  - round 22：`161 nodes, ok 126, failed 32, inconclusive 3`，轮末发布 4 个源（18/83/19/2；saki 上游 500 → NoAliveNodes 保留上一份）。
+  - `active_exports` 4 行、`export_snapshots` 4 行（sha256/count 一致）、导出目录 4 个 0600 不可变文件。
+  - `GET /api/export/<key>.yaml?token=…`：本机与公网（`probe.bucher.dpdns.org`）均 200，正文逐字节一致；
+    无 token/错 token 401、未知 key 404。
+  - Sub-Store 5 条成员 URL 指回新域名后，collection `probe` 下载 200 / 122 条代理（= 四份导出之和）；
+    122 条里 108 条的 `[CC]` 与 `exit_history` 实测出口国别一致，14 条因所选变体没有出口身份而保留上游标签（保守行为，待跟进）。
+- **真实内核验收（parent integration gate，2026-10-20）**：把 4 份已发布导出逐个交给线上真实的
+  `mihomo v1.19.32` 做 `mihomo -t -d <tmp> -f <export>.yaml`，4/4 **ACCEPTED**；对照内核正在跑的
+  `/opt/probe/core/config.yaml` 同样 ACCEPTED。内核口径解析出的节点数 19/18/83/2 = 122，与
+  Sub-Store collection 下载到的 122 条一致。
+- 已知限制：`probe-*-local` 快照未清理（推模式接线后会被覆盖成新内容）；
+  未验证：真内核 L2/L3 真流量端到端仍只有 mock 证据。
+
+### 第三批：调度器 / 读取面 / 耗时入账 / 推模式 / 前置校验（2026-10-20 晚）
+
+- **G09 调度器**：`probe-engine::scheduler::{SchedulerDecision, decide, reap_orphan_rounds,
+  parse_stored_instant, OrphanLedger, STARTUP_GRACE, ORPHAN_NOTE}`（纯函数 + 固定时间戳用例）
+  + `impl OrphanLedger for Storage`（真 SQLite 回收用例；孤儿轮 `duration_s=0` 对齐 Python）
+  + `probe-api::spawn_scheduler`（20s tick，`serve()` 启动即拉起，`spawn_scheduler_every` 供测试注入）。
+  `/api/v1/status` 新增 `schedule:{enabled,interval_minutes,next_run}`。
+- **G14 读取面**：`GET /api/v1/nodes`（keyset `(source,fingerprint)`、16 字段白名单、`server` 只出 host）、
+  `/nodes/{fp}`（+状态历史）、`/rounds`、`/rounds/{id}`、`POST /rounds/{id}/cancel`（在飞 CAS 槽：200/409/404）。
+  `/api/v1/status` 的 `rounds.last` 补全计数与 `duration_s`（面板三张卡不再显示 '-'）；publish token 对读取面一律 401。
+- **耗时入账**：`probe-storage::{finish_round_timed, finish_round_full_timed}`（duration 与关闭同一条 UPDATE，
+  不新增失败面）+ runner 侧 `measured_seconds`（Python `round(x,1)`；NaN/inf/负数 clamp 到 0.0，时钟回拨读 0）。
+- **G13 推模式**：`probe-engine::publish::push_round_exports`（只推本轮 Published 源、正文取活跃快照、
+  payload 九字段对齐 Python、prune 三重作用域 = 前缀 + `-local` + `source==local`、list 失败一律不删、
+  所有后端失败只记 `PushRecord` 绝不影响轮次）。`probe-source::SubAdmin::list_subs` 新增。
+- **G03 前置校验**：`probe-engine::preflight::{make_testable, KernelValidator, MihomoValidator, MAX_PRUNE}`——
+  内核 `-t` 校验 → 按**账本身份**（`fingerprint_proxy`，忽略名字）剪掉被拒节点并重写重试（Python `make_testable`）
+  → 仍被拒则 `Rejected` 让调用方 block 本轮；`Degraded`（无 MIHOMO_BIN 且无 docker）只跳过不失败；
+  内核文本 200 字符有界并把 secret 换成 `[redacted]`。CLI 与 API 两条轮次路径都已接线。
+
+门禁（同一工作区）：
+```text
+cargo fmt --all -- --check                              -> 退出 0
+cargo clippy --workspace --all-targets -- -D warnings    -> 退出 0
+cargo test --workspace --no-fail-fast                    -> 509 passed / 0 failed
+  probe-api 32 / config 32 / dns 60 / domain 41 / engine 156
+  probe-mihomo 44 / source 50 / storage 71 / substore 23
+python -X utf8 -m unittest discover -s tests             -> Ran 596 tests, OK (skipped=2)
+```
+- 环境限制（如实记录，非代码问题）：跑 `probe-substore`（rquickjs）相关构建/测试时，本机多次出现 rustc 原生崩溃
+  （`0xC0000409` STATUS_STACK_BUFFER_OVERRUN）与运行器退出；随后 `target/` 出现损坏产物
+  （proc-macro2 报 "only metadata stub found for rlib dependency core"，交叉构建报 158 个 E0463 类错误）。
+  处置：`cargo clean` + `CARGO_BUILD_JOBS=2` + `CARGO_INCREMENTAL=0` 全量重建交叉目标。
+  上述 host 门禁是在产物损坏之前实测通过的；交叉构建失败属于产物/环境损坏。
+
+### 第三批线上落地（ct186，2026-10-20T10:0xZ）
+- 二进制：`cargo clean` 后全量重建的 `probe-cli`，sha256 `3e790e0f…`（与损坏前同一次构建**逐字节一致**，可复现），
+  已部署到 `/opt/probe/bin/probe-cli`；`probe-api.service`/`probe-round.service` 增加 `MIHOMO_BIN=/opt/probe/bin/mihomo` drop-in。
+- **进程内调度器已接管**：`systemctl disable --now probe-round.timer`（单元保留作手动回退），
+  启动 4 秒后即由调度器自动开轮（journal：`scheduler started a round round_id=27`）。
+- round 27（API 路径，trigger=schedule）：`141 nodes, ok 106, failed 33, inconclusive 2`，`duration_s=111.6`（**该列首次被写入**）；
+  轮末 4 源发布（14/70/16/1，saki 上游 500 → NoAliveNodes），随后 **4 条 `<prefix>-<key>-local` 推回 Sub-Store**
+  （journal：`export pushed into Sub-Store … name=probe-pokenmen-local node_count=14`）；
+  Sub-Store 侧核对 `probe-pokenmen-local`：`source=local`、`14 proxies`、`displayName=pokenmen 测活 (14)`。
+- 读取面实测：`/api/v1/status` 带 `schedule{enabled,interval_minutes,next_run}` 与完整 `rounds.last`；
+  `/api/v1/nodes?limit=2` 200（16 字段白名单）、`/api/v1/rounds?limit=2` 200、未知节点/未知轮次 404、
+  `POST /api/v1/rounds/{未知}/cancel` 404（标准错误体）、publish token 与空 token 访问读取面均 401。
+- 收尾：`schedule.interval_minutes` 回到 60（`next_run` 11:05:29Z），systemd 定时器已停用，三个服务 active。
+- 未验证：真内核 L2/L3 真流量端到端（G07）；`_local` 之外的旧快照清理；`/metrics`、迁移模式、UI 仍未做（见 17 审计矩阵）。
+
+### 第四批：`/metrics` 与 CLI 进程级测试（2026-10-20 深夜）
+
+- **G16 `/metrics`**（`probe-api/src/metrics.rs` + `probe-storage::MetricsSnapshot`）：admin 鉴权、`text/plain; version=0.0.4`、`no-store`；
+  数字全部在抓取时从账本现算（三条索引查询），因此没有第二份计数器会漂移或在重启后丢失：
+  `probe_rounds_finished_total` / `_suspect_total` / `_inconclusive_total` / `_with_duration_total`、
+  `probe_nodes{status=...}`、`probe_exports_active`、`probe_scheduler_enabled`、`probe_scheduler_interval_minutes`、
+  `probe_round_last_{total,ok,failed,duration_seconds}`。标签只有 `status`（≤5 值）；标签值按文本规范转义，
+  并有一条「恶意 status 不能注入新指标行」的用例。
+- **probe-cli 首个测试**（此前该 crate 测试数为 0）：`crates/probe-cli/tests/db_commands.rs` 以**真二进制**跑
+  `db migrate / check / backup / rollback / verify`：全新账本迁移→检查（`0 pending`、`integrity_check: ok`）→备份→
+  **备份后写入一条轮次**→未加 `--yes` 的回滚被拒（exit 2，且账本未被改动）→加 `--yes` 回滚成功（写后那条消失、
+  回滚自带 verify）→`db verify` 通过；另有「缺失账本 check 退 1 并点名路径」「未知子命令退 2」「缺 `--from` 退 2」。
+- 门禁：`cargo fmt --all -- --check` 0；`cargo clippy --workspace --all-targets -- -D warnings` 0；
+  `cargo test --workspace --no-fail-fast` = **520 passed / 0 failed**
+  （api 36 / cli 4 / config 32 / dns 60 / domain 41 / engine 156 / mihomo 44 / source 52 / storage 72 / substore 23）；
+  `python -X utf8 -m unittest discover -s tests` -> Ran 596, OK (skipped=2)。
+  线上（ct186）：新二进制 `cf81a1b1…` 已部署，`GET /metrics` 实测 200、
+  `content-type: text/plain; version=0.0.4; charset=utf-8`、`cache-control: no-store`、15 条指标行，无 token 401。
+- **G02 边界**（同批）：`probe-source` 的 Sub-Store 客户端把重定向限制为 5 跳（此前用 reqwest 默认），
+  响应体改为**流式读取**并在 8 MiB 处拒绝（此前 `Response::text()` 无上限）——
+  两条都带用例（自指的 302 循环必须失败为 redirect；超限正文必须报 exceeds，而不是先缓冲进内存）。
+- **G15 只读面板**（`probe-api/src/lib.rs` 的 `PANEL_HTML`，9.8 KB，无外部依赖）：
+  概要卡（状态 / 轮次 / 存活 / 失败 / 总数 / 耗时 / 下次轮次）、带状态+来源筛选与游标翻页的节点表、
+  轮次表、导出表（每个 key 一个「下载」按钮，用 admin 凭据直接取 `/api/export/<key>.yaml`）。
+  渲染全程 `textContent`（新增用例断言面板里**不存在** `innerHTML`），页面不含任何写操作入口；
+  JS 用 `node --check` 做过语法检查，线上 `/` 与 `https://probe.bucher.dpdns.org/` 均 200。
+- **G20 供应链门禁**（同轮）：
+  - `cargo audit` 实测出 **7 个漏洞**：`rustls 0.23.45`（4 条，含会话密钥经 Debug 泄露、ECH 降级、
+    brotli 解压放大到 1 GiB）与 `zip 2.4.2`（3 条，含 SUID/SGID 保留、解压软链逃逸，CVSS 9.1）。
+    处置：`cargo update -p rustls` → 0.23.46；`zip` 2.2 → **9.0.5**（调用点只需兼容编译，
+    且我们从未调用被点名的 `extract()`，只用 `enclosed_name()` + 逐条写盘）。现在 **0 漏洞 / 0 警告**。
+  - 顺带清掉未维护依赖：`serde_yaml`（deprecated）→ `serde_yaml_ng` → 仍带 `unsafe-libyaml` →
+    最终换 **`serde_norway` 0.9.42**（维护中的 fork，后端 `unsafe-libyaml-norway`），advisory 归零。
+  - 新增 `tools/license_check.py`：读 `cargo metadata --locked`，对 245 个第三方包做 SPDX 表达式求值
+    （`OR`/`AND`/`WITH`/括号 + 老式 `MIT/Apache-2.0` 归一），白名单 12 条；当前 **clean**。
+  - 新增 `tools/sbom.py`：`cargo metadata --locked` → CycloneDX 1.4 JSON（245 components、purl、license），
+    输出确定性（仅 timestamp 变动），CI 里作为 artifact 上传。
+  - CI（`.github/workflows/ci.yml`）改为 `--all-features` 的 clippy/test，并新增 license / advisories / SBOM 三步。
+- **G07 真流量取证（同轮）**：`verify.chain_payload` 增加 `scope: "chain" | "all"`（默认 `chain`，保持 Python 语义；
+  `all` 让每个存活节点都真拉一次页面）。线上 ct186 置 `scope=all` 后跑 round 29：
+  133 节点 / ok 96，**150 个变体各完成一次真实页面拉取，合计 8,005,808 字节**（单条约 372 B–52 KB），
+  **2 个「延迟通过但真实 TLS 拉不动」的节点被判 `payload_fail`**——正是 Python 记录的那类假活；
+  同时 L2 出口验证留下 150 条观测（83 个不同出口 IP、18 个国家）。轮次耗时 111.6s → 174.4s，
+  仍在 25 分钟看门狗之内。用例：`scope=all` 时直连节点的 payload 失败必须变成 `payload_fail` 判决（而非 uncertain），
+  `scope=chain` 时直连节点完全不发真实流量。
+- **面板：出口与质量视图（同轮）**：
+  - 节点表新增**实测出口列**（`exit_ip` + `exit_asn`，来自 L2 出口验证）；
+  - 点击任一节点行 → 详情区显示**质量窗口**与状态变更历史；质量由既有 `probe-domain::quality::summarize_samples`
+    计算（该模块此前无生产调用方），窗口取该节点最近 50 条 results，**按时间正序**喂入（抖动定义在相邻序上）：
+    样本数/成功数/成功率、min/median/p90/p95/max 延迟、抖动、出口数与出口稳定度。
+  - 新读取面：`Storage::recent_results(source, fingerprint, limit)`（keyset 无关，round_id DESC + limit 校验）；
+    `GET /api/v1/nodes/{fp}` 响应新增 `quality`（空窗口为 `null`，**不编造 0**）。
+  - 线上实测（节点 `233pio/🇼🇸 TW-Taichung…`）：`window 2 / success_rate 1.0 / median 214ms / p95 250.9ms /
+    jitter 82ms / exits 2 / exit_stability 0.5` —— 两条样本两个不同出口 IP，稳定度如实反映。
+- **导出快照保留策略（同轮）**：`publish.keep_snapshots`（默认 `None` = 全留；`0` 视为未设置，
+  绝不会被读成「全部删除」）。每轮发布后（**即使本轮因护栏跳过发布也照跑**）执行一次保留：
+  `Storage::prune_export_snapshots` 只删「不在最新 N 条、且不是 active」的行（active 还被 DB 触发器二次保护），
+  然后 `prune_publications` 按 `<sha256(key)>-<sha256(content)>.yaml` 命名规则删除**不再被任何行引用**的文件；
+  不是该命名格式的文件（README、备份、别人的东西）一律不碰。
+  - 线上取证：keep=3 时 round 31 触发 `export retention pruned superseded snapshots round_id=31 snapshots=14 files=14 keys=4`，
+    账本 26 行/26 文件 → **13 行/13 文件**（`prologue` 保留 4 条，因为它的 active 快照比最新 3 条更老——active 永不删）；
+    随后恢复 keep=20，导出接口仍 200、4 个 active key 完整。
+  - 用例：三次发布 → `keep=1` 只留 active（删 2 行 2 文件、外来文件无恙、再跑一次为 no-op）；配置侧覆盖 `0 → None`。
+- **面板：来源 / 护栏 / 保留量（同轮）**：
+  - `/api/v1/status` 新增 `sources`（按来源的 total/alive/dead，来自新 `Storage::source_summary()`）与
+    `exports: {active, snapshots}`（`active_export_count()` + `snapshot_count()`），全部是索引计数，无节点名/地址。
+  - 面板：新增「来源」表（含存活率）、轮次表新增「护栏」列（suspect/inconclusive/dropped/restored 标注）、
+    概要卡新增「导出 key / 快照」。
+  - 线上实测：`sources` 5 行（233pio 10/7、pokenmen 18/18、probe 314/65、prologue 126/98、purens 43/33），
+    `exports {active: 4, snapshots: 13}`，round 31 显示 `inconclusive: true`、`suspect: false` —— 与账本一致。
+- **配置自检（同轮，并明确不做「配置编辑」）**：
+  - 背景：`Config::load` 对**读不到或非 JSON** 的文件一律回退成默认值（Python `stored = {}`），
+    这是正确的运行时行为，但意味着 `config.json` 里一个手抖就可能让服务静默以默认值运行（来源没了、发布凭据没了），
+    **日志里一句话都不会说**。
+  - 新增 `Config::parse(&str) -> (Config, json_valid)`（`load` 改为读文件后调用它），
+    以及 `GET /api/v1/config/validate`：解析**进程启动时那个文件**，返回 `json_valid`、生效摘要、
+    以及与当前运行值的差异列表（`schedule`/`publish`/`sources`/`verify.chain_payload`/`core`/`chain`）；
+    所有凭据只输出 `*_configured` 布尔，绝不回显。
+  - 面板新增「配置」卡：`正常` / `未重启`（文件与运行值不一致）/ `JSON 损坏`，点击展示差异。
+  - 线上实测：`json_valid true`、`matches_running true`、差异为空，摘要含 `keep_snapshots 20`、
+    `payload_scope all`、`schedule 60`；**响应体不含 admin token 也不含 publish token**。
+  - **配置编辑（写入）明确不做**：它需要写文件 + 重启语义，而文件坏掉的后果正是上面那个静默回退——
+    在有 SSH 的前提下，面板写入只会把一个已有故障模式搬到浏览器里。审计矩阵里记的是这个理由，而不是一个永远不做的 TODO。
+- **模糊测试（同轮，G20 尾项）**：本机没有 nightly，`cargo-fuzz`/libFuzzer 用不了，
+  所以把「随机输入下不崩」做成**确定性变异测试**进 CI（固定种子 + 固定变异计划，失败可复现）：
+  - `probe-config`：`Config::parse` × 2000 次（改字节/截断/插入/追加 0x00 0xFF/反转），断言永不 panic；
+  - `probe-mihomo`：`parse_trace` × 1000 次，断言键非空且已 trim、值不含换行且已 trim；
+  - `probe-source`：`parse_proxies` × 1000 次，断言不 panic、Ok 时每个条目都是对象。
+  - 第一次跑就抓到真问题：`parse_trace` 对 `ip=…\r=` 这类输入会保留**行内 `\r`**；
+    查 Python `partition("=").strip()` 行为一致，故**保持parity**并把「为什么允许」写进断言注释，
+    而不是偷偷改解析行为。
+  - libFuzzer 的跑法记在下方「手工验证」小节，供有 nightly 的环境深挖。
+- **crate 签名**：评估结论是**当前不适用**——唯一的产物分发方式是从操作机 SSH 拷二进制（CI 产物由平台完整性保护），
+  真正适用的控制是「上传前后哈希一致」，这一步本来就在部署流程里（每次部署都打印两端 sha256 并核对）。
+  等出现 GitHub Release / 包分发时再引入签名，届时 SBOM 与签名一起出。
+
+- **链式路径真流量取证（同轮，G07 最后一个未验证分支）**：在 ct186 上起了一个**完全隔离**的实例
+  （`/tmp/chain` 自有 root/DB、自有 mihomo：控制器 19191、车道 19300/19301、混合端口 19397/19398），
+  配置 `chain.enabled=true`、前置来源 `pokenmen` 按名单取 2 条真实节点、`test_plain_nodes=true`（客户端路径模式）、
+  `verify.chain_payload.scope=chain`、发布关闭。
+  - 结果：**76 个变体、74 条 chain 记录、24 条存活、24 条完成真实页面拉取、合计 790,896 字节**；
+    两个前置均 alive（147ms / 146ms），chain 记录的出口 IP 随前置不同而不同（`42.200.173.215` vs `42.200.172.135`）——
+    说明流量确实从不同前置出去；单条 payload 达到 65,536 字节上限。
+  - 过程中修掉两处真问题：① `probe-cli round` 从未初始化 tracing，前置池告警**全部静默**（已加，默认 `warn`，`RUST_LOG` 可调）；
+    ② `probe-cli --help` 直接报 `unknown argument`（已加用法说明，未知命令也打印用法）。
+  - 踩到并记录：隔离实例必须改 `core.mixed_port`（默认 19194 与生产内核冲突 → reload 整包失败 → 全部 `front_dead`）；
+    `chain.front_source` 在 JSON 里是**嵌套对象** `{kind,name}`，写成扁平键会被静默忽略。
+
+- **质量抽样（同轮，G07 最后一项）**：新增 `quality` 配置段（`enabled` 默认 false、`sample_size` 默认 5、
+  `max_bytes` 默认 256 KiB、`timeout_s` 15），在轮次**验收完成之后**对**分散抽样**的存活节点各做一次有上限的真实传输，
+  写入新表 `quality_samples`（迁移 0009，`PRIMARY KEY (round_id, source, fingerprint)` 使重跑幂等），
+  并在节点详情里给出 `transfers` 与 `throughput_mbps`（十进制 Mbps，聚合口径同 `probe-domain::quality`）。
+  - 设计取舍：抽样用「每隔 k 个取一个」而不是「取前 k 个」——同一订阅的前几个节点通常同属一家、机型最便宜，
+    只测它们不构成对整轮的抽样；抽样失败**不改变判决**（吞吐探测超时说明不了节点死活，轮次已经判过了）。
+  - 线上实测（round 33，281 节点 / ok 239 / 402.7s）：**3 条样本、合计 185,837 字节 / 4,289ms**
+    （`purens` 90,917B/2,907ms、`prologue` 94,548B/920ms、`233pio` 372B/462ms），
+    节点详情实测 `transfers: 1, throughput_mbps: 0.25`。
+  - 用例：① 存储层「同一轮重复写入是 no-op、limit=0 被拒」；② 引擎层「4 个存活 + 1 个失败、sample_size=2 →
+    取到 a/c 而不是 a/b、失败节点绝不探测、`enabled=false` 时零流量」；③ API 层「1 MB / 100 ms → 80 Mbps」。
+
+- **依赖策略门禁（同轮，G20 收尾）**：新增 `tools/dependency_policy.py`（**不引入 `cargo deny`**——它的配置 schema 随版本变，
+  而我在本机无法固定版本验证；写一份没跑过的 deno.toml 塞进 CI 只会在某天变红）。策略用 `cargo metadata --locked` 直接判定：
+  - **来源**：注册表依赖必须来自 crates.io；不允许 git 依赖；不允许工作区之外的 path 依赖；
+  - **禁令**：`openssl` / `openssl-sys` / `native-tls` / `libgit2-sys` / `cloudflare-zlib` 五个名字，
+    每一条都对应本项目**主动关掉的门**（rustls 是唯一 TLS 栈）；
+  - **可重现性**：注册表依赖不得用通配符版本 `*`；
+  - **只报告不拦截**：13 个多版本 crate（健康依赖图里正常）、40 个带 build script 的 crate（构建必需）。
+  - `--selftest` 用合成图证明每条规则都会真的触发（6 条规则全中），避免「策略写了但从不生效」。
+  - 实测：`dependency policy: clean (243 third-party crate(s), 5 denied name(s), 0 wildcard registry requirement(s))`。
+  - 过程中修掉一个自己的 bug：cargo 写的是**绝对** path，且仓库路径含非 ASCII，字符串前缀比较在 Windows 上不稳；
+    改成「path 依赖的目标必须是本工作区成员」——语义更准，也不受编码影响。
+
+- **跨进程轮次锁（同轮，G06 的 process exclusion）**：新增 `probe_engine::RoundLock`——
+  `<root>/data/round.lock` 用 `create_new`（POSIX `O_EXCL` / NTFS `CREATE_NEW`）原子创建，写入 `pid=` 与起始时间；
+  文件年龄超过看门狗预算即视为陈旧并夺取一次；`Drop` 只删**自己 pid** 的那份（防止慢轮次被夺取后误删别人的锁）。
+  服务端 `spawn_round` 与 `probe-cli round` 都取锁。
+  - 线上取证（round 34，263 节点 / ok 220 / 379.8s）：轮次运行中锁文件为 `pid=16456 started=…`，
+    同时手工执行 `probe-cli round` → **exit 2**，输出 `round refused: another round is already running (pid=16456 started=…)`；
+    轮次结束后锁文件消失。
+  - 用例：第二次取锁被拒且信息含持有者 pid；把锁文件 mtime 改到 2 小时前后可夺取、Drop 后文件消失。
+- **收尾审计（同轮）**：逐行核对审计矩阵，补齐 9 行的证据与结论（G01/G03/G06/G08/G10/G11/G17/G18/G21），
+  把 G13 的缺口改写成明确的一句话（不实现 Sub-Store 侧 operator 配置），并在矩阵开头写明当前状态与**仅剩的 4 项**。
+
+- **未测节点优先（同轮，G09）**：`run_round` 开头按账本状态重排任务——`pending`/`unknown`（以及**账本里根本没有行**的节点）
+  排在最前，其余保持原有相对顺序（`sort_by_key` 稳定排序，只在两个 rank 之间排序）。
+  动机是**取消/超时下的覆盖率**：一轮若被看门狗中断，尾部节点永远轮不到；按未测优先，每轮都在推进没人见过的节点，
+  而不是反复重测列表头部。`Ledger::node_statuses` 有新默认实现（返回空 = 不重排），`Mutex<Storage>` 用一次查询提供真实状态。
+  - 线上取证（round 35）：`INFO probe_engine::round: unmeasured nodes scheduled first unmeasured=19 measured=327`。
+  - 用例：① `alive/pending/dead` + 一个**账本里不存在**的节点 → 顺序必须变成 `pending, 不存在, alive, dead`；
+    ② 空账本 → 顺序完全不变（排序只在有信息时发生）。
+  - 顺带确认：Python 侧既没有 pending 优先也没有 dead backoff，所以这两项是本项目的增强，不是 parity 缺口。
+
+- **事件日志（同轮，G14 最后一项）**：`events` 表在 Python 时代由 `db.log()` 写入并裁剪到最新 2000 条，
+  但 Rust 侧**从来没有写过也没有读过**——它只是一张躺在 schema 里的死表。本轮接通：
+  - `Storage::record_event(level, message)`（消息按字符截断到 500）+ `recent_events(limit)`（新到旧），
+    写入后按 Python 语义裁剪到最新 2000 行；
+  - API 在轮次生命周期的关键点写事件：`round N started (trigger=…)`、`round N closed: total/ok/failed/inconclusive/dropped`、
+    来源拉取失败（warn，带原始错误摘要）、轮次失败（error）；写事件走独立线程，**绝不因为写日志失败而影响轮次**；
+  - 新端点 `GET /api/v1/events?limit=`（admin），形状与 Python 一致 `{"events": [...]}`，limit 非法回 400 而不是静默截断；
+  - 面板新增「事件」表（时间/级别/内容，warn 黄、error 红），加载时取最新 20 条。
+  - 线上取证（round 36）：部署前 `events` 0 行 → 触发轮次后立刻出现
+    `[warn] source fetch failed: saki: HTTP 500 …` 与 `[info] round 36 started (trigger=api)`，`/api/v1/events?limit=5` 返回 200。
+  - 用例：存储层（新到旧、截断、limit=0 被拒）与 API 层（两行事件、顺序、`limit=0` → 400）。
+
+### 手工验证：libFuzzer（需要 nightly + Linux/WSL）
+```bash
+cargo install cargo-fuzz
+cargo +nightly fuzz init            # 只做一次，生成 fuzz/
+# 目标：fuzz_targets/config_parse.rs -> probe_config::Config::parse
+#       fuzz_targets/trace_parse.rs  -> probe_mihomo::exit::parse_trace
+cargo +nightly fuzz run trace_parse -- -max_total_time=300 -rss_limit_mb=2048
+```
+种子语料就是上面三个测试里的 `SEEDS`；变异测试发现的每个输入都应当加进语料并补一条回归用例。
+
+---
+
+## 安全与轮次可靠性补丁 — 2026-10-09（工作区，未提交）
+
+基于 `c2a88fd`，默认实现仍为 Python；本批未连接 VPS、未部署、未推送。
+起点实跑：Python 573 总计（571 通过 / 2 跳过），Rust 243 通过。
+
+### 复现与修复
+- Python：新库首次调度饥饿、线程启动失败占住 BUSY、畸形/截断 JSON 被当作空
+  命令执行、负数/重复长度与无正文上限、URL 用户信息及 fragment 泄露、
+  host 保留型脱敏地址回写覆盖真实后端、共享库忽略 Rust inconclusive。
+- Rust：拒绝 reload 仍测旧别名、converge/baseline 错误绕过关闭轮次、
+  结果写入失败但节点状态已提交、取消/空轮次被当成有效基线、变体计数
+  抬高下轮护栏、失败抹掉分类、状态地址字符串切分漏出完整 URL。
+- 已定位缺陷的回归先在修前代码上确认失败；修复后补测取消准备阶段、提交边界、
+  worker panic、控制器中途故障、按计划汇总结果及 API 密钥失败保护。
+- SQLite 用真实触发器分别中止 results 与 node_state_history 的写入，
+  确认已修改节点、已插入节点、结果与状态变更历史一起回滚；移除测试触发器后
+  同一连接可成功提交，失败计数只增加一次。
+- Python HTTP 测试使用本地回环服务，校验 400/408/413 与断开连接；
+  配置保存测试显式模拟 Sub-Store 清理调用，避免外部网络依赖。
+
+### 最终门禁
+```text
+python -X utf8 -m unittest discover -s tests
+  Ran 592 tests in 42.364s; OK (skipped=2)
+  = 590 passed / 0 failed / 2 skipped，新增 19 项
+
+cargo test --workspace --locked
+  probe-api 8 / probe-cli 0 / probe-config 24 / probe-dns 22
+  probe-domain 12 / probe-engine 75 / probe-mihomo 26
+  probe-source 46 / probe-storage 21 / probe-substore 23
+  = 257 passed / 0 failed，新增 14 项
+
+cargo fmt --all -- --check
+  无输出，退出 0
+cargo clippy --workspace --all-targets --locked -- -D warnings
+  零告警，退出 0
+python -X utf8 tools/scan_secrets.py
+  secret scan: clean (tracked files)
+```
+
+构建后的 probe-engine 测试二进制以 `round::tests --test-threads=4` 连续运行
+10 次，每次 28 passed，10/10 通过。内嵌 Sub-Store 全量测试约 190 秒，
+与本批起点一致，未跳过其慢用例。
+
+### 行为边界
+- Python POST 正文限 2 MiB、15 秒，空正文兼容；不接受 Transfer-Encoding，
+  不再把格式错误转成空命令。配置保存响应使用与状态轮询相同的脱敏投影。
+- Rust 的 results/nodes/history 在同一事务内提交，轮次关闭仍是独立操作。
+  若数据库连关闭操作也拒绝，返回明确错误，仍需后续孤儿轮回收处理。
+- 取消在同步提交前生效；进入提交后不把已落账结果重新标成取消。
+- 本批不增加数据库迁移、不改变 publish token 作用域、不切换默认服务。
+  真 Mihomo 端到端、DNS/ECS 接入、出口验证、发布执行面与 shadow 对账仍待完成；
+  不能把本地回归通过描述成 Rust 迁移或线上测活验证完成。
+
+---
+
 ## R1 — 2026-09-30（HEAD：R1 提交）
 
 ### 环境

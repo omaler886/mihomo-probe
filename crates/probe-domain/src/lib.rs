@@ -9,8 +9,33 @@ use serde::{Deserialize, Serialize};
 
 /// A round row id, mirroring `rounds.id` in the Python SQLite schema.
 pub type RoundId = i64;
+pub mod geo;
+pub use geo::ExitIdentity;
+
+/// How a logical node aggregates its eligible endpoint observations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainPass {
+    #[default]
+    Any,
+    All,
+}
+
+impl DomainPass {
+    /// Return whether valid passing/total endpoint counts satisfy this policy.
+    pub fn accepts(self, passing: usize, total: usize) -> bool {
+        if total == 0 || passing > total {
+            return false;
+        }
+        match self {
+            Self::Any => passing > 0,
+            Self::All => passing == total,
+        }
+    }
+}
 
 pub mod policy;
+pub mod quality;
 pub use policy::{
     apply as apply_policy, round_is_suspect, NodeSnapshot, NodeUpdate, Observation, Policy,
     Transition, STATUS_ALIVE, STATUS_DEAD, STATUS_EXCLUDED, STATUS_PENDING, STATUS_UNKNOWN,
@@ -87,5 +112,18 @@ mod tests {
             DomainError::Kernel("timeout".into()).to_string(),
             "kernel error: timeout"
         );
+    }
+
+    /// Empty/inconsistent measurements are never success under either policy.
+    #[test]
+    fn domain_pass_applies_to_real_endpoint_counts() {
+        assert!(DomainPass::Any.accepts(1, 2));
+        assert!(!DomainPass::All.accepts(1, 2));
+        assert!(DomainPass::All.accepts(2, 2));
+        for policy in [DomainPass::Any, DomainPass::All] {
+            assert!(!policy.accepts(0, 0));
+            assert!(!policy.accepts(0, 2));
+            assert!(!policy.accepts(3, 2));
+        }
     }
 }

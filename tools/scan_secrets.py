@@ -17,6 +17,7 @@ environment, never in tracked files, so a hit is a defect, not a warning.
 
 Usage:
     python3 tools/scan_secrets.py             # working tree (tracked files)
+    python3 tools/scan_secrets.py --include-untracked  # also new non-ignored files
     python3 tools/scan_secrets.py --history   # + every commit (slow on big repos)
 """
 import argparse
@@ -65,11 +66,15 @@ MARKERS = (
 ALLOWLIST_FILES = ("tools/scan_secrets.py", ".env.example")
 
 
-def _tracked_files():
-    out = subprocess.run(["git", "ls-files", "-z"], capture_output=True)
+def _tracked_files(include_untracked=False):
+    """Return repository paths; optionally include new files while respecting ignores."""
+    command = ["git", "ls-files", "-z"]
+    if include_untracked:
+        command.extend(["--cached", "--others", "--exclude-standard"])
+    out = subprocess.run(command, capture_output=True)
     if out.returncode != 0:
         sys.exit(f"git ls-files failed: {out.stderr.decode(errors='replace')}")
-    return [Path(p) for p in out.stdout.decode().split("\0") if p]
+    return list(dict.fromkeys(Path(p) for p in out.stdout.decode("utf-8").split("\0") if p))
 
 
 def _clean_line(line):
@@ -86,22 +91,23 @@ def _marker_hit(line):
 
 
 def scan_text(path, text, findings):
+    """Append locations and rule names without copying detected credentials into logs."""
     for lineno, raw in enumerate(text.splitlines(), 1):
         line = _clean_line(raw)
         for name, pattern in PATTERNS:
             if pattern.search(line) and not _marker_hit(line):
-                findings.append((str(path), lineno, name,
-                                 line.strip()[:90]))
+                findings.append((str(path), lineno, name, "[REDACTED]"))
 
 
-def scan_worktree(findings):
-    for path in _tracked_files():
+def scan_worktree(findings, include_untracked=False):
+    """Scan selected repository files; unreadable inputs fail the gate explicitly."""
+    for path in _tracked_files(include_untracked):
         if _is_allowlisted(path) or not path.is_file():
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            print(f"  skip (unreadable) {path}: {exc}")
+            findings.append((str(path), 0, "unreadable-file", type(exc).__name__))
             continue
         scan_text(path, text, findings)
 
@@ -144,10 +150,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--history", action="store_true",
                         help="also scan every commit (git grep per rev)")
+    parser.add_argument("--include-untracked", action="store_true",
+                        help="include new non-ignored files in the worktree scan")
     args = parser.parse_args()
 
     findings = []
-    scan_worktree(findings)
+    scan_worktree(findings, args.include_untracked)
     if args.history:
         scan_history(findings)
 
@@ -161,6 +169,7 @@ def main():
               " rotate if it was ever pushed.")
         return 1
     print("secret scan: clean (tracked files"
+          + (" + non-ignored untracked files" if args.include_untracked else "")
           + (" + full history" if args.history else "") + ")")
     return 0
 

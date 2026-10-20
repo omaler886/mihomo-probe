@@ -297,4 +297,158 @@ Rust 侧新增 2 个测试（`lane_members` 的划分与边界用例）：全量
 
 ### 回滚
 - `git revert` 本提交（回到没有 `crates/probe-dns/` 的状态）；无数据/格式迁移，
+
+---
+
+## R20 — 整轮护栏语义修正（2026-10-21）
+
+**触发**：ct186 线上复核发现 **36/36 轮全部 `inconclusive`**。根因：一个长期 500 的上游
+（saki）使 `preserved_sources` 每轮非空 → 每轮都按 ADR-0005 以外的条件标记 inconclusive。
+连锁后果有两个，都是生产级缺陷：
+
+1. **存活下限护栏被永久禁用**：`suspect = !inconclusive && round_is_suspect(...)`，
+   inconclusive 恒真 ⇒ suspect 永远为 false ⇒ 即使一轮 ok=0/275 也照常发布。
+2. **存活基线链被清空**：`previous_alive_count` 跳过 suspect 与 inconclusive 轮，
+   全部轮次被跳过 ⇒ 基线恒为 0 ⇒ 即便护栏可达，`round_is_suspect` 对 `alive_prev<=0`
+   也恒返回 false（首轮永不 suspect 的设计）。双重失效。
+
+### 修复（`crates/probe-engine/src/round.rs`）
+- `inconclusive` 收窄回 **ADR-0005 写入条件本身**：`!has_commit || ok+failed == 0`
+  （内核不可达 / 拒绝 reload / 空测量 / 取消 / 工作线程崩溃 / controller_error / 落账失败）。
+  **数据源拉取失败不在清单上**：被测过的节点仍是有效测量。
+- 数据源拉取失败改为**在 note 里点名**（`; sources not fetched: saki`），节点状态照旧保留
+  （不变量未变），操作者从轮次行就能看到窟窿，而不是一句笼统的 "incomplete coverage"。
+- `GuardDecision::MarkRoundInconclusive` 的 doc 与 CLI 文案同步更正
+  （旧文案 "incomplete coverage; affected sources require previous exports" 已失真）。
+
+### 修复（运行报错与文案，`crates/probe-cli` / `crates/probe-api`）
+- serve 启动横幅删掉失真的 "shadow; Python remains the default implementation"——
+  ct186 上 Rust 已是唯一实现，该句让线上日志自相矛盾。
+- `/metrics` 的 `probe_rounds_inconclusive_total` HELP 同步收窄语义。
+
+### 测试
+- 新增 `a_fetch_failed_source_is_named_but_not_inconclusive`（健康轮 + saki 拉取失败 →
+  ApplyConvergence、note 点名、轮次行 inconclusive=0）。
+- 新增 `a_fetch_failed_source_does_not_mask_the_suspect_guard`（基线 10 + saki 拉取失败 +
+  ok=0 → 仍必须 suspect/PreservePreviousState）——本批的回归用例。
+- 更新 `uncertain_dns_preserves_the_node_and_isolates_its_source`：节点级保留不变
+  （streak 不推进、状态原样），轮级从 MarkRoundInconclusive 改为 ApplyConvergence
+  （该轮测到了 1 个活节点，是有效测量；无基线时首轮永不 suspect）。
+- 其余 ADR-0005 用例（refused reload / 空轮 / 取消 / panic / controller_error / 内核不可达）
+  语义未动，原断言全部原样通过。
+
+### 影响范围
+- 轮次行的 `inconclusive` 语义收窄：历史行不迁移（旧行仍是 1，仅不再被当作基线）；
+  部署后第一轮 conclusive 轮即恢复基线链，第二轮起护栏恢复效力。
+- 发布语义不变：partial coverage 照发（Python parity，publish_round 的 `measured` 分支）。
+- Python 侧零改动（Python 从不因数据源拉取失败标记轮次）。
+
+### 回滚
+- `git revert` 本提交；轮次行/账本无格式迁移，导出快照不受影响。
+
+---
+
+## R21 — 四路对抗审查的修正批（2026-10-21）
+
+同一会话对**已部署但未提交**的 R8–R19 代码做了四路并行对抗审查（probe-api /
+probe-engine / probe-cli+config+mihomo / storage+source+dns），证实 20 项缺陷，
+全部修复并带测试；1 项（NaN 端口）实测证伪后按实际行为钉住。
+
+### 安全（HIGH）
+1. **`core.secret` 0644 → 0600**（probe-config）：`fs::write` 落盘 0644，任何本机
+   用户可读内核 controller 的 bearer secret。改 `create_new(0600)`，且像 Python 一样
+   **每次读取都 chmod 修复**历史遗留文件（ct186 线上那颗 0644 的会在重启后自愈）。
+   测试：`core_secret_file_is_never_world_readable`。
+2. **fetch.rs 传输错误泄漏后端 URL**（probe-source）：reqwest 的 Display 内嵌完整请求
+   URL，而部署的后端路径 `ridge.eminet.ggff.net/<secret>` **本身就是凭据**；连接失败/
+   重定向错误把它原样写进轮次 note/events（共享账本、面板可见）。四处调用点全部改为
+   只分类不引用（probe-dns resolver 同款），`kind_of` 增加 `is_redirect`。
+   测试：`transport_failures_never_leak_the_backend_url`（连一个不存在的端口断言无 URL）。
+
+### 正确性（HIGH/MED）
+3. **链式实测存活节点被发布层整体丢弃**（probe-engine collect+publish）：
+   `originals` 建在 expand 之后的条目上（first-wins），链式变体携带的
+   `dialer-proxy: __FRONT0__` 成了节点的「原始」形式 → `close_dialers` 按
+   UnclosedDialer 丢掉每个链式验证过的节点；client-path 模式下整源每轮 NoAliveNodes。
+   改为从 **expand 之前的上游字典**建 originals，并覆盖 direct 孪生的派生指纹。
+   测试：`originals_carry_upstream_dicts_for_both_fold_keys`。
+4. **DEFERRED 事务在 Python 共库写入时 BUSY_SNAPSHOT**（probe-storage）：
+   `commit_measurements`/`converge_nodes`/`record_results` 先读后写，WAL 快照升级
+   失败**立即**返回（实测 0.00s，绕过 busy_timeout）→ 整轮测量丢弃。全部改
+   `TransactionBehavior::Immediate`（record_quality_samples 本来就是）。
+5. **孤儿收割把 ok=0 当可信基线**（probe-engine scheduler + storage）：
+   崩溃残留的 open row 被收割时 `inconclusive=0` → `previous_alive_count` 读到 0 →
+   下一轮（最可能仍在故障中的那轮）护栏失效。收割改 `finish_round_full_timed` +
+   `inconclusive=1`；note/计数/时长保持逐字节 Python 兼容。
+   另：收割器现在**跳过本进程在飞的轮次**（deadline 取消后的 drain 窗口），
+   调度器的 round.lock 抢占加了 120s drain 余量。测试：`a_running_round_is_never_reaped…`
+   + 真库用例断言 `inconclusive` 与基线跳过。
+6. **region 标签重写可产出重名节点 → 整源每轮发布失败**（probe-engine publish）：
+   `[SG] 01`（实测出口 HK）与 `[HK] 01` 都发布成 `[HK] 01`，dedupe 比的是改写前的
+   名字 → 拓扑校验拒收 → 该源导出永久停更。改按**发布名** dedupe。
+   测试：`a_region_tag_collision_supersedes_the_loser_instead_of_failing_the_source`。
+   （ct186 线上 `add_region_tag: true`，属已生效缺陷。）
+7. **迁移注册表只看版本号**（probe-storage migrations）：0004–0009 部署期间换过字节，
+   版本号相同而内容不同的库会静默跳过迁移。现在 apply 时**逐行比对 name**，
+   不一致/未知版本号立即报错（启动期点名版本）。
+   测试：`a_registry_row_with_a_foreign_name_fails_loudly` / `an_unknown_higher_version_is_refused`。
+8. **API 阻塞点**（probe-api）：发布尾部持全局 storage mutex 在 async worker 上跑
+   fsync 重的 `publish_round` → 1 核运行时全 API（含 cancel 路由、deadline 计时器）
+   冻结在发布期间；内核 preflight（最多 6×120s 同步子进程）同理且不可取消。发布尾部
+   改 `spawn_blocking`（锁在阻塞线程内取放）；preflight 改 `spawn_blocking` +
+   **ctx 已取消则一次尝试都不花**。测试：`a_cancelled_round_never_starts_preflight`。
+9. **回滚绕过引擎物化路径 + 三次全量加载**（probe-api exports + storage）：
+   旧处理器直接调 `storage.rollback_export`，激活的指针可指向无文件的快照；且为一次
+   存在性检查在锁内三次加载+哈希 ≤8MiB 正文。改走 `probe_engine::rollback_export`
+   （物化→校验→CAS），预检查改为两个元数据读取（`active_export_id` /
+   `export_snapshot_exists`）。现有回滚测试改用可写 root 真实走物化路径。
+10. **`cmd_status` 新装环境 panic**（probe-cli）：`Connection::open` 会**创建**空
+    state.db，随后 `expect("query")` 死于 no such table，留下孤儿库。改先查路径存在，
+    查询错误退出码 1 而非 panic。
+11. **`substore` 子命令端口默认 8088 与文档/内嵌默认 8299 相悖**（probe-cli）：
+    与 serve 默认冲突。改显式给过 `--port` 才覆盖，否则 8299。
+12. **serve 的 SUBSTORE_BACKEND 冲突警告在 tracing init 之前发出 → 静默丢弃**
+    （probe-cli）：订阅器初始化移到 cmd_serve 顶部。
+13. **docker 137/139 当作配置失败**（probe-mihomo）：容器被 OOM/SIGKILL（128+n）时
+    `docker run` 的退出码不是配置判定，读成 `Failed` 会以「内核拒绝配置」错误诊断
+    阻塞轮次。docker 路径 `code >= 125` 全部归 Degraded。
+14. **`find_word` 把 `.` 当名字的一部分**（probe-mihomo）：Python 的
+    `(?<![\w-])…(?![\w-])` 里 `.` 是边界 —— `proxy 'v1.tokyo' …` 匹配不到名为
+    `tokyo` 的节点 → 整轮 Rejected。名字层对齐（`.` 归边界）；**server 层保留更严的
+    规则**（`sub.edge.example.test` 不得点名 `edge.example.test`，Python 是裸子串会误杀，
+    拒绝猜更安全——按实际行为重写了三个用例的语义注释）。
+15. **CLI 值旗标缺值/坏值静默吞**（probe-cli）：`--root` 截断会静默用兜底根、
+    `--port 8O88` 静默 8088。缺值/不可解析一律 exit 2。--help 的默认根从 /opt/probe
+    改为真实值 /srv/mihomo-test（resolve_root 的兜底）。
+
+### 证伪一项
+- **`port: .nan` 会拨 0 端口**（审查推断）：实测 serde_norway→serde_json::Value 根本
+  表达不了 NaN，`port` 键整体消失 → 节点以 "missing port" 被丢弃，与 Python 的
+  ValueError 殊途同归，**不会**走到饱和转换。`coerce_port` 保留 `is_finite` 过滤作
+  纵深防御；测试 `a_nan_or_infinite_port_never_reaches_the_kernel` 按真实行为钉住。
+
+### 低危修正（LOW）
+- `metrics` 的 `probe_round_last_*` 改读**最新已关闭**轮次（in-flight 轮期间不再
+  全零误报，`last_finished_round` 新读接口）。
+- config self-check 端点不再回显 `trace_url` / `chain_payload.url`（免费操作员字符串，
+  可带凭据；降为 `*_configured` 布尔，模块 doc 的承诺自洽）。
+- `--help` 给 `db backup` 加了「服务停止后再备份」的提示（在线 backup 对共享账本
+  会因外部提交反复重启拷贝）。
+
+### 验证
+- `cargo fmt --all -- --check` 0；`cargo clippy --workspace --all-targets
+  --all-features -- -D warnings` 0；`cargo test --workspace --locked
+  --all-features` 全绿（engine 169 / api 46 / source 55 / storage 76 / mihomo 46 /
+  config 36 / substore 23 / pipeline 23 / db_commands 4 …）；
+- Python `python -X utf8 -m unittest discover -s tests`：Ran 596, OK (skipped=2)；
+- `tools/scan_secrets.py` / `tools/license_check.py` / `tools/dependency_policy.py` clean。
+
+### 影响范围
+- 无 schema 迁移（0009 不变）；`core.secret` 权限修复在服务重启后自愈线上文件。
+- 回滚 API 行为不变（仍 CAS），但快照文件缺失时不再激活无文件指针。
+
+### 回滚
+- `git revert` 本提交；`inconclusive` 收窄与收割标记对历史行不回填。
+
+---
   Python 侧无影响。

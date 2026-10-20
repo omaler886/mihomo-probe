@@ -11,9 +11,8 @@
 //! persists [`NodeUpdate`]; shadow diffing (workstreams/13) compares these
 //! decisions against the Python implementation field by field.
 
-/// Node statuses. `EXCLUDED` is not produced by [`apply`] -- it is written by
-/// the entry-IP filter (R4/R6 收尾) explicitly, and its streak must not
-/// advance: a transient classification must never kill a node.
+/// Node statuses. An entry exclusion is a classification, never a failed dial;
+/// applying it clears the failure streak without incrementing either counter.
 pub const STATUS_ALIVE: &str = "alive";
 pub const STATUS_PENDING: &str = "pending";
 pub const STATUS_DEAD: &str = "dead";
@@ -55,9 +54,10 @@ pub struct NodeSnapshot {
 }
 
 /// One round's verdict for one node, before folding.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Observation {
     pub ok: bool,
+    pub is_excluded: bool,
     pub delay_ms: Option<i64>,
     /// The failure class (`timeout`, `front_dead`, ...). `None` when alive.
     pub reason: Option<String>,
@@ -111,6 +111,17 @@ pub fn apply(
     policy: &Policy,
     now: &str,
 ) -> (NodeUpdate, Transition) {
+    if observation.is_excluded {
+        return (
+            NodeUpdate {
+                status: Some(STATUS_EXCLUDED.into()),
+                consec_fail: Some(0),
+                last_reason: Some(observation.reason.clone()),
+                ..Default::default()
+            },
+            Transition::None,
+        );
+    }
     let was = if node.status.is_empty() {
         STATUS_UNKNOWN
     } else {
@@ -199,6 +210,7 @@ mod tests {
             ok: true,
             delay_ms: Some(delay),
             reason: None,
+            is_excluded: false,
         }
     }
 
@@ -207,6 +219,7 @@ mod tests {
             ok: false,
             delay_ms: None,
             reason: Some(reason.into()),
+            is_excluded: false,
         }
     }
 
@@ -308,5 +321,22 @@ mod tests {
         // format, and this module only carries it through.
         let (update, _) = apply(&node(STATUS_ALIVE, 0), &pass(1), &P, "2026-10-05T08:00:00");
         assert_eq!(update.last_ok.as_deref(), Some("2026-10-05T08:00:00"));
+    }
+
+    /// Exclusions clear stale failure streaks but are not successes or failures.
+    #[test]
+    fn exclusions_do_not_consume_a_failure_or_success() {
+        let observation = Observation {
+            is_excluded: true,
+            reason: Some("entry_cn".into()),
+            ..Default::default()
+        };
+        let (update, transition) = apply(&node(STATUS_PENDING, 2), &observation, &P, "T");
+        assert_eq!(update.status.as_deref(), Some(STATUS_EXCLUDED));
+        assert_eq!(update.consec_fail, Some(0));
+        assert_eq!(update.total_ok, None);
+        assert_eq!(update.total_fail, None);
+        assert_eq!(update.last_ok, None);
+        assert_eq!(transition, Transition::None);
     }
 }

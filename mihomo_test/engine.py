@@ -2322,19 +2322,15 @@ def verify_cfg_excludes(cfg):
 
 
 def _previous_alive_count():
-    """Alive count of the last completed round, skipping a suspect one.
-
-    `LIMIT 1` is deliberate and used to read `LIMIT 2`, which suggested a
-    comparison of two rounds that never happened: `db.one` returns rows[0] and
-    the second row was never read. The fallback query below is what actually
-    reaches past a suspect round.
-    """
-    row = db.one("SELECT ok, suspect, finished_at FROM rounds WHERE finished_at IS NOT NULL "
-                 "ORDER BY id DESC LIMIT 1")
-    if row and row.get("suspect"):
-        row = db.one("SELECT ok FROM rounds WHERE finished_at IS NOT NULL AND suspect=0 "
-                     "ORDER BY id DESC LIMIT 1")
-    return int(row["ok"]) if row else 0
+    """Return the latest trustworthy alive count, supporting legacy/shared schemas."""
+    columns = {row["name"] for row in db.query("PRAGMA table_info(rounds)")}
+    eligible = "finished_at IS NOT NULL AND COALESCE(suspect, 0)=0"
+    # Rust adds this column. Detect it without migrating a Python-only ledger:
+    # a cancelled/failed Rust round may carry partial counts, but no valid baseline.
+    if "inconclusive" in columns:
+        eligible += " AND COALESCE(inconclusive, 0)=0"
+    row = db.one(f"SELECT ok FROM rounds WHERE {eligible} ORDER BY id DESC LIMIT 1")
+    return int(row["ok"] or 0) if row else 0
 
 
 # Display tag for the front nodes published inside a chained export. Reserved

@@ -47,15 +47,24 @@ enum GuardDecision { ApplyConvergence, PreservePreviousState, MarkRoundInconclus
 - **裁决**：轮次级标记，新增 `rounds.inconclusive INTEGER NOT NULL DEFAULT 0`
   （migration 0003）。**不是**节点级第六态——节点态保持
   unknown/alive/pending/dead/excluded 五态不变。
-- **写入条件**：`KernelState::Unreachable` / `NotPrepared`（内核不可达或配置
-  生成失败）→ 该轮不测节点、不收敛、不推进任何 streak，`inconclusive=1`。
-  这把 runner 原有的隐式行为（跳过节点阶段）显式化为可查询的列。
+- **写入条件**：初版为 `KernelState::Unreachable` / `NotPrepared`；
+  2026-10-09 补丁补齐拒绝 reload、空测量、取消、工作线程崩溃、测量阶段
+  `controller_error` 与落账失败。均不收敛、不推进 streak，`inconclusive=1`。
+  取消在同步提交前检查；事务已经开始后到达的取消不撤销已提交的轮次。
+- **2026-10-21 更正（R20）**：**数据源拉取失败从写入条件中移除**。此前的实现把
+  `preserved_sources`（拉取失败的来源 ∪ 含不确定节点的来源）非空也当作
+  `inconclusive=1`，超出本 ADR 的清单。线上后果（ct186，saki 长期 HTTP 500）：
+  36/36 轮全部 inconclusive → ① `suspect = !inconclusive && …` 使存活下限护栏
+  **永久失效**（ok=0 也发布）；② `previous_alive_count` 跳过一切轮次，基线恒 0。
+  现收窄为 `!has_commit || ok+failed == 0`，拉取失败的来源在 note 里点名
+  （`; sources not fetched: <keys>`），节点状态保留的不变量不变。
+  回归用例：`a_fetch_failed_source_does_not_mask_the_suspect_guard`。
 - **读取方**：`previous_alive_count` 跳过 suspect 与 inconclusive 的轮——
   测了空空的轮不得作为下一轮护栏的存活基线。
-- **Python 兼容（shadow 共库）**：Python 读方无此列，INSERT 走 DEFAULT 0，
-  行为不变。Python 把 Rust 的 inconclusive 轮读作「ok=0 的完成轮」，
-  `_previous_alive_count` 因此回溯——suspect 护栏保守触发，方向安全
-  （保护上轮发布），无需改 Python。已在 13 登记为口径差异。
+- **Python 兼容（shadow 共库）**：2026-10-09 已修正读取方。
+  `_previous_alive_count` 只在列存在时过滤 `inconclusive=1`，旧库不迁移；
+  Python INSERT 仍走 DEFAULT 0。此前「ok=0 会自动回溯，因此无需修改」
+  的结论不成立：旧代码只回溯 suspect 轮，可能把基线重置成 0 或部分计数。
 
 ## R7 落地形态（本批）
 - `probe-domain::policy`：`Policy` / `NodeSnapshot` / `Observation` / `NodeUpdate` /
@@ -85,6 +94,7 @@ enum GuardDecision { ApplyConvergence, PreservePreviousState, MarkRoundInconclus
 |---|---|---|---|
 | 2026-09-30 | 本文件 | 审计+设计草案 | R0 |
 | 2026-10-05 | 本文件 | ADR-0005 裁决 + R7 落地形态 + 待办勾选 | R7 批次 |
+| 2026-10-09 | runner/storage/Python baseline | 原子落账、异常轮次保护、共库读取兼容 | 回归测试确认原有漏项 |
 
 ## 测试证据
 - Python 侧行为由 tests/test_logic.py PolicyTest 等锚定。
