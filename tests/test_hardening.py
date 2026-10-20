@@ -352,6 +352,47 @@ class _LiveServer:
         finally:
             connection.close()
 
+    def raw_bytes_post(self, request_bytes):
+        """Send prebuilt request bytes on a bare socket, parse the reply.
+
+        http.client refuses to *send* duplicate/conflicting Content-Length or
+        Transfer-Encoding headers on newer Pythons (request-smuggling
+        hardening), so the framing tests must reach for the socket: what is
+        under test is the SERVER's rejection, and that needs the hostile
+        framing to actually go out on the wire.
+        """
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            sock.sendall(request_bytes)
+            sock.shutdown(socket.SHUT_WR)
+            chunks = []
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            head, _, body = b"".join(chunks).partition(b"\r\n\r\n")
+            lines = head.split(b"\r\n")
+            status = int(lines[0].split()[1])
+            headers = {}
+            for line in lines[1:]:
+                name, _, value = line.partition(b":")
+                headers[name.decode("latin-1").strip().lower()] = (
+                    value.strip().decode("latin-1"))
+            return status, json.loads(body or b"null"), headers
+        finally:
+            sock.close()
+
+    def framing_request(self, headers, path="/api/run", body=b"{}"):
+        """HTTP/1.1 request bytes with the given framing headers."""
+        lines = [
+            f"POST {path} HTTP/1.1",
+            f"Host: 127.0.0.1:{self.port}",
+            f"X-Auth-Token: {self.cfg['auth']['token']}",
+        ]
+        lines.extend(f"{name}: {value}" for name, value in headers)
+        return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
+
     def close(self):
         self.httpd.shutdown()
         self.httpd.server_close()
@@ -606,7 +647,13 @@ class HttpSurfaceTest(unittest.TestCase):
             start.assert_not_called()
 
     def test_invalid_body_framing_never_starts_a_round(self):
-        """Reject ambiguous or negative lengths instead of reading until EOF."""
+        """Reject ambiguous or negative lengths instead of reading until EOF.
+
+        Sent as raw socket bytes: the hostile framing has to reach the wire
+        for the server's rejection to be exercised at all, and http.client
+        refuses duplicate/conflicting Content-Length values client-side on
+        newer Pythons.
+        """
         cases = [
             [("Content-Length", "-1")],
             [("Content-Length", "invalid")],
@@ -619,9 +666,10 @@ class HttpSurfaceTest(unittest.TestCase):
         with unittest.mock.patch.object(server, "run_in_background") as start:
             for headers in cases:
                 with self.subTest(headers=headers):
-                    code, _, response_headers = self.srv.raw_post("/api/run", b"{}", headers)
+                    request = self.srv.framing_request(headers)
+                    code, _, response_headers = self.srv.raw_bytes_post(request)
                     self.assertEqual(code, 400)
-                    self.assertEqual(response_headers.get("Connection"), "close")
+                    self.assertEqual(response_headers.get("connection"), "close")
             start.assert_not_called()
 
     def test_an_oversized_body_is_rejected_before_reading(self):

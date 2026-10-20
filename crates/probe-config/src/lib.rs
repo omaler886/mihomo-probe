@@ -535,6 +535,11 @@ impl Config {
     /// `config.core_secret()` contract: one secret file, 0600, generated once.
     /// Python chmods on every read, so an existing file with the wrong mode
     /// (a plain `fs::write` used to create it 0644) is repaired here too.
+    ///
+    /// `Ok` is only ever returned for a value that IS durably persisted in a
+    /// readable file: handing out a generated secret that never reached disk
+    /// would let a round write an unauthenticated kernel config, which is the
+    /// one outcome this function must never produce.
     pub fn core_secret(data_dir: &Path) -> DomainResult<String> {
         let path = data_dir.join(CORE_SECRET_FILE);
         if let Ok(existing) = std::fs::read_to_string(&path) {
@@ -543,16 +548,22 @@ impl Config {
                 restrict_secret_permissions(&path);
                 return Ok(trimmed.to_string());
             }
+            // An empty secret file is healed like Python heals it
+            // (`write_text` truncates): generate and overwrite in place.
+            return write_new_secret(&path);
         }
+        // The read failed: the path is absent, unreadable, or not a file at
+        // all. Creating a NEW file must also be the only write -- and on
+        // Linux `open(O_CREAT|O_EXCL)` on an existing path reports EEXIST
+        // whether that path is a file, a directory, or anything else, so the
+        // AlreadyExists branch re-verifies by READING the file back instead
+        // of assuming one exists.
         let secret = random_hex(16);
         std::fs::create_dir_all(data_dir).map_err(|e| {
             DomainError::Config(format!("cannot create {}: {e}", data_dir.display()))
         })?;
-        // create_new + mode 0600: the secret must never be world-readable,
-        // and two processes generating it concurrently must not interleave
-        // writes -- the loser reads the winner's value back.
         #[cfg(unix)]
-        let write_result = {
+        {
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
             match std::fs::OpenOptions::new()
@@ -561,34 +572,56 @@ impl Config {
                 .mode(0o600)
                 .open(&path)
             {
-                Ok(mut file) => file.write_all(secret.as_bytes()).map_err(|e| {
-                    DomainError::Config(format!("cannot write {}: {e}", path.display()))
-                }),
+                Ok(mut file) => {
+                    file.write_all(secret.as_bytes()).map_err(|e| {
+                        DomainError::Config(format!("cannot write {}: {e}", path.display()))
+                    })?;
+                    return Ok(secret);
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Someone created it between the failed read and here --
+                    // or the path is not a readable file. Only a read-back
+                    // decides which, and only a readable non-empty FILE may
+                    // produce Ok (a directory named `core.secret`, an
+                    // unreadable file, or anything else blocks the round).
+                    let existing = std::fs::read_to_string(&path).map_err(|e| {
+                        DomainError::Config(format!("cannot read {}: {e}", path.display()))
+                    })?;
+                    let trimmed = existing.trim();
+                    if trimmed.is_empty() {
+                        return Err(DomainError::Config(format!(
+                            "core secret at {} is empty",
+                            path.display()
+                        )));
+                    }
                     restrict_secret_permissions(&path);
-                    Ok(())
+                    Ok(trimmed.to_string())
                 }
                 Err(err) => Err(DomainError::Config(format!(
                     "cannot create {}: {err}",
                     path.display()
                 ))),
             }
-        };
-        #[cfg(not(unix))]
-        let write_result = std::fs::write(&path, &secret)
-            .map_err(|e| DomainError::Config(format!("cannot write {}: {e}", path.display())));
-        write_result?;
-        if let Ok(existing) = std::fs::read_to_string(&path) {
-            let trimmed = existing.trim();
-            if !trimmed.is_empty() {
-                // A concurrent writer created the file between the read above
-                // and our create_new: its value is the one the other process
-                // is using, so return that one, not our unsaved candidate.
-                return Ok(trimmed.to_string());
-            }
         }
-        Ok(secret)
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&path, &secret).map_err(|e| {
+                DomainError::Config(format!("cannot write {}: {e}", path.display()))
+            })?;
+            Ok(secret)
+        }
     }
+}
+
+/// Overwrite an existing-but-empty secret file with a freshly generated one.
+/// Python parity: `write_text` truncates in place, and the 0600 repair runs
+/// after the write because mode() only applies at creation time.
+fn write_new_secret(path: &Path) -> DomainResult<String> {
+    let secret = random_hex(16);
+    std::fs::write(path, &secret)
+        .map_err(|e| DomainError::Config(format!("cannot write {}: {e}", path.display())))?;
+    restrict_secret_permissions(path);
+    Ok(secret)
 }
 
 /// Python parity (`config.py` chmods the file on every access): force 0600 on
@@ -1333,6 +1366,51 @@ mod tests {
         assert_eq!(core.mixed_port, defaults.mixed_port);
         assert_eq!(core.base_port, defaults.base_port);
         assert_eq!(core.lanes, defaults.lanes);
+    }
+
+    #[test]
+    fn an_empty_secret_file_is_healed_and_the_value_is_persisted() {
+        // Python `write_text` truncates an empty secret file in place; the
+        // healed value must be exactly what the file holds afterwards, or a
+        // restart would generate a DIFFERENT secret and break the kernel.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("core.secret"), "").unwrap();
+        let secret = Config::core_secret(tmp.path()).unwrap();
+        assert_eq!(secret.len(), 32);
+        let on_disk = std::fs::read_to_string(tmp.path().join("core.secret"))
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(
+            on_disk, secret,
+            "the handed-out secret must be the persisted one"
+        );
+        // And the next read reuses it.
+        assert_eq!(Config::core_secret(tmp.path()).unwrap(), secret);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_named_like_the_secret_never_yields_a_secret() {
+        // On Linux, open(O_CREAT|O_EXCL) on an existing directory reports
+        // EEXIST, and treating that as "the file exists, carry on" handed out
+        // a secret that never reached disk -- an unauthenticated kernel
+        // config. Only a readable non-empty FILE may produce Ok.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("core.secret")).unwrap();
+        let err = Config::core_secret(tmp.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("cannot read"),
+            "the error must say the secret is unreadable: {err}"
+        );
+        // The directory's mode was not touched either.
+        let mode = std::fs::metadata(tmp.path().join("core.secret"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "a non-file path is never chmodded");
     }
 
     #[test]

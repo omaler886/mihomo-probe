@@ -451,4 +451,43 @@ probe-engine / probe-cli+config+mihomo / storage+source+dns），证实 20 项�
 - `git revert` 本提交；`inconclusive` 收窄与收割标记对历史行不回填。
 
 ---
+
+## R22 — CI 首跑修正（2026-10-21）
+
+`d330ed0` 推送后 CI 首次在新代码上跑（此前 R8–R19 从未入过 CI），两个 job 各挂一处，
+均已修复：
+
+1. **python job**：`test_invalid_body_framing_never_starts_a_round` 的
+   重复 Content-Length 子用例 ERROR——**新版 http.client（3.12.14+ 的请求走私加固）
+   客户端拒绝发送**重复/冲突的 Content-Length，子用例在客户端就抛了，根本没到服务器。
+   本地 3.12.10 能发，CI 的 3.12.15 不能 → 「本地绿、CI 红」的新变体。
+   修复：测试改走**裸 socket** 发送预构请求字节（`raw_bytes_post`/`framing_request`
+   两个新测试助手），7 个 framing 用例全部不经 http.client——被测的是**服务器**的
+   拒绝行为，敌意帧必须真的上线。全平台版本无关。
+2. **rust job**：`a_missing_core_secret_never_writes_an_unauthenticated_config`
+   FAILED——R21 的 `core_secret` 重写引入的真缺陷：Linux 上
+   `open(O_CREAT|O_EXCL)` 对**已存在的目录**也返回 EEXIST，AlreadyExists 分支
+   被当作「文件已存在」处理，函数返回了一个**从未落盘**的 secret → 轮次照跑、
+   内核配置无鉴权——正是该用例钉住不许发生的事。Windows 上 `fs::write` 对目录
+   报错所以本地全绿。
+   修复：AlreadyExists 分支改为**读回验证**——只有「可读且非空」的才返回 Ok
+   （目录/不可读/空文件一律 Err 阻塞）；空文件按 Python `write_text` 语义
+   原地截断重生成。新增两个用例：`an_empty_secret_file_is_healed_and_the_value_is_persisted`
+   （痊愈值必须与盘上一致）与 `a_directory_named_like_the_secret_never_yields_a_secret`
+   （unix 下钉住 EISDIR 路径与「不 chmod 目录」）。
+
+教训：**Windows 本地绿 ≠ Linux CI 绿**又添两条——`http.client` 的版本化加固、
+`O_EXCL` 对目录的 EEXIST 语义。ct186（生产机）从现在起兼任 Linux 测试床：
+交叉编译 test 二进制传上去跑，是唯一能在推送前复现 CI 环境的方式。
+
+### 验证
+- 本地：fmt/clippy/workspace tests/Python 596 全绿（config 37 / api 46 / mihomo 46）。
+- Linux（ct186 实测）：`probe_config` 与 `probe_api` 的 Linux test 二进制交叉编译后
+  在生产机上运行，`a_missing_core_secret_never_writes_an_unauthenticated_config` 与
+  新增两个 secret 用例全部通过。
+
+### 回滚
+- `git revert` 本提交。
+
+---
   Python 侧无影响。
