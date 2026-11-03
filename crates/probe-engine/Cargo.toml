@@ -12,6 +12,9 @@ probe-dns = { path = "../probe-dns" }
 # the ledger arrive through traits, so tests need neither a kernel nor a file.
 probe-mihomo = { path = "../probe-mihomo" }
 probe-source = { path = "../probe-source" }
+# workstreams/18 B2: the remote publish leg drives the Publisher trait; the
+# arrow stays engine -> publish (publish never imports the engine).
+probe-publish = { path = "../probe-publish" }
 probe-storage = { path = "../probe-storage" }
 serde_json = { workspace = true }
 serde = { workspace = true }

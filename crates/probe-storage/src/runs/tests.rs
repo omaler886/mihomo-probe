@@ -349,3 +349,106 @@ fn hostile_claim_inputs_are_refused() {
         .unwrap()
         .is_claimed());
 }
+
+// --- publish status (workstreams/18 B2) ------------------------------------
+
+/// The publish outcome lands on the slot that carries the round id -- open or
+/// already closed -- and never on any other row of the same source.
+#[test]
+fn the_publish_status_lands_on_the_rounds_slot() {
+    let storage = create_storage();
+    let source_id = source(&storage, "air");
+    let round_id = round(&storage);
+    let ClaimOutcome::Claimed { run_id } = storage
+        .claim_source_run(&source_id, "api-manual", None, Duration::ZERO)
+        .unwrap()
+    else {
+        panic!();
+    };
+    storage.attach_source_run(run_id, round_id).unwrap();
+
+    // Still open: the update path finds it.
+    storage
+        .record_source_publish_status(&source_id, round_id, PUBLISH_PUBLISHED, None)
+        .unwrap();
+    let row = storage.source_run(run_id).unwrap().unwrap();
+    assert_eq!(row.status, STATUS_ACTIVE);
+    assert_eq!(row.publish_status, Some(PUBLISH_PUBLISHED.to_string()));
+    assert_eq!(row.error_code, None);
+
+    // Closed by the round task afterwards: the same slot is updated again.
+    storage.close_source_run(run_id, STATUS_COMPLETED).unwrap();
+    storage
+        .record_source_publish_status(&source_id, round_id, PUBLISH_FAILED, Some("gist_auth"))
+        .unwrap();
+    let row = storage.source_run(run_id).unwrap().unwrap();
+    assert_eq!(row.status, STATUS_COMPLETED);
+    assert_eq!(row.publish_status, Some(PUBLISH_FAILED.to_string()));
+    assert_eq!(row.error_code, Some("gist_auth".to_string()));
+    assert_eq!(
+        storage.list_source_runs(&source_id, 50).unwrap().len(),
+        1,
+        "no second row for a round that has a slot"
+    );
+}
+
+/// A caller that never claims (a CLI one-shot) has no slot: a closed history
+/// row is inserted, carrying the publish outcome.
+#[test]
+fn a_publish_status_without_a_slot_writes_history() {
+    let storage = create_storage();
+    let source_id = source(&storage, "air");
+    let round_id = round(&storage);
+    storage
+        .record_source_publish_status(&source_id, round_id, PUBLISH_NO_CHANGE, None)
+        .unwrap();
+    let rows = storage.list_source_runs(&source_id, 50).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, STATUS_COMPLETED);
+    assert_eq!(rows[0].round_id, Some(round_id));
+    assert_eq!(rows[0].publish_status, Some(PUBLISH_NO_CHANGE.to_string()));
+
+    // And the next round's outcome goes to its own row, not the old one.
+    let second = round(&storage);
+    storage
+        .record_source_publish_status(&source_id, second, PUBLISH_PUBLISHED, None)
+        .unwrap();
+    let rows = storage.list_source_runs(&source_id, 50).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].publish_status, Some(PUBLISH_PUBLISHED.to_string()));
+    assert_eq!(rows[0].round_id, Some(second));
+    assert_eq!(rows[1].publish_status, Some(PUBLISH_NO_CHANGE.to_string()));
+}
+
+/// The vocabulary is frozen and the error code bounded: garbage is refused,
+/// never stored for a GUI to render.
+#[test]
+fn hostile_publish_statuses_and_error_codes_are_refused() {
+    let storage = create_storage();
+    let source_id = source(&storage, "air");
+    let round_id = round(&storage);
+    for hostile in ["", "ok", "PUBLISHED", "published; --", "gist_published"] {
+        assert!(
+            storage
+                .record_source_publish_status(&source_id, round_id, hostile, None)
+                .is_err(),
+            "{hostile:?} must not be a publish status"
+        );
+    }
+    assert!(storage
+        .record_source_publish_status(&source_id, round_id, PUBLISH_FAILED, Some("line\nfeed"))
+        .is_err());
+    assert!(storage
+        .record_source_publish_status(&source_id, round_id, PUBLISH_FAILED, Some(""))
+        .is_err());
+    assert!(storage
+        .record_source_publish_status(&source_id, round_id, PUBLISH_FAILED, Some(&"x".repeat(129)))
+        .is_err());
+    assert!(storage
+        .record_source_publish_status("not-a-uuid", round_id, PUBLISH_FAILED, None)
+        .is_err());
+    // The maximum-length code is fine.
+    storage
+        .record_source_publish_status(&source_id, round_id, PUBLISH_FAILED, Some(&"x".repeat(128)))
+        .unwrap();
+}

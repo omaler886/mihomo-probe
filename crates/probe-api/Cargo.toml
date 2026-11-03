@@ -10,6 +10,9 @@ probe-storage = { path = "../probe-storage" }
 probe-mihomo = { path = "../probe-mihomo" }
 probe-source = { path = "../probe-source" }
 probe-engine = { path = "../probe-engine" }
+# workstreams/18 B2: the admin publish diagnostics endpoint drives the
+# publisher directly (construction + healthcheck only, never a publish).
+probe-publish = { path = "../probe-publish" }
 probe-substore = { path = "../probe-substore" }
 axum = { workspace = true }
 serde = { workspace = true }

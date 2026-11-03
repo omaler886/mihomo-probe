@@ -19,6 +19,9 @@ use probe_api::AppState;
 use probe_config::Config;
 use probe_engine::{Ledger, RoundPlan, RoundSettings};
 use probe_mihomo::Controller;
+// `healthcheck`/`publish` are trait methods; the trait must be in scope at
+// the `gist` subcommands.
+use probe_publish::Publisher;
 use probe_storage::{migrations, Storage};
 
 fn main() {
@@ -119,6 +122,10 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "gist" => {
+            let sub = positionals.get(1).map(String::as_str).unwrap_or("");
+            std::process::exit(cmd_gist(&root, sub));
+        }
         "substore" => {
             // The embedded Sub-Store's own default is 8299 (documented, and
             // `substore.listen` says the same): falling through to serve's
@@ -148,6 +155,7 @@ fn print_usage() {
 \x20   status                print the last round from the ledger\n\
 \x20   db <migrate|check|backup|verify|rollback>\n\
 \x20   substore [init|status]\n\
+\x20   gist <test|init>       test the Gist destination / create the one Gist\n\
 \n\
 \x20 flags:\n\
 \x20   --root <dir>          service root (default: $MIHOMO_TEST_ROOT or /srv/mihomo-test)\n\
@@ -498,6 +506,79 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
         eprintln!("push: task failed: {err}");
         fallback
     });
+    // Workstreams/18 B2: the remote publish leg (Gist / composite). It runs
+    // after the local pipeline committed and NEVER changes the round's
+    // outcome; its per-source results are recorded on the source's run slot
+    // (`publish_status`). The same lock/runtime shape as the push above: the
+    // storage guard must not cross an await, and the HTTP calls run on a
+    // blocking thread with their own current-thread runtime.
+    if cfg.publish.provider != probe_config::PublishProvider::Local {
+        let publish_cfg = cfg.publish.clone();
+        let sources_cfg = cfg.sources.clone();
+        let export_root_remote = export_root.clone();
+        let remote_outcome = published.clone();
+        let remote_storage = Arc::clone(&storage);
+        let report = tokio::task::spawn_blocking(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    eprintln!("publish: cannot start a runtime: {err}");
+                    return None;
+                }
+            };
+            let guard = remote_storage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let request = probe_engine::publish_remote::RemotePublishRequest {
+                publish: &publish_cfg,
+                export_root: &export_root_remote,
+                outcome: &remote_outcome,
+                round_id,
+                sources: &sources_cfg,
+            };
+            Some(
+                runtime.block_on(probe_engine::publish_remote::publish_round_remote(
+                    &guard, request,
+                )),
+            )
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(report) = report {
+            if !report.constructed {
+                eprintln!("publish: remote publisher not configured; nothing was sent");
+            }
+            for entry in &report.entries {
+                let note = entry.error_code.as_deref().unwrap_or("-");
+                match entry.status {
+                    probe_storage::runs::PUBLISH_PUBLISHED if entry.error_code.is_none() => {
+                        println!(
+                            "remote publish {}: published ({})",
+                            entry.key, entry.gist_file
+                        );
+                    }
+                    probe_storage::runs::PUBLISH_NO_CHANGE => {
+                        println!("remote publish {}: no change", entry.key);
+                    }
+                    probe_storage::runs::PUBLISH_PUBLISHED => {
+                        // Composite: the local artifact is authoritative; the
+                        // Gist-side failure rides along as a note.
+                        println!(
+                            "remote publish {}: published (gist note: {note})",
+                            entry.key
+                        );
+                    }
+                    _ => {
+                        eprintln!("remote publish {}: {}: {note}", entry.key, entry.status);
+                    }
+                }
+            }
+        }
+    }
     if let Some(reason) = published.skipped {
         println!("publish: skipped ({reason:?})");
     }
@@ -561,6 +642,143 @@ fn cmd_db(
             2
         }
     }
+}
+
+/// `gist` subcommands (workstreams/18 B2): `test` probes the configured Gist
+/// destination, `init` creates the ONE Gist the publisher will ever patch.
+/// Both are masked: the token (which lives only in its file) and any gist
+/// content are never printed -- configured/ok/error codes only.
+fn cmd_gist(root: &Path, subcommand: &str) -> i32 {
+    match subcommand {
+        "test" => cmd_gist_test(root),
+        "init" => cmd_gist_init(root),
+        other => {
+            eprintln!("unknown gist subcommand: {other:?} (expected test | init)");
+            2
+        }
+    }
+}
+
+/// `gist test`: one healthcheck against the configured destination. Every
+/// answer is `configured`/`ok`/`error_code` -- never a message, never a URL,
+/// never the token. Exit 0 only when the destination answers.
+fn cmd_gist_test(root: &Path) -> i32 {
+    let cfg = load(root);
+    tokio_block(async {
+        let publisher = match probe_publish::GistPublisher::from_config(&cfg.publish.gist) {
+            Ok(publisher) => publisher,
+            // Construction failure IS the unconfigured case: no token file,
+            // no request, and nothing to say beyond the reason code.
+            Err(_) => {
+                println!("configured=false");
+                println!("error_code=config");
+                return 1;
+            }
+        };
+        let gist_id = cfg.publish.gist.gist_id.as_deref().unwrap_or("");
+        match publisher.healthcheck(gist_id).await {
+            Ok(()) => {
+                println!("configured=true");
+                println!("ok=true");
+                0
+            }
+            Err(error) => {
+                let configured = !matches!(error.code, probe_publish::PublishErrorCode::Config);
+                println!("configured={configured}");
+                println!("ok=false");
+                println!("error_code={}", error.code.as_str());
+                1
+            }
+        }
+    })
+}
+
+/// The `gist init` idempotency decision, pure for tests: an existing gist id
+/// that still healthchecks means the dedicated Gist already exists. Every
+/// other combination creates -- because `POST /gists` has no idempotency
+/// key, the caller (not the publisher) owns the create-once rule (F-032).
+fn gist_init_decision(existing_id: Option<&str>, healthcheck_ok: Option<bool>) -> GistInitDecision {
+    match (
+        existing_id.map(str::trim).filter(|id| !id.is_empty()),
+        healthcheck_ok,
+    ) {
+        (Some(_), Some(true)) => GistInitDecision::AlreadyInitialized,
+        _ => GistInitDecision::Create,
+    }
+}
+
+/// What `gist init` decided to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GistInitDecision {
+    /// The configured id is live: report and exit.
+    AlreadyInitialized,
+    /// No usable id (or it stopped answering): create once.
+    Create,
+}
+
+/// `gist init`: create the dedicated Gist once, then tell the operator where
+/// the id goes. Idempotent: an existing, healthy gist id short-circuits to
+/// `already-initialized` without a second POST. This repo has no config.json
+/// writer, so persistence is the printed snippet -- exact, and the only
+/// thing an operator has to paste.
+fn cmd_gist_init(root: &Path) -> i32 {
+    let cfg = load(root);
+    let section = cfg.publish.gist.clone();
+    tokio_block(async move {
+        if let Some(existing) = section
+            .gist_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            let health = match probe_publish::GistPublisher::from_config(&section) {
+                Ok(publisher) => publisher.healthcheck(existing).await.is_ok(),
+                Err(_) => false,
+            };
+            match gist_init_decision(Some(existing), Some(health)) {
+                GistInitDecision::AlreadyInitialized => {
+                    println!("already-initialized");
+                    println!("gist_id={existing}");
+                    return 0;
+                }
+                GistInitDecision::Create => {
+                    eprintln!(
+                        "the configured gist_id did not healthcheck; creating a new Gist \
+                         (the old id stays in the config until you paste the new one)"
+                    );
+                }
+            }
+        }
+        let publisher = match probe_publish::GistPublisher::from_config(&section) {
+            Ok(publisher) => publisher,
+            Err(_) => {
+                println!("configured=false");
+                println!("error_code=config");
+                return 1;
+            }
+        };
+        match publisher.create_gist("mihomo-probe exports").await {
+            Ok(gist_id) => {
+                let visibility = if section.public { "public" } else { "secret" };
+                println!("gist created ({visibility})");
+                println!("gist_id={gist_id}");
+                println!("persist it in <root>/data/config.json (merge into publish.gist):");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "publish": {"gist": {"gist_id": gist_id}},
+                    }))
+                    .unwrap_or_else(|_| "{{\"publish\": {}}}".to_string())
+                );
+                0
+            }
+            Err(error) => {
+                println!("ok=false");
+                println!("error_code={}", error.code.as_str());
+                1
+            }
+        }
+    })
 }
 
 fn stamp() -> String {
@@ -873,4 +1091,50 @@ fn tokio_block<T>(future: impl std::future::Future<Output = T>) -> T {
         .build()
         .expect("tokio runtime")
         .block_on(future)
+}
+
+#[cfg(test)]
+mod gist_init_tests {
+    use super::{gist_init_decision, GistInitDecision};
+
+    #[test]
+    fn an_existing_healthy_gist_id_is_already_initialized() {
+        assert_eq!(
+            gist_init_decision(Some("gist0001abcd"), Some(true)),
+            GistInitDecision::AlreadyInitialized
+        );
+        // Whitespace around the stored id does not defeat the guard.
+        assert_eq!(
+            gist_init_decision(Some("  gist0001abcd  "), Some(true)),
+            GistInitDecision::AlreadyInitialized
+        );
+    }
+
+    /// Every other combination creates: no id, a blank id, a failed or
+    /// unknown healthcheck. The create itself stays one POST (the publisher
+    /// never retries); re-running `init` is the operator's retry.
+    #[test]
+    fn everything_else_needs_a_create() {
+        assert_eq!(
+            gist_init_decision(None, Some(true)),
+            GistInitDecision::Create
+        );
+        assert_eq!(
+            gist_init_decision(Some(""), Some(true)),
+            GistInitDecision::Create,
+            "a blank stored id reads as unconfigured"
+        );
+        assert_eq!(
+            gist_init_decision(Some("   "), None),
+            GistInitDecision::Create
+        );
+        assert_eq!(
+            gist_init_decision(Some("gist0001abcd"), Some(false)),
+            GistInitDecision::Create
+        );
+        assert_eq!(
+            gist_init_decision(Some("gist0001abcd"), None),
+            GistInitDecision::Create
+        );
+    }
 }

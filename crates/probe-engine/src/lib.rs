@@ -15,6 +15,7 @@ pub mod measure;
 pub mod network;
 pub mod preflight;
 pub mod publish;
+pub mod publish_remote;
 pub mod round;
 pub mod round_lock;
 pub mod scheduler;

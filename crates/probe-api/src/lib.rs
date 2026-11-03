@@ -27,6 +27,7 @@ mod config_check;
 mod exports;
 pub mod gui;
 mod metrics;
+mod publishers;
 mod read;
 mod sources;
 
@@ -998,6 +999,90 @@ async fn publish_after_round(
             );
         }
     }
+    // Workstreams/18 B2: the remote publish leg (Gist / composite). Like the
+    // push below it never changes the round's outcome: per-source results are
+    // recorded on the run slots (`source_runs.publish_status`) and logged
+    // here. Provider `local` (the default) skips the whole block, so the
+    // default configuration behaves exactly as before.
+    if state.publish.provider != probe_config::PublishProvider::Local {
+        let publish = state.publish.clone();
+        let sources = state.sources.clone();
+        let export_root = state.publish.export_root(&state.root);
+        let remote_outcome = published.clone();
+        let storage = state.storage.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    tracing::warn!(%err, "cannot start the remote publish runtime");
+                    return None;
+                }
+            };
+            let guard = match storage.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let request = probe_engine::publish_remote::RemotePublishRequest {
+                publish: &publish,
+                export_root: &export_root,
+                outcome: &remote_outcome,
+                round_id,
+                sources: &sources,
+            };
+            Some(
+                runtime.block_on(probe_engine::publish_remote::publish_round_remote(
+                    &guard, request,
+                )),
+            )
+        })
+        .await;
+        match joined {
+            Ok(Some(report)) => {
+                if !report.constructed {
+                    tracing::error!(
+                        round_id = round_id,
+                        "remote publisher not configured; local results stand, nothing was sent"
+                    );
+                }
+                for entry in &report.entries {
+                    match entry.status {
+                        probe_storage::runs::PUBLISH_PUBLISHED => {
+                            tracing::info!(
+                                round_id = round_id,
+                                key = %entry.key,
+                                gist_file = %entry.gist_file,
+                                note = entry.error_code.as_deref().unwrap_or("-"),
+                                "remote publish succeeded"
+                            );
+                        }
+                        probe_storage::runs::PUBLISH_NO_CHANGE => {
+                            tracing::info!(
+                                round_id = round_id,
+                                key = %entry.key,
+                                "remote publish: no change"
+                            );
+                        }
+                        _ => {
+                            tracing::warn!(
+                                round_id = round_id,
+                                key = %entry.key,
+                                status = entry.status,
+                                detail = entry.error_code.as_deref().unwrap_or("-"),
+                                "remote publish failed; the previous artifact stands"
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(round_id = round_id, %err, "remote publish task failed")
+            }
+        }
+    }
     if !state.publish.push_to_substore {
         return;
     }
@@ -1192,6 +1277,7 @@ pub fn build_router(state: SharedState) -> Router {
         .merge(read::admin_routes())
         .merge(metrics::routes())
         .merge(config_check::routes())
+        .merge(publishers::admin_routes())
         .merge(sources::admin_routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), guard));
     Router::new()

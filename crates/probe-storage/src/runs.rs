@@ -38,6 +38,29 @@ pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_CANCELLED: &str = "cancelled";
 pub const STATUS_ABANDONED: &str = "abandoned";
 
+/// The `source_runs.publish_status` vocabulary (workstreams/18 B2): what the
+/// remote publish leg did with this run's publication. `published` is the
+/// authoritative success (the artifact row's digest advanced); a composite
+/// publish whose Gist leg failed also lands here, with the sanitized reason
+/// in `error_code` -- the local artifact is what the stable URL serves.
+pub const PUBLISH_PUBLISHED: &str = "published";
+/// The destination already held exactly this content: nothing was sent.
+pub const PUBLISH_NO_CHANGE: &str = "no_change";
+/// The publish failed; `error_code` names the frozen publisher code.
+pub const PUBLISH_FAILED: &str = "publish_failed";
+/// The publisher could not even be constructed (broken token file, no gist
+/// id): the round's local results stand, nothing remote was attempted.
+pub const PUBLISH_CONFIG_ERROR: &str = "gist_config_error";
+
+/// The publish statuses this crate accepts. Frozen spellings; anything else
+/// is refused rather than stored for a GUI to render.
+const PUBLISH_STATUSES: &[&str] = &[
+    PUBLISH_PUBLISHED,
+    PUBLISH_NO_CHANGE,
+    PUBLISH_FAILED,
+    PUBLISH_CONFIG_ERROR,
+];
+
 /// Slot timestamps are `utc_now()` stamps: second resolution, UTC.
 const STAMP: &[time::format_description::BorrowedFormatItem<'_>] =
     time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
@@ -85,6 +108,13 @@ pub struct SourceRunRow {
     pub has_idempotency_key: bool,
     pub claimed_at: String,
     pub updated_at: String,
+    /// What the remote publish leg did with this run's publication
+    /// (workstreams/18 B2). `None` = the local-only pipeline ran, or the row
+    /// predates migration 0012.
+    pub publish_status: Option<String>,
+    /// The publisher's frozen error code (`gist_auth`, ...) or the sanitized
+    /// gist-side note a composite publish carries. Never a credential.
+    pub error_code: Option<String>,
 }
 
 /// The outcome of trying to claim a slot. Every arm carries the run id, so the
@@ -311,7 +341,8 @@ impl Storage {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT id, source_id, round_id, trigger, status, idempotency_key, claimed_at, updated_at
+                "SELECT id, source_id, round_id, trigger, status, idempotency_key, claimed_at,
+                        updated_at, publish_status, error_code
                    FROM source_runs WHERE source_id = ?1 ORDER BY id DESC LIMIT ?2",
             )
             .map_err(storage_error("list source runs"))?;
@@ -353,6 +384,60 @@ impl Storage {
         Ok((inserted > 0).then(|| self.conn.last_insert_rowid()))
     }
 
+    /// Record what the remote publish leg did with one source's publication
+    /// for `round_id` (workstreams/18 B2).
+    ///
+    /// The run slot the API claim path opened already carries the round id, so
+    /// the update finds it whether it is still open or already closed; a slot
+    /// from a caller that never claims (a CLI one-shot) does not exist yet, so
+    /// a closed history row is inserted instead -- the same shape
+    /// [`Self::record_source_run`] writes, plus the publish columns. Returns
+    /// the number of rows written (always 1).
+    ///
+    /// The artifact's `last_content_sha256` is NOT touched here: only a
+    /// successful publish advances that digest (《指导》§3.4), and the engine
+    /// does that through `mark_artifact_published`.
+    pub fn record_source_publish_status(
+        &self,
+        source_id: &str,
+        round_id: i64,
+        publish_status: &str,
+        error_code: Option<&str>,
+    ) -> DomainResult<usize> {
+        validate_source_id(source_id)?;
+        if !PUBLISH_STATUSES.contains(&publish_status) {
+            return Err(DomainError::Storage("invalid publish status".into()));
+        }
+        if let Some(code) = error_code {
+            if code.is_empty() || code.chars().count() > 128 || code.chars().any(char::is_control) {
+                return Err(DomainError::Storage("invalid publish error code".into()));
+            }
+        }
+        let now = utc_now();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE source_runs
+                    SET publish_status = ?2, error_code = ?3, updated_at = ?4
+                  WHERE source_id = ?1 AND round_id = ?5",
+                params![source_id, publish_status, error_code, now, round_id],
+            )
+            .map_err(storage_error("record publish status"))?;
+        if updated > 0 {
+            return Ok(updated);
+        }
+        // No slot for this round (the claim path was not used): history only.
+        self.conn
+            .execute(
+                "INSERT INTO source_runs(source_id, round_id, trigger, status, idempotency_key,
+                                        claimed_at, updated_at, publish_status, error_code)
+                 VALUES(?1, ?2, 'publish', 'completed', NULL, ?3, ?3, ?4, ?5)",
+                params![source_id, round_id, now, publish_status, error_code],
+            )
+            .map_err(storage_error("record publish status"))?;
+        Ok(1)
+    }
+
     /// Shared single-row decoder for the id-keyed lookups.
     fn run_query<P: rusqlite::Params>(
         &self,
@@ -360,7 +445,8 @@ impl Storage {
         key: P,
     ) -> DomainResult<Option<SourceRunRow>> {
         let sql = format!(
-            "SELECT id, source_id, round_id, trigger, status, idempotency_key, claimed_at, updated_at
+            "SELECT id, source_id, round_id, trigger, status, idempotency_key, claimed_at,
+                    updated_at, publish_status, error_code
                FROM source_runs {where_clause}"
         );
         let mut statement = self
@@ -385,7 +471,8 @@ impl Storage {
     ) -> DomainResult<Option<SourceRunRow>> {
         transaction
             .query_row(
-                "SELECT id, source_id, round_id, trigger, status, idempotency_key, claimed_at, updated_at
+                "SELECT id, source_id, round_id, trigger, status, idempotency_key, claimed_at,
+                        updated_at, publish_status, error_code
                    FROM source_runs WHERE idempotency_key = ?1 ORDER BY id DESC LIMIT 1",
                 params![key],
                 run_from_row,
@@ -402,7 +489,8 @@ impl Storage {
     ) -> DomainResult<Option<SourceRunRow>> {
         transaction
             .query_row(
-                "SELECT id, source_id, round_id, trigger, status, idempotency_key, claimed_at, updated_at
+                "SELECT id, source_id, round_id, trigger, status, idempotency_key, claimed_at,
+                        updated_at, publish_status, error_code
                    FROM source_runs
                   WHERE source_id = ?1 AND status IN ('claimed', 'active')
                   ORDER BY id DESC LIMIT 1",
@@ -421,7 +509,8 @@ impl Storage {
     ) -> DomainResult<Option<SourceRunRow>> {
         transaction
             .query_row(
-                "SELECT id, source_id, round_id, trigger, status, idempotency_key, claimed_at, updated_at
+                "SELECT id, source_id, round_id, trigger, status, idempotency_key, claimed_at,
+                        updated_at, publish_status, error_code
                    FROM source_runs
                   WHERE source_id = ?1 AND round_id IS NOT NULL
                   ORDER BY id DESC LIMIT 1",
@@ -506,7 +595,7 @@ fn parse_stored_instant(text: &str) -> Option<time::OffsetDateTime> {
     Some(date.with_time(clock).assume_utc())
 }
 
-/// Decode the eight slot columns, folding `idempotency_key` into a boolean:
+/// Decode the ten slot columns, folding `idempotency_key` into a boolean:
 /// the key belongs to the caller, not to anything we echo back.
 fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRunRow> {
     Ok(SourceRunRow {
@@ -518,6 +607,8 @@ fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRunRow> {
         has_idempotency_key: row.get::<_, Option<String>>(5)?.is_some(),
         claimed_at: row.get(6)?,
         updated_at: row.get(7)?,
+        publish_status: row.get(8)?,
+        error_code: row.get(9)?,
     })
 }
 

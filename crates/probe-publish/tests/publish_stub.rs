@@ -62,8 +62,12 @@ fn gist(files: Value) -> Scripted {
 struct Stub {
     gets: Arc<Mutex<VecDeque<Scripted>>>,
     patches: Arc<Mutex<VecDeque<Scripted>>>,
+    /// Scripted POST answers (the `gist init` create), in order.
+    posts: Arc<Mutex<VecDeque<Scripted>>>,
     /// Parsed PATCH bodies, in arrival order.
     patch_bodies: Arc<Mutex<Vec<Value>>>,
+    /// Parsed POST bodies, in arrival order.
+    post_bodies: Arc<Mutex<Vec<Value>>>,
     /// `Authorization` header values seen (proves the token file content is
     /// what actually authenticates; also the pool of strings leak checks
     /// must NOT be about -- the header itself legitimately carries it).
@@ -84,6 +88,14 @@ impl Stub {
 
     fn patches(&self) -> Vec<Value> {
         self.patch_bodies.lock().unwrap().clone()
+    }
+
+    fn post_count(&self) -> usize {
+        self.post_bodies.lock().unwrap().len()
+    }
+
+    fn posts(&self) -> Vec<Value> {
+        self.post_bodies.lock().unwrap().clone()
     }
 
     fn request_count(&self) -> usize {
@@ -137,6 +149,12 @@ async fn handle(
             }
             stub.patches.lock().unwrap().pop_front()
         }
+        Method::POST => {
+            if let Some(value) = parsed {
+                stub.post_bodies.lock().unwrap().push(value);
+            }
+            stub.posts.lock().unwrap().pop_front()
+        }
         _ => stub.gets.lock().unwrap().pop_front(),
     };
     // Track concurrency around the stall: an unserialized pair of publishes
@@ -168,10 +186,22 @@ async fn start_stub(
     patches: Vec<Scripted>,
     delay: Duration,
 ) -> (String, Stub) {
+    start_stub_full(gets, patches, Vec::new(), delay).await
+}
+
+/// The same stub with a scripted POST queue, for the `gist init` create.
+async fn start_stub_full(
+    gets: Vec<Scripted>,
+    patches: Vec<Scripted>,
+    posts: Vec<Scripted>,
+    delay: Duration,
+) -> (String, Stub) {
     let stub = Stub {
         gets: Arc::new(Mutex::new(gets.into())),
         patches: Arc::new(Mutex::new(patches.into())),
+        posts: Arc::new(Mutex::new(posts.into())),
         patch_bodies: Arc::new(Mutex::new(Vec::new())),
+        post_bodies: Arc::new(Mutex::new(Vec::new())),
         auth_seen: Arc::new(Mutex::new(Vec::new())),
         raw_log: Arc::new(Mutex::new(Vec::new())),
         in_flight: Arc::new(AtomicUsize::new(0)),
@@ -827,4 +857,113 @@ fn outcome_error_message(outcome: &PublishOutcome) -> String {
         PublishOutcome::Failed { message, .. } => message.clone(),
         _ => String::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// create_gist -- the one-time `gist init` step (workstreams/18 B2)
+// ---------------------------------------------------------------------------
+
+/// A 201 create answers with the new gist id, is secret by default, seeds
+/// exactly the `manifest.json` placeholder, authenticates with the token
+/// file's content, and is sent EXACTLY ONCE (no retry can exist: a retried
+/// POST that lands twice is how duplicate Gists are born).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_gist_posts_once_secret_by_default() {
+    let (base, stub) = start_stub_full(
+        vec![],
+        vec![],
+        vec![script(
+            201,
+            json!({"id": GIST_ID, "html_url": "https://gist.github.com/x", "public": false})
+                .to_string(),
+        )],
+        Duration::ZERO,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let publisher = publisher_in(&base, dir.path());
+    let gist_id = publisher.create_gist("mihomo-probe exports").await.unwrap();
+    assert_eq!(gist_id, GIST_ID);
+
+    assert_eq!(stub.post_count(), 1, "one POST, never a retry");
+    let body = &stub.posts()[0];
+    assert_eq!(body["public"], false, "secret by default");
+    assert_eq!(body["description"], "mihomo-probe exports");
+    let files = body["files"].as_object().unwrap();
+    assert_eq!(
+        files.keys().map(String::as_str).collect::<Vec<_>>(),
+        [MANIFEST_FILE],
+        "the create seeds only the manifest placeholder"
+    );
+    let manifest: Value =
+        serde_json::from_str(files[MANIFEST_FILE]["content"].as_str().unwrap()).unwrap();
+    assert!(
+        manifest.is_object(),
+        "the placeholder is a JSON object the first publish can merge into"
+    );
+    let auth = stub.auth_seen.lock().unwrap().clone();
+    assert!(
+        auth.iter().all(|value| *value == format!("Bearer {TOKEN}")),
+        "the create authenticates with the token file's content"
+    );
+    stub.assert_no_token_leak(&[]);
+}
+
+/// `GistSection::public = true` is the only way a public Gist is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_gist_honors_the_public_flag() {
+    let (base, stub) = start_stub_full(
+        vec![],
+        vec![],
+        vec![script(201, json!({"id": GIST_ID}).to_string())],
+        Duration::ZERO,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let section = GistSection {
+        public: true,
+        ..gist_section(dir.path(), None)
+    };
+    let publisher = GistPublisher::with_api_base(&section, &base).unwrap();
+    publisher.create_gist("x").await.unwrap();
+    assert_eq!(stub.posts()[0]["public"], true);
+}
+
+/// A refused create maps the status and stays a single attempt (the 422 here
+/// is the "validate before create" case a naive retry would double).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_create_maps_the_status_without_retrying() {
+    let (base, stub) = start_stub_full(
+        vec![],
+        vec![],
+        vec![script(422, r#"{"message":"Validation Failed"}"#)],
+        Duration::ZERO,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let publisher = publisher_in(&base, dir.path());
+    let error = publisher.create_gist("x").await.unwrap_err();
+    assert_eq!(error.code, probe_publish::PublishErrorCode::Remote);
+    assert!(!error.retryable, "a failed create is never auto-retried");
+    assert_eq!(stub.post_count(), 1, "no retries on a create");
+    stub.assert_no_token_leak(std::slice::from_ref(&error.message));
+}
+
+/// A create whose response never arrives (dead port) is a `network` failure
+/// and -- again -- exactly one attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_that_never_completes_is_reported_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let publisher =
+        GistPublisher::with_api_base(&gist_section(dir.path(), None), "http://127.0.0.1:1")
+            .unwrap()
+            .with_backoff_base(Duration::from_millis(2))
+            .with_max_retry_after(Duration::from_millis(20));
+    let error = publisher.create_gist("x").await.unwrap_err();
+    assert_eq!(error.code, probe_publish::PublishErrorCode::Network);
+    assert!(
+        !error.retryable,
+        "a lost create response must not be retried"
+    );
+    assert!(!error.message.contains(TOKEN));
 }

@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use crate::{utc_now, DomainResult};
 
-pub const LATEST_VERSION: i64 = 11;
+pub const LATEST_VERSION: i64 = 12;
 
 /// (version, name, sql). Versions are strictly increasing and append-only:
 /// an applied migration is never edited, corrections come as new files.
@@ -72,6 +72,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         11,
         "0011_source_runs",
         include_str!("../../../migrations/0011_source_runs.sql"),
+    ),
+    (
+        12,
+        "0012_source_run_publish",
+        include_str!("../../../migrations/0012_source_run_publish.sql"),
     ),
 ];
 

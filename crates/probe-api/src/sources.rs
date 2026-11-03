@@ -478,7 +478,9 @@ async fn artifact_export_key(state: &AppState, source: &SourceRow) -> Option<Str
 
 /// The run slot DTO. The idempotency key is a boolean, never the key itself:
 /// it belongs to the caller, and echoing it into an admin response would put
-/// a client's retry handle into a log line.
+/// a client's retry handle into a log line. The publish columns are the
+/// remote leg's masked bookkeeping (workstreams/18 B2): a status word and a
+/// frozen error code, never a message body.
 fn run_dto(run: &SourceRunRow) -> serde_json::Value {
     json!({
         "run_id": run.id,
@@ -489,6 +491,8 @@ fn run_dto(run: &SourceRunRow) -> serde_json::Value {
         "has_idempotency_key": run.has_idempotency_key,
         "claimed_at": run.claimed_at,
         "updated_at": run.updated_at,
+        "publish_status": run.publish_status,
+        "error_code": run.error_code,
     })
 }
 

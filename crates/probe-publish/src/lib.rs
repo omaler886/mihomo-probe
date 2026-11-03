@@ -23,9 +23,12 @@
 //! to GitHub: `GistPublisher::with_api_base` aims everything at a local
 //! axum stub.
 //!
-//! Wiring into the engine, the CLI `gist init|test` commands and the API
-//! test endpoint is the follow-up task (A2); this crate is the library
-//! layer plus its contract tests.
+//! The one-shot Gist creation (`create_gist`, the CLI's `gist init`) is part
+//! of this crate, but its create-once idempotence guard is NOT: the CLI
+//! healthchecks the configured id first, because `POST /gists` has no
+//! server-side idempotency key. The engine, CLI and API wiring live in
+//! `probe-engine::publish_remote`, `probe-cli gist` and
+//! `probe-api::publishers`.
 
 pub mod composite;
 pub mod gist;

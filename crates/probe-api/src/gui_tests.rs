@@ -405,24 +405,52 @@ async fn xss_display_name_never_reaches_the_page() {
     );
 }
 
-/// Batch boundary (B2/B5): the publisher and migration endpoints do not
-/// exist yet, so today's router answers 404 -- the exact condition the SPA
-/// renders as 「未启用」. The page itself is pinned to call those documented
-/// paths, degrade on 404, double-confirm deletion, announce dynamic status
-/// and offer the light/dark theme.
+/// Batch boundary (B2 landed, B5 pending): the publisher test endpoint now
+/// EXISTS and is admin-gated (401 without the token, `configured:false` with
+/// it on an unconfigured deployment), while the migration endpoints do not
+/// exist yet and still answer 404 -- the exact condition the SPA renders as
+/// 「未启用」. The page itself is pinned to call those documented paths,
+/// degrade on 404/`configured:false`, double-confirm deletion, announce
+/// dynamic status and offer the light/dark theme.
 #[tokio::test]
-async fn future_contracts_degrade_to_not_enabled() {
+async fn migrations_stay_unwired_and_gist_test_is_admin_gated() {
     let tmp = tempfile::tempdir().unwrap();
     let base = spawn(gui_state(tmp.path(), Vec::new())).await;
     let client = reqwest::Client::new();
     for path in [
-        "/api/v1/publishers/gist/test",
         "/api/v1/migrations/substore/scan",
         "/api/v1/migrations/substore/apply",
     ] {
         let response = post(&client, &base, path, Some(ADMIN), None, None).await;
         assert_eq!(response.status(), 404, "{path} is a later batch");
     }
+    // B2: the publisher test endpoint exists. Without the admin token it is
+    // the guarded group's 401; with it, an unconfigured deployment answers
+    // the masked `configured:false` the SPA renders as 「未启用」.
+    let response = post(
+        &client,
+        &base,
+        "/api/v1/publishers/gist/test",
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), 401);
+    let response = post(
+        &client,
+        &base,
+        "/api/v1/publishers/gist/test",
+        Some(ADMIN),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["configured"], false, "{body}");
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["error_code"], "config");
     let html = get(&client, &base, "/gui", None)
         .await
         .text()

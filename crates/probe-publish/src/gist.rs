@@ -42,6 +42,11 @@ pub const GITHUB_API_BASE: &str = "https://api.github.com";
 /// cannot publish under this name.
 pub const MANIFEST_FILE: &str = "manifest.json";
 
+/// The manifest a freshly created Gist starts with: an empty JSON object in
+/// exactly the shape [`crate::Publisher::publish`] merges into, so the first
+/// source's entry lands in a manifest that is already valid.
+const MANIFEST_PLACEHOLDER: &str = "{}";
+
 /// GitHub rejects unsigned clients; a stable UA also makes the deployment
 /// recognizable in GitHub's request logs.
 const USER_AGENT_VALUE: &str = concat!("mihomo-probe-publish/", env!("CARGO_PKG_VERSION"));
@@ -231,6 +236,9 @@ pub struct GistPublisher {
     api_base: String,
     token: String,
     gist_id: Option<String>,
+    /// Whether `create_gist` makes the Gist public. Defaults to `false`: a
+    /// probe artifact is not something to expose to the world by accident.
+    public: bool,
     max_retries: u32,
     backoff_base: Duration,
     max_retry_after: Duration,
@@ -262,6 +270,7 @@ impl GistPublisher {
                 .clone()
                 .map(|id| id.trim().to_string())
                 .filter(|id| !id.is_empty()),
+            public: section.public,
             max_retries: section.max_retries.max(1),
             backoff_base: DEFAULT_BACKOFF_BASE,
             max_retry_after: DEFAULT_MAX_RETRY_AFTER,
@@ -280,6 +289,70 @@ impl GistPublisher {
     pub fn with_max_retry_after(mut self, cap: Duration) -> Self {
         self.max_retry_after = cap;
         self
+    }
+
+    /// The one-time `gist init` step: create the dedicated Gist this
+    /// publisher would patch, seeded with the `manifest.json` placeholder
+    /// (F-031). Secret by default ([`GistSection::public`], `false` = secret).
+    ///
+    /// The idempotence guard lives in the CALLER (the CLI healthchecks the
+    /// configured id first and only creates when there is none): `POST
+    /// /gists` has no server-side idempotency key, so this method sends
+    /// exactly ONE request and never retries -- a retried POST whose first
+    /// attempt actually landed would mint a second Gist, which is the one
+    /// thing the Gist model must never do. A lost response (network error
+    /// after the request reached GitHub) may therefore orphan a Gist; the
+    /// operator deletes it and re-runs `init`. Returns the new gist id.
+    pub async fn create_gist(&self, description: &str) -> Result<String, PublishError> {
+        let description: String = description.trim().chars().take(200).collect();
+        let body = json!({
+            "description": description,
+            "public": self.public,
+            "files": {MANIFEST_FILE: {"content": MANIFEST_PLACEHOLDER}},
+        });
+        let response = self
+            .send_once(
+                Method::POST,
+                &format!("{}/gists", self.api_base),
+                Some(body),
+            )
+            .await
+            // A create is NEVER retried automatically (see above), so the
+            // outcome never advertises "a later attempt may fix this": every
+            // error keeps its code but loses `retryable`, which is what the
+            // callers key their retry decisions on.
+            .map_err(|mut error| {
+                error.retryable = false;
+                error
+            })?;
+        let payload: Value = response.json().await.map_err(|error| {
+            // Not retryable ON PURPOSE: the create may have landed, and a
+            // second POST is how duplicate Gists are born. Re-running the
+            // (idempotent) init is the operator's retry.
+            PublishError {
+                code: PublishErrorCode::Network,
+                retryable: false,
+                message: redact(
+                    &format!("gist create response was not JSON: {error}"),
+                    &self.token,
+                ),
+                status: None,
+                retry_after: None,
+            }
+        })?;
+        let gist_id = payload
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        gist_id.ok_or_else(|| PublishError {
+            code: PublishErrorCode::Network,
+            retryable: false,
+            message: "gist create response carried no id".to_string(),
+            status: None,
+            retry_after: None,
+        })
     }
 
     fn gist_url(&self, gist_id: &str) -> String {
