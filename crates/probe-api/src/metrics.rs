@@ -293,6 +293,7 @@ mod tests {
                     publish: cfg.publish,
                     schedule: cfg.schedule,
                     policy: cfg.policy,
+                    min_run_interval_seconds: 0,
                 },
             )
             .with_publish(PublishSection::default()),

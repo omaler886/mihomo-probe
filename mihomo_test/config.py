@@ -326,6 +326,16 @@ DEFAULTS = {
     "publish": {
         "enabled": True,
         "push_to_substore": False,
+        # Migration-window escape hatch (workstreams/18). The refactor's rule
+        # is that a round must never CREATE a Sub-Store object: every repeated
+        # run of the old pipeline forked one logical subscription into many
+        # products. `push_to_substore` only decides whether the legacy write
+        # path runs at all; this flag decides whether it may still run, and
+        # even then it can only UPDATE a pre-bound canonical sub. Env
+        # `ALLOW_LEGACY_SUBSTORE_WRITE=1` opens it without editing this file,
+        # which is what a rollback needs; `=0` closes it again during an
+        # incident.
+        "allow_legacy_substore_write": False,
         "prefix": "probe",
         "hostname": os.environ.get("MIHOMO_TEST_HOSTNAME", "probe.example.com"),
         "add_region_tag": True,
@@ -499,6 +509,13 @@ def load():
         # unsafe as file names.
         cfg["sources"] = normalize_sources(cfg.get("sources"))
         cfg["chain"] = normalize_chain(cfg.get("chain"))
+        # The legacy Sub-Store write switch is also an environment variable,
+        # so a rollback never has to edit this file under pressure and an
+        # incident can close the path again with `=0`. A blank value leaves
+        # the stored decision alone. See DEFAULTS["publish"].
+        env_legacy = os.environ.get("ALLOW_LEGACY_SUBSTORE_WRITE", "").strip().lower()
+        if env_legacy:
+            cfg["publish"]["allow_legacy_substore_write"] = env_legacy in ("1", "true", "yes", "on")
         # Persist when the file was pruned *or* when a token had to be minted:
         # a token that only lives in this process would change on every
         # restart, breaking every URL that was handed out.

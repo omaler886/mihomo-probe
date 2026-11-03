@@ -964,6 +964,15 @@ pub struct PublishSection {
     /// Read-only credential for `GET /api/export/<key>.yaml`. `None` (or an
     /// empty/whitespace value) means no export download is authorized.
     pub token: Option<String>,
+    /// Migration-window escape hatch for the legacy Sub-Store write path
+    /// (workstreams/18). The refactor forbids creating Sub-Store objects per
+    /// round; this flag exists only so an operator can keep ONE pre-bound
+    /// canonical sub updating while clients cut over to the stable artifact
+    /// URL. Even when true the round may only *update* an existing sub --
+    /// creating a new one is still refused. Default false; the environment
+    /// variable `ALLOW_LEGACY_SUBSTORE_WRITE=1` turns it on without a config
+    /// edit, which is what a rollback needs.
+    pub allow_legacy_substore_write: bool,
     /// Export root. `None` = `<root>/exports` (see [`PublishSection::export_root`]).
     pub dir: Option<String>,
     /// Snapshots kept per key; the active one is always kept. `None` keeps
@@ -974,6 +983,23 @@ pub struct PublishSection {
 
 /// Directory under the service root that holds exports by default.
 pub const EXPORT_DIR_NAME: &str = "exports";
+
+/// The legacy-write decision: config value first, environment second.
+///
+/// The environment variable exists so a rollback never has to edit a JSON
+/// file under pressure, and it can both open and close the path: an explicit
+/// `=0` must be able to disarm a stored `true` during an incident. An unset
+/// variable leaves the stored decision alone. Kept pure so the decision
+/// table is unit-testable without mutating process state.
+fn legacy_substore_write_for(stored: bool, env: Option<&str>) -> bool {
+    match env.map(str::trim).filter(|raw| !raw.is_empty()) {
+        Some(raw) => matches!(
+            raw.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => stored,
+    }
+}
 
 impl PublishSection {
     /// The absolute export root every caller must agree on: the configured
@@ -995,6 +1021,7 @@ impl Default for PublishSection {
             hostname: DEFAULT_PUBLISH_HOSTNAME.to_string(),
             add_region_tag: true,
             token: None,
+            allow_legacy_substore_write: false,
             dir: None,
             keep_snapshots: None,
         }
@@ -1028,6 +1055,15 @@ impl PublishSection {
                 .map(str::trim)
                 .filter(|token| !token.is_empty())
                 .map(str::to_string),
+            // Config first, environment second: the env var exists so a
+            // rollback never has to edit a JSON file under pressure.
+            allow_legacy_substore_write: legacy_substore_write_for(
+                get_bool(
+                    "allow_legacy_substore_write",
+                    defaults.allow_legacy_substore_write,
+                ),
+                std::env::var("ALLOW_LEGACY_SUBSTORE_WRITE").ok().as_deref(),
+            ),
             dir: value
                 .get("dir")
                 .and_then(Value::as_str)
@@ -1052,13 +1088,29 @@ pub struct ScheduleSection {
     pub enabled: bool,
     /// Minutes between scheduled rounds; Python clamps to 1..=1440.
     pub interval_minutes: i64,
+    /// Minimum seconds between two per-source triggers (workstreams/18). A
+    /// faster second click on the GUI's 立即测活 coalesces into the run that
+    /// just happened instead of queueing another measurement of the same
+    /// nodes. The scheduled timer is unaffected: it already spaces itself by
+    /// `interval_minutes`. 0 disables the spacing check.
+    pub min_run_interval_seconds: i64,
 }
+
+/// `schedule.min_run_interval_seconds` default: 15 minutes, the refactor
+/// guidance's P0 value. The scheduled interval stays 30 minutes, so manual
+/// re-runs can land between rounds without doubling the measurement load.
+pub const DEFAULT_MIN_RUN_INTERVAL_SECONDS: i64 = 900;
+
+/// The clamp a hand-edited value passes through: below one second the window
+/// is meaningless (allow everything), above one hour it blocks real retries.
+pub const MIN_RUN_INTERVAL_RANGE: (i64, i64) = (0, 3600);
 
 impl Default for ScheduleSection {
     fn default() -> Self {
         Self {
             enabled: true,
             interval_minutes: DEFAULT_SCHEDULE_MINUTES,
+            min_run_interval_seconds: DEFAULT_MIN_RUN_INTERVAL_SECONDS,
         }
     }
 }
@@ -1080,6 +1132,15 @@ impl ScheduleSection {
                 })
                 .unwrap_or(defaults.interval_minutes)
                 .clamp(MIN_SCHEDULE_MINUTES, MAX_SCHEDULE_MINUTES),
+            min_run_interval_seconds: value
+                .get("min_run_interval_seconds")
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_f64().map(|f| f as i64))
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                })
+                .unwrap_or(defaults.min_run_interval_seconds)
+                .clamp(MIN_RUN_INTERVAL_RANGE.0, MIN_RUN_INTERVAL_RANGE.1),
         }
     }
 
@@ -1161,6 +1222,7 @@ pub fn default_tree() -> Value {
             "hostname": DEFAULT_PUBLISH_HOSTNAME,
             "add_region_tag": true,
             "token": "",
+            "allow_legacy_substore_write": false,
             "dir": null,
             "keep_snapshots": null,
         },
@@ -1168,6 +1230,7 @@ pub fn default_tree() -> Value {
         "schedule": {
             "interval_minutes": DEFAULT_SCHEDULE_MINUTES,
             "enabled": true,
+            "min_run_interval_seconds": DEFAULT_MIN_RUN_INTERVAL_SECONDS,
         },
         // Mirrors config.DEFAULTS["policy"].
         "policy": {
@@ -1540,6 +1603,38 @@ mod tests {
         );
         assert_eq!(cfg.publish.dir, None);
         assert_eq!(cfg.publish_prefix, cfg.publish.prefix);
+        assert!(
+            !cfg.publish.allow_legacy_substore_write,
+            "the legacy Sub-Store write path is off until an operator opens it"
+        );
+    }
+
+    /// The legacy flag reads from the config block, and the environment
+    /// overrides it both ways: a rollback must not need a file edit, and an
+    /// incident must be able to close the path again with `=0`. Tested through
+    /// the pure decision function rather than by mutating process state --
+    /// the test binary runs the other config tests in parallel.
+    #[test]
+    fn the_legacy_substore_write_flag_reads_config_then_environment() {
+        let stored = PublishSection::from_value(&serde_json::json!({
+            "allow_legacy_substore_write": true,
+        }));
+        assert!(stored.allow_legacy_substore_write);
+        let absent = PublishSection::from_value(&serde_json::json!({}));
+        assert!(!absent.allow_legacy_substore_write);
+
+        // Unset: the stored decision stands.
+        assert!(legacy_substore_write_for(true, None));
+        assert!(!legacy_substore_write_for(false, None));
+        // A blank value is an unset value: the stored decision stands.
+        assert!(legacy_substore_write_for(true, Some("   ")));
+        // Set: the environment decides, in both directions.
+        for on in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(legacy_substore_write_for(false, Some(on)), "{on}");
+        }
+        for off in ["0", "false", "no", "off"] {
+            assert!(!legacy_substore_write_for(true, Some(off)), "{off}");
+        }
     }
 
     #[test]

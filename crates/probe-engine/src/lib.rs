@@ -18,6 +18,7 @@ pub mod publish;
 pub mod round;
 pub mod round_lock;
 pub mod scheduler;
+pub mod sources;
 pub mod verify;
 
 pub use collect::{backend_from_env, collect, Collected};
@@ -39,4 +40,7 @@ pub use round_lock::RoundLock;
 pub use scheduler::{
     decide, parse_stored_instant, reap_orphan_rounds, OrphanLedger, SchedulerDecision, ORPHAN_NOTE,
     STARTUP_GRACE,
+};
+pub use sources::{
+    artifact_for_export_key, default_gist_file, source_for_export_key, sync_ledger_sources,
 };

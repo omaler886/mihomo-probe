@@ -1203,16 +1203,12 @@ struct FakeAdmin {
     lists: Mutex<usize>,
     fail_upserts: Mutex<bool>,
     fail_list: Mutex<bool>,
+    /// Names `update_sub` may touch: the legacy path is update-only, and the
+    /// double refuses a name it was not seeded with, like the real client.
+    bound: Mutex<Vec<String>>,
 }
 
 impl FakeAdmin {
-    fn with_subs(subs: Vec<SubEntry>) -> Self {
-        Self {
-            subs: Mutex::new(subs),
-            ..Self::default()
-        }
-    }
-
     fn upsert_names(&self) -> Vec<String> {
         self.upserts
             .lock()
@@ -1257,6 +1253,30 @@ impl SubAdmin for FakeAdmin {
         })
     }
 
+    fn update_sub<'a>(
+        &'a self,
+        name: &'a str,
+        payload: &'a Value,
+    ) -> AdminFuture<'a, Result<String, String>> {
+        Box::pin(async move {
+            // Update-only: an unbound name is a missing canonical sub, which
+            // the legacy path must report rather than create.
+            let bound = self.bound.lock().unwrap();
+            if !bound.iter().any(|candidate| candidate == name) {
+                return Err("canonical sub does not exist; refusing to create one".to_string());
+            }
+            drop(bound);
+            self.upserts
+                .lock()
+                .unwrap()
+                .push((name.to_string(), payload.clone()));
+            if *self.fail_upserts.lock().unwrap() {
+                return Err("backend down".to_string());
+            }
+            Ok("updated".to_string())
+        })
+    }
+
     fn delete_sub<'a>(&'a self, name: &'a str) -> AdminFuture<'a, Result<bool, String>> {
         Box::pin(async move {
             self.deletes.lock().unwrap().push(name.to_string());
@@ -1272,6 +1292,36 @@ impl SubAdmin for FakeAdmin {
             }
             Ok(self.subs.lock().unwrap().clone())
         })
+    }
+}
+
+/// An admin whose canonical `<prefix>-<key>-local` subs exist, so the
+/// update-only legacy path has something pre-bound to update.
+fn bound_admin(keys: &[&str]) -> FakeAdmin {
+    let admin = FakeAdmin::default();
+    {
+        let mut bound = admin.bound.lock().unwrap();
+        for key in keys {
+            bound.push(format!("probe-{key}-local"));
+        }
+    }
+    admin
+}
+
+/// The same, with a seeded sub list for the prune to read.
+fn bound_admin_with_subs(keys: &[&str], subs: Vec<SubEntry>) -> FakeAdmin {
+    let admin = bound_admin(keys);
+    *admin.subs.lock().unwrap() = subs;
+    admin
+}
+
+/// The legacy publish section: both flags on, which is the only state the
+/// migration window runs in.
+fn legacy_publish() -> PublishSection {
+    PublishSection {
+        push_to_substore: true,
+        allow_legacy_substore_write: true,
+        ..PublishSection::default()
     }
 }
 
@@ -1327,16 +1377,30 @@ async fn push_mode_off_sends_nothing_to_substore() {
     );
 }
 
-/// Every published source gets one local sub carrying its export body.
+/// The double gate: `push_to_substore` alone is not enough. The legacy write
+/// path opens only when BOTH flags are on (workstreams/18), so a config that
+/// predates the refactor cannot quietly resume creating Sub-Store objects.
 #[tokio::test]
-async fn push_mode_upserts_one_local_sub_per_published_source() {
+async fn push_mode_without_the_legacy_flag_sends_nothing() {
     let (storage, _root, sources, mut outcome) = published_round(&["air"]);
-    let admin = FakeAdmin::default();
+    let admin = bound_admin(&["air"]);
     let publish = PublishSection {
         push_to_substore: true,
         ..PublishSection::default()
     };
     push_round_exports(&admin, &storage, &publish, &sources, &mut outcome).await;
+
+    assert!(outcome.push.is_empty());
+    assert!(admin.upserts.lock().unwrap().is_empty());
+    assert_eq!(*admin.lists.lock().unwrap(), 0);
+}
+
+/// Every published source gets one local sub carrying its export body.
+#[tokio::test]
+async fn push_mode_updates_one_local_sub_per_published_source() {
+    let (storage, _root, sources, mut outcome) = published_round(&["air"]);
+    let admin = bound_admin(&["air"]);
+    push_round_exports(&admin, &storage, &legacy_publish(), &sources, &mut outcome).await;
 
     assert_eq!(admin.upsert_names(), ["probe-air-local"]);
     let payload = admin.upsert_payload("probe-air-local");
@@ -1357,21 +1421,42 @@ async fn push_mode_upserts_one_local_sub_per_published_source() {
     assert_eq!(outcome.push[0].name, "probe-air-local");
     assert!(outcome.push[0].ok);
     assert_eq!(outcome.push[0].node_count, 1);
-    assert_eq!(outcome.push[0].detail, "created");
+    assert_eq!(outcome.push[0].detail, "updated");
+}
+
+/// The legacy path updates only: a source whose canonical sub was never
+/// created is reported, and nothing new appears in Sub-Store.
+#[tokio::test]
+async fn push_mode_never_creates_a_missing_canonical_sub() {
+    let (storage, _root, sources, mut outcome) = published_round(&["air"]);
+    let admin = FakeAdmin::default();
+    push_round_exports(&admin, &storage, &legacy_publish(), &sources, &mut outcome).await;
+
+    assert_eq!(outcome.push.len(), 1);
+    assert!(!outcome.push[0].ok);
+    assert!(
+        outcome.push[0].detail.contains("refusing to create"),
+        "{}",
+        outcome.push[0].detail
+    );
+    assert!(admin.upserts.lock().unwrap().is_empty());
+    assert!(
+        outcome
+            .sources
+            .iter()
+            .all(|source| matches!(source, SourcePublication::Published { .. })),
+        "a refused push never downgrades the publication"
+    );
 }
 
 /// One refused write is recorded; the next source is still pushed, and the
 /// publication itself is never downgraded by a push failure.
 #[tokio::test]
-async fn a_failed_upsert_is_recorded_and_never_stops_the_other_sources() {
+async fn a_failed_update_is_recorded_and_never_stops_the_other_sources() {
     let (storage, _root, sources, mut outcome) = published_round(&["air", "backup"]);
-    let admin = FakeAdmin::default();
+    let admin = bound_admin(&["air", "backup"]);
     *admin.fail_upserts.lock().unwrap() = true;
-    let publish = PublishSection {
-        push_to_substore: true,
-        ..PublishSection::default()
-    };
-    push_round_exports(&admin, &storage, &publish, &sources, &mut outcome).await;
+    push_round_exports(&admin, &storage, &legacy_publish(), &sources, &mut outcome).await;
 
     assert_eq!(
         admin.upsert_names(),
@@ -1396,32 +1481,35 @@ async fn a_failed_upsert_is_recorded_and_never_stops_the_other_sources() {
 /// The prune removes retired local subs and touches nothing else.
 #[tokio::test]
 async fn prune_removes_only_our_retired_local_subs() {
-    let admin = FakeAdmin::with_subs(vec![
-        SubEntry {
-            name: "probe-air-local".to_string(),
-            source: Some("local".to_string()),
-        },
-        SubEntry {
-            name: "probe-retired-local".to_string(),
-            source: Some("local".to_string()),
-        },
-        SubEntry {
-            name: "probe-muted-local".to_string(),
-            source: Some("local".to_string()),
-        },
-        SubEntry {
-            name: "other-air-local".to_string(),
-            source: Some("local".to_string()),
-        },
-        SubEntry {
-            name: "probe-remote-local".to_string(),
-            source: Some("remote".to_string()),
-        },
-        SubEntry {
-            name: "probe-air".to_string(),
-            source: Some("local".to_string()),
-        },
-    ]);
+    let admin = bound_admin_with_subs(
+        &["air"],
+        vec![
+            SubEntry {
+                name: "probe-air-local".to_string(),
+                source: Some("local".to_string()),
+            },
+            SubEntry {
+                name: "probe-retired-local".to_string(),
+                source: Some("local".to_string()),
+            },
+            SubEntry {
+                name: "probe-muted-local".to_string(),
+                source: Some("local".to_string()),
+            },
+            SubEntry {
+                name: "other-air-local".to_string(),
+                source: Some("local".to_string()),
+            },
+            SubEntry {
+                name: "probe-remote-local".to_string(),
+                source: Some("remote".to_string()),
+            },
+            SubEntry {
+                name: "probe-air".to_string(),
+                source: Some("local".to_string()),
+            },
+        ],
+    );
     let storage = Storage::open_in_memory().unwrap();
     let root = TestRoot::new();
     // "air" publishes; "muted" is enabled and marked for export but has nothing
@@ -1433,10 +1521,7 @@ async fn prune_removes_only_our_retired_local_subs() {
         exportable("live", "vless"),
     );
     let verdicts = vec![alive(job("air", "fp", "live"), Some("HK"))];
-    let publish = PublishSection {
-        push_to_substore: true,
-        ..PublishSection::default()
-    };
+    let publish = legacy_publish();
     let mut outcome = publish_round(
         &storage,
         &root.0,
@@ -1477,22 +1562,21 @@ async fn prune_removes_only_our_retired_local_subs() {
 #[tokio::test]
 async fn a_failed_listing_never_deletes_anything() {
     let (storage, _root, sources, mut outcome) = published_round(&["air"]);
-    let admin = FakeAdmin::with_subs(vec![SubEntry {
-        name: "probe-retired-local".to_string(),
-        source: Some("local".to_string()),
-    }]);
+    let admin = bound_admin_with_subs(
+        &["air"],
+        vec![SubEntry {
+            name: "probe-retired-local".to_string(),
+            source: Some("local".to_string()),
+        }],
+    );
     *admin.fail_list.lock().unwrap() = true;
-    let publish = PublishSection {
-        push_to_substore: true,
-        ..PublishSection::default()
-    };
-    push_round_exports(&admin, &storage, &publish, &sources, &mut outcome).await;
+    push_round_exports(&admin, &storage, &legacy_publish(), &sources, &mut outcome).await;
 
     assert_eq!(
         admin.upsert_names(),
         ["probe-air-local"],
-        "the upserts still happen"
+        "the updates still happen"
     );
     assert!(admin.deletes().is_empty(), "no list, no deletes");
-    assert_eq!(outcome.push.len(), 1, "only the upsert is recorded");
+    assert_eq!(outcome.push.len(), 1, "only the update is recorded");
 }

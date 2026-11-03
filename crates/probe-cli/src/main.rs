@@ -246,6 +246,18 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
     ));
     let secret = Config::core_secret(&root.join("data")).expect("core secret");
     let controller = Controller::new(&cfg.core.api, Some(&secret));
+    // Workstreams/18: the configured sources are the ledger's registry. This
+    // runs before the round opens so the per-source run slots below resolve a
+    // real source_id, and it is idempotent -- a rename updates one row and
+    // never mints a second source or artifact for the same key.
+    {
+        let storage = storage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(err) = probe_engine::sync_ledger_sources(&storage, &cfg.sources) {
+            eprintln!("source registry sync failed: {err}");
+        }
+    }
     let ledger: Arc<dyn Ledger> = storage.clone();
     let round_id = ledger.start_round(trigger, mode).unwrap_or_else(|err| {
         eprintln!("could not open a round row: {err}");
@@ -810,6 +822,7 @@ async fn cmd_serve(root: &Path, host: &str, port: u16) -> std::io::Result<()> {
                 publish: cfg.publish.clone(),
                 schedule: cfg.schedule.clone(),
                 policy: cfg.policy.clone(),
+                min_run_interval_seconds: cfg.schedule.min_run_interval_seconds,
             },
         )
         .with_publish(cfg.publish.clone()),

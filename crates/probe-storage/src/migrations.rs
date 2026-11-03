@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use crate::{utc_now, DomainResult};
 
-pub const LATEST_VERSION: i64 = 9;
+pub const LATEST_VERSION: i64 = 11;
 
 /// (version, name, sql). Versions are strictly increasing and append-only:
 /// an applied migration is never edited, corrections come as new files.
@@ -63,6 +63,16 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0009_quality_samples",
         include_str!("../../../migrations/0009_quality_samples.sql"),
     ),
+    (
+        10,
+        "0010_source_artifact",
+        include_str!("../../../migrations/0010_source_artifact.sql"),
+    ),
+    (
+        11,
+        "0011_source_runs",
+        include_str!("../../../migrations/0011_source_runs.sql"),
+    ),
 ];
 
 /// Tables whose presence `db verify` requires after a full apply: the Python
@@ -82,6 +92,9 @@ pub const REQUIRED_TABLES: &[&str] = &[
     "active_exports",
     "exit_history",
     "quality_samples",
+    "sources",
+    "artifacts",
+    "source_runs",
 ];
 
 fn ensure_registry(conn: &Connection) -> DomainResult<()> {
@@ -397,14 +410,20 @@ mod tests {
 
     /// A ledger carrying a version this binary does not know (migrated by a
     /// NEWER build, then rolled back) is refused, not best-effort read.
+    ///
+    /// The version is LATEST_VERSION + **2**: LATEST_VERSION + 1 with a foreign
+    /// name is the *different revision* case (the version exists here under
+    /// another name), which `a_registry_row_with_a_foreign_name_fails_loudly`
+    /// already covers at version 9. This test is only about a version the
+    /// registry has never heard of at all.
     #[test]
     fn an_unknown_higher_version_is_refused() {
         let mut conn = Connection::open_in_memory().unwrap();
         assert!(!apply(&mut conn).unwrap().is_empty());
         conn.execute(
             "INSERT INTO schema_migrations(version, name, applied_at)
-             VALUES(?1, '0010_from_the_future', '2023-11-14T22:13:20')",
-            [LATEST_VERSION + 1],
+             VALUES(?1, '0011_from_the_future', '2023-11-14T22:13:20')",
+            [LATEST_VERSION + 2],
         )
         .unwrap();
         let err = apply(&mut conn).unwrap_err().to_string();

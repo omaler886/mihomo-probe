@@ -45,6 +45,7 @@ fn state_with(publish: PublishSection) -> SharedState {
             publish: PublishSection::default(),
             schedule: probe_config::ScheduleSection::default(),
             policy: cfg.policy,
+            min_run_interval_seconds: 0,
         },
     );
     Arc::new(state.with_publish(publish))
@@ -75,6 +76,7 @@ fn writable_root_state(publish: PublishSection) -> (SharedState, tempfile::TempD
             publish: PublishSection::default(),
             schedule: probe_config::ScheduleSection::default(),
             policy: cfg.policy,
+            min_run_interval_seconds: 0,
         },
     );
     (Arc::new(state.with_publish(publish)), tmp)

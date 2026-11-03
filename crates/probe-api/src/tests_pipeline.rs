@@ -23,7 +23,7 @@ const ADMIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 struct MockState {
     dns_queries: AtomicUsize,
     delays: Mutex<Vec<String>>,
-    /// Names the push mode created through `POST /api/subs`.
+    /// Names the legacy push updated through `PATCH /api/sub/{name}`.
     upserts: Mutex<Vec<String>>,
 }
 
@@ -84,6 +84,16 @@ async fn upsert_sub(
     Json(json!({"ok": true}))
 }
 
+/// Record one legacy update-only write (PATCH) the same way.
+async fn update_sub(
+    State(state): State<Arc<MockState>>,
+    AxumPath(name): AxumPath<String>,
+    Json(_payload): Json<Value>,
+) -> Json<Value> {
+    state.upserts.lock().unwrap().push(name);
+    Json(json!({"ok": true}))
+}
+
 /// List the subs this mock holds; the push mode's prune reads it.
 async fn list_subs(State(state): State<Arc<MockState>>) -> Json<Value> {
     let names = state.upserts.lock().unwrap().clone();
@@ -115,13 +125,16 @@ async fn mock_services_with(kernel_delay: std::time::Duration) -> (String, Arc<M
             StatusCode::NO_CONTENT
         }))
         .route("/proxies/{name}/delay", get(delay_reply))
-        // Sub-Store's admin half: a sub never exists yet, an upsert is recorded,
-        // and listing returns what was recorded (the push mode's prune reads it).
+        // Sub-Store's admin half. The canonical subs the legacy push updates
+        // exist (GET answers 200); the write itself is a PATCH, which the
+        // update-only path must use instead of POST /api/subs.
         .route(
             "/api/sub/{name}",
-            get(|| async { StatusCode::NOT_FOUND })
-                .patch(|| async { Json(json!({"ok": true})) })
-                .delete(|| async { Json(json!({"ok": true})) }),
+            get(|AxumPath(name): AxumPath<String>| async move {
+                Json(json!({"name": name, "source": "local"}))
+            })
+            .patch(update_sub)
+            .delete(|| async { Json(json!({"ok": true})) }),
         )
         .route("/api/subs", get(list_subs).post(upsert_sub))
         .with_state(state.clone());
@@ -174,6 +187,7 @@ fn pipeline_state_tuned(
             publish: cfg.publish,
             schedule: cfg.schedule,
             policy: cfg.policy,
+            min_run_interval_seconds: 0,
         },
     ))
 }
@@ -547,14 +561,15 @@ async fn status_reports_last_round_counts_and_the_schedule_block() {
     assert!(body["schedule"]["next_run"].is_null());
 }
 
-/// Push mode on: the round end upserts the published export into Sub-Store,
-/// and the in-flight flag only clears after the push finished.
+/// Legacy push on (both flags): the round end updates the published export in
+/// Sub-Store, and the in-flight flag only clears after the push finished.
 #[tokio::test]
-async fn push_mode_upserts_the_published_export_at_round_end() {
+async fn legacy_push_updates_the_published_export_at_round_end() {
     let root = tempfile::tempdir().unwrap();
     let (services, external) = mock_services().await;
     let state = pipeline_state_tuned(root.path(), &services, |cfg, _round| {
         cfg.publish.push_to_substore = true;
+        cfg.publish.allow_legacy_substore_write = true;
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -576,12 +591,12 @@ async fn push_mode_upserts_the_published_export_at_round_end() {
     .expect("the round (including its push) must finish");
 
     // The push runs at round end, before the in-flight flag clears, so the
-    // upsert is already recorded here.
+    // update is already recorded here.
     let upserts = external.upserts.lock().unwrap().clone();
     assert_eq!(
         upserts.len(),
         1,
-        "one published source, one upsert: {upserts:?}"
+        "one published source, one update: {upserts:?}"
     );
     assert!(
         upserts[0].ends_with("-air-local"),

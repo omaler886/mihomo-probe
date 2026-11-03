@@ -184,6 +184,24 @@ class Client:
             self._request("PATCH", f"/api/{kind}/{urllib.parse.quote(name, safe='')}", payload)
             return "patched"
 
+    def update_only(self, kind, name, payload):
+        """Replace an EXISTING sub/collection; never create one.
+
+        The legacy write path (workstreams/18) may only keep a pre-bound
+        canonical object updating while clients cut over to the stable
+        artifact URL, so a missing object is an error to report rather than an
+        invitation to mint a new one. Sub-Store answers HTTP 500 (not 404)
+        for an object that does not exist, which `_is_missing` normalises into
+        `NotFound` here.
+        """
+        path = f"/api/{kind}/{urllib.parse.quote(name, safe='')}"
+        try:
+            self.get_json(path)
+        except NotFound:
+            raise StoreError(f"{kind} {name} 不存在；拒绝新建，请先绑定 canonical 对象")
+        self._request("PATCH", path, payload)
+        return "updated"
+
     def _exists(self, kind, name):
         return (self.sub(name) if kind == "sub" else self.collection(name)) is not None
 

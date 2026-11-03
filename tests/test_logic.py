@@ -5126,19 +5126,25 @@ class ReapOrphanRoundsTest(unittest.TestCase):
 
 
 class _FakePushStore:
-    """Records upserts; can be told to fail on a given subscription name.
+    """Records update-only writes; can be told to fail on a given name.
 
-    `existing` seeds `/api/subs` so the prune path has something to walk;
-    `deletes` records what it removed.
+    `existing` seeds `/api/subs` so the prune path has something to walk, and
+    `present` seeds the existence probe `update_only` makes before it PATCHes
+    -- the legacy path may never create an object, so a name that is not
+    present is reported rather than written. `deletes` records what it
+    removed.
     """
 
-    def __init__(self, fail_on=(), existing=()):
+    def __init__(self, fail_on=(), existing=(), present=()):
         self.upserts = []
         self.fail_on = tuple(fail_on)
         self.existing = list(existing)
+        self.present = set(present)
         self.deletes = []
 
-    def upsert(self, kind, name, payload):
+    def update_only(self, kind, name, payload):
+        if name not in self.present:
+            raise StoreError(f"{kind} {name} 不存在；拒绝新建")
         if name in self.fail_on:
             raise StoreError("sub-store said no")
         self.upserts.append((kind, name, payload))
@@ -5147,6 +5153,11 @@ class _FakePushStore:
     def get_json(self, path):
         if path == "/api/subs":
             return list(self.existing)
+        if path.startswith("/api/sub/"):
+            name = path[len("/api/sub/"):]
+            if name in self.present:
+                return {"name": name, "source": "local"}
+            raise NotFound(name)
         return []
 
     def _request(self, method, path, body=None):
@@ -5189,7 +5200,10 @@ class PushExportsTest(unittest.TestCase):
             json.dumps({"count": count}), encoding="utf-8")
 
     def cfg(self, sources):
-        return {"sources": sources, "publish": {"prefix": "probe"}}
+        return {"sources": sources,
+                "publish": {"prefix": "probe",
+                            "push_to_substore": True,
+                            "allow_legacy_substore_write": True}}
 
     def push(self, cfg, store, keys=None):
         keys = engine.publish_keys(cfg) if keys is None else keys
@@ -5208,11 +5222,39 @@ class PushExportsTest(unittest.TestCase):
     def test_a_disabled_source_is_never_pushed_even_with_a_stale_export(self):
         self.export("air")
         self.export("eps1")
-        store = _FakePushStore()
+        store = _FakePushStore(present=["probe-air-local"])
         cfg = self.cfg([{"key": "air", "enabled": True},
                         {"key": "eps1", "enabled": False}])
         self.push(cfg, store)
         self.assertEqual(store.names(), ["probe-air-local"])
+
+    def test_the_legacy_flag_alone_does_not_open_the_write_path(self):
+        """`push_to_substore` without the legacy flag writes nothing.
+
+        The double gate is the whole point (workstreams/18): a config that
+        predates the refactor must not quietly resume creating Sub-Store
+        objects because someone ticked the old box.
+        """
+        self.export("air")
+        store = _FakePushStore(present=["probe-air-local"])
+        cfg = self.cfg([{"key": "air", "enabled": True}])
+        cfg["publish"]["allow_legacy_substore_write"] = False
+        records = self.push(cfg, store)
+        self.assertEqual(store.names(), [])
+        self.assertFalse(any(record["ok"] for record in records))
+        self.assertTrue(all("legacy" in record["text"] for record in records),
+                        f"the report must say why: {records}")
+
+    def test_a_missing_canonical_sub_is_reported_and_never_created(self):
+        """Update-only: a sub that does not exist is reported, not created."""
+        self.export("air")
+        store = _FakePushStore()  # nothing present
+        cfg = self.cfg([{"key": "air", "enabled": True}])
+        records = self.push(cfg, store)
+        self.assertEqual(store.names(), [], "update_only must not create")
+        self.assertFalse(records[0]["ok"])
+        self.assertEqual(records[0]["level"], "error")
+        self.assertIn("不存在", records[0]["text"])
 
     def test_disabled_sources_do_not_appear_in_the_report(self):
         self.export("air")
@@ -5233,7 +5275,7 @@ class PushExportsTest(unittest.TestCase):
 
     def test_records_carry_the_count_and_the_subscription_name(self):
         self.export("air", count=7)
-        store = _FakePushStore()
+        store = _FakePushStore(present=["probe-air-local"])
         records = self.push(self.cfg([{"key": "air", "enabled": True}]), store)
         self.assertTrue(records[0]["ok"])
         self.assertEqual(records[0]["count"], 7)
@@ -5241,7 +5283,8 @@ class PushExportsTest(unittest.TestCase):
 
     def test_a_store_failure_is_reported_at_error_level(self):
         self.export("air")
-        store = _FakePushStore(fail_on=("probe-air-local",))
+        store = _FakePushStore(fail_on=("probe-air-local",),
+                               present=["probe-air-local"])
         records = self.push(self.cfg([{"key": "air", "enabled": True}]), store)
         self.assertFalse(records[0]["ok"])
         self.assertEqual(records[0]["level"], "error")
@@ -5254,7 +5297,7 @@ class PushExportsTest(unittest.TestCase):
 
     def test_cli_report_keeps_the_original_one_line_per_key_text(self):
         self.export("air", count=3)
-        store = _FakePushStore()
+        store = _FakePushStore(present=["probe-air-local"])
         records = self.push(self.cfg([{"key": "air", "enabled": True}]), store)
         self.assertEqual(engine.push_report(records),
                          ["probe-air-local: updated (3 节点)"])
@@ -5291,10 +5334,14 @@ class PruneLocalSubsTest(unittest.TestCase):
             json.dumps({"count": count}), encoding="utf-8")
 
     def run_push(self, keys, existing):
-        store = _FakePushStore(existing=existing)
+        store = _FakePushStore(existing=existing,
+                               present=[f"probe-{k}-local" for k in keys])
         for key in keys:
             self.export(key)
-        return engine.push_exports({"publish": {"prefix": "probe"}}, store, keys), store
+        return engine.push_exports(
+            {"publish": {"prefix": "probe",
+                         "push_to_substore": True,
+                         "allow_legacy_substore_write": True}}, store, keys), store
 
     def test_a_retired_local_sub_is_removed(self):
         records, store = self.run_push(
@@ -5340,10 +5387,14 @@ class PruneLocalSubsTest(unittest.TestCase):
 
     def test_a_removal_failure_is_reported_at_error_level(self):
         store = _FakePushStore(
-            existing=[{"name": "probe-retired-local", "source": "local"}])
+            existing=[{"name": "probe-retired-local", "source": "local"}],
+            present=["probe-alive-local"])
         store._request = lambda *a, **k: (_ for _ in ()).throw(StoreError("nope"))
         self.export("alive")
-        records = engine.push_exports({"publish": {"prefix": "probe"}}, store, ["alive"])
+        records = engine.push_exports(
+            {"publish": {"prefix": "probe",
+                         "push_to_substore": True,
+                         "allow_legacy_substore_write": True}}, store, ["alive"])
         bad = [r for r in records if "移除失败" in r["text"]]
         self.assertEqual(len(bad), 1)
         self.assertEqual(bad[0]["level"], "error")
@@ -5353,10 +5404,13 @@ class PruneLocalSubsTest(unittest.TestCase):
         def boom(_path):
             raise StoreError("sub-store unreachable")
 
-        store = _FakePushStore()
+        store = _FakePushStore(present=["probe-alive-local"])
         store.get_json = boom
         self.export("alive")
-        records = engine.push_exports({"publish": {"prefix": "probe"}}, store, ["alive"])
+        records = engine.push_exports(
+            {"publish": {"prefix": "probe",
+                         "push_to_substore": True,
+                         "allow_legacy_substore_write": True}}, store, ["alive"])
         self.assertTrue(records[0]["ok"])
 
     def test_a_single_source_round_keeps_the_other_sources_subscriptions(self):
@@ -5372,8 +5426,10 @@ class PruneLocalSubsTest(unittest.TestCase):
         existing = [{"name": "probe-air-local", "source": "local"},
                     {"name": "probe-other-local", "source": "local"}]
         self.export("air")
-        store = _FakePushStore(existing=existing)
-        cfg = {"publish": {"prefix": "probe"},
+        store = _FakePushStore(existing=existing, present=["probe-air-local"])
+        cfg = {"publish": {"prefix": "probe",
+                           "push_to_substore": True,
+                           "allow_legacy_substore_write": True},
                "sources": [{"key": "air", "enabled": True},
                            {"key": "other", "enabled": True}]}
         engine.push_exports(cfg, store, ["air"])
@@ -5382,7 +5438,7 @@ class PruneLocalSubsTest(unittest.TestCase):
 
         # A source that genuinely left the config is still removed: absence
         # from `publish_keys` is the retirement signal, not absence from `keys`.
-        store = _FakePushStore(existing=existing)
+        store = _FakePushStore(existing=existing, present=["probe-air-local"])
         cfg["sources"][1]["enabled"] = False
         engine.push_exports(cfg, store, ["air"])
         self.assertEqual(store.deletes, [("DELETE", "/api/sub/probe-other-local")])
@@ -5401,7 +5457,9 @@ class PushEndpointTest(unittest.TestCase):
         self._old_dir = engine.EXPORT_DIR
         engine.EXPORT_DIR = self.tmp
         self._old_cfg = server._State.cfg
-        self.store = _FakePushStore()
+        # The legacy write path is update-only, so the fake needs the
+        # canonical subs to exist before the handler runs (workstreams/18).
+        self.store = _FakePushStore(present=["probe-air-local"])
         for key, count in (("air", 5), ("eps1", 9)):
             (self.tmp / f"{key}.yaml").write_text("proxies: []\n", encoding="utf-8")
             (self.tmp / f"{key}.meta.json").write_text(
@@ -5435,7 +5493,9 @@ class PushEndpointTest(unittest.TestCase):
     def test_endpoint_pushes_enabled_sources_and_skips_disabled_ones(self):
         cfg = {
             "auth": {"token": "tok"},
-            "publish": {"prefix": "probe"},
+            "publish": {"prefix": "probe",
+                        "push_to_substore": True,
+                        "allow_legacy_substore_write": True},
             "sources": [{"key": "air", "enabled": True},
                         {"key": "eps1", "enabled": False}],
         }
@@ -5448,7 +5508,9 @@ class PushEndpointTest(unittest.TestCase):
     def test_endpoint_returns_a_summary_plus_records_not_one_long_sentence(self):
         cfg = {
             "auth": {"token": "tok"},
-            "publish": {"prefix": "probe"},
+            "publish": {"prefix": "probe",
+                        "push_to_substore": True,
+                        "allow_legacy_substore_write": True},
             "sources": [{"key": "air", "enabled": True}],
         }
         payload = self.post_push(cfg)

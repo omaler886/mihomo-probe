@@ -417,6 +417,7 @@ mod tests {
         let zero = ScheduleSection {
             enabled: true,
             interval_minutes: 0,
+            ..schedule()
         };
         assert_eq!(zero.interval().as_secs(), 60);
         let last = datetime!(2026-10-20 12:00:00 UTC);

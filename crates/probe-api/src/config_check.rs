@@ -38,6 +38,7 @@ fn summary(config: &probe_config::Config) -> serde_json::Value {
         "publish": {
             "enabled": config.publish.enabled,
             "push_to_substore": config.publish.push_to_substore,
+            "allow_legacy_substore_write": config.publish.allow_legacy_substore_write,
             "prefix": config.publish.prefix,
             "hostname": config.publish.hostname,
             "add_region_tag": config.publish.add_region_tag,

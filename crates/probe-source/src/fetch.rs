@@ -214,6 +214,23 @@ pub trait SubAdmin: Send + Sync {
     /// something it believes it created needs "removed" to be distinguishable
     /// from "was never there", and both are fine outcomes here.
     fn delete_sub<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<bool, String>>;
+    /// Replace an EXISTING sub, never create one: the legacy write path
+    /// (workstreams/18) may only keep a pre-bound canonical object updating
+    /// while clients cut over, so a missing sub is an error to report rather
+    /// than an invitation to mint a new object. Returns `"updated"`.
+    ///
+    /// Defaults to a refusal so an admin that cannot update-only still
+    /// compiles; the real client implements the PATCH.
+    fn update_sub<'a>(
+        &'a self,
+        name: &'a str,
+        payload: &'a Value,
+    ) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async move {
+            let _ = (name, payload);
+            Err("update-only writes are not supported by this admin".to_string())
+        })
+    }
     /// Every sub the backend holds, as `(name, source)` -- Python
     /// `store.get_json("/api/subs")`. The push mode needs it to find the
     /// `-local` subs a retired source left behind.
@@ -373,6 +390,27 @@ impl SubAdmin for SubStoreClient {
                 Err(err) if err.status == 404 || is_missing(err.status, &err.body) => Ok(false),
                 Err(err) => Err(err.message()),
             }
+        })
+    }
+
+    fn update_sub<'a>(
+        &'a self,
+        name: &'a str,
+        payload: &'a Value,
+    ) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async move {
+            let path = format!("/api/sub/{}", encode(name));
+            // Existence first: a PATCH against a missing sub would CREATE it
+            // through Sub-Store's upsert semantics, which is exactly what the
+            // legacy path must never do. A 404 (or a 500-that-means-404) is
+            // therefore reported, not retried.
+            if !self.sub_exists(name).await? {
+                return Err("canonical sub does not exist; refusing to create one".to_string());
+            }
+            self.send_json(reqwest::Method::PATCH, &path, payload)
+                .await
+                .map_err(|err| err.message())?;
+            Ok("updated".to_string())
         })
     }
 

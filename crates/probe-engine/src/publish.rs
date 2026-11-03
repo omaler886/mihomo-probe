@@ -1009,12 +1009,19 @@ fn local_sub_name(prefix: &str, key: &str) -> String {
 /// snapshot rather than from the file: the ledger is authoritative, so the bytes
 /// pushed are the bytes a download would serve.
 ///
-/// Only sources that actually published this round are upserted, and the whole
-/// call is a no-op without `publish.push_to_substore`. Nothing here can fail the
-/// round: every backend call becomes a [PushRecord], and one source failing never
-/// stops the others, the prune, or the round that already finished. (Python also
-/// re-upserts enabled sources that did not publish from their file on disk; this
-/// is narrower and idempotent -- same content, fewer writes.)
+/// Only sources that actually published this round are pushed, and the whole
+/// call is a no-op unless BOTH legacy flags are on. Nothing here can fail the
+/// round: every backend call becomes a [PushRecord], and one source failing
+/// never stops the others, the prune, or the round that already finished.
+///
+/// LEGACY PATH (workstreams/18): the refactor's rule is that a round must
+/// never create a Sub-Store object -- every repeated run of the old pipeline
+/// forked one logical subscription into many products. This function is the
+/// migration-window escape hatch, so it is doubly gated (`push_to_substore`
+/// AND `allow_legacy_substore_write`) and it can only UPDATE a pre-bound
+/// canonical sub: a missing sub is reported, never created. New deployments
+/// consume the stable artifact URL instead
+/// (`GET /artifacts/{source_id}/subscription`).
 pub async fn push_round_exports(
     admin: &dyn SubAdmin,
     storage: &Storage,
@@ -1022,7 +1029,7 @@ pub async fn push_round_exports(
     sources: &[SourceSpec],
     outcome: &mut PublishRoundOutcome,
 ) {
-    if !publish.push_to_substore {
+    if !publish.push_to_substore || !publish.allow_legacy_substore_write {
         return;
     }
     let published: Vec<String> = outcome
@@ -1041,7 +1048,13 @@ pub async fn push_round_exports(
     outcome.push = records;
 }
 
-/// Upsert one source's active export as its `-local` sub.
+/// Update one source's active export as its `-local` sub -- update only.
+///
+/// The legacy path may never CREATE a Sub-Store object (workstreams/18), so
+/// this calls `update_sub`, not `upsert_sub`: a sub that does not exist is
+/// reported as a record detail and the round moves on. Python's payload is
+/// kept field for field; `source = local` is what keeps the prune scoped, and
+/// the content is embedded so the sub keeps working without this service.
 async fn push_one(
     admin: &dyn SubAdmin,
     storage: &Storage,
@@ -1070,9 +1083,9 @@ async fn push_one(
         }
     };
     record.node_count = snapshot.summary.node_count;
-    // Python's payload field for field. `source = local` is what keeps the prune
-    // scoped, and the content is embedded so the sub keeps working without this
-    // service.
+    // Python's payload field for field. `source = local` is what keeps the
+    // prune scoped, and the content is embedded so the sub keeps working
+    // without this service.
     let payload = serde_json::json!({
         "name": name,
         "displayName": format!("{key} 测活 ({})", snapshot.summary.node_count),
@@ -1084,7 +1097,7 @@ async fn push_one(
         "passThroughUA": false,
         "process": [],
     });
-    match admin.upsert_sub(&name, &payload).await {
+    match admin.update_sub(&name, &payload).await {
         Ok(action) => {
             record.ok = true;
             record.detail = action;

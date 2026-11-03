@@ -2591,9 +2591,17 @@ def _push_record(key, name, ok, level, text, count=0):
 
 
 def push_exports(cfg, store, keys, log=None):
-    """Upsert the exported lists into Sub-Store as local subscriptions.
+    """Update the exported lists in Sub-Store as local subscriptions.
 
-    Every write is an upsert. The previous pipelines only ever PATCHed a name
+    LEGACY PATH (workstreams/18). The refactor's rule is that a round must
+    never create a Sub-Store object: every repeated run of the old pipeline
+    forked one logical subscription into many products. So this function is
+    doubly gated (`publish.push_to_substore` AND
+    `publish.allow_legacy_substore_write`) and it can only UPDATE a
+    pre-bound canonical sub -- a missing one is reported, never created.
+    New deployments consume the stable artifact URL instead.
+
+    Every write is an update. The previous pipelines only ever PATCHed a name
     they assumed still existed, so one rename upstream turned the whole
     write-back into a silent no-op that still exited 0.
 
@@ -2605,6 +2613,15 @@ def push_exports(cfg, store, keys, log=None):
     log = log or db.log
     prefix = cfg["publish"].get("prefix", "probe")
     results = []
+    if not (cfg["publish"].get("push_to_substore")
+            and cfg["publish"].get("allow_legacy_substore_write")):
+        for key in keys:
+            results.append(_push_record(
+                key, key, ok=False, level="warn",
+                text=f"{key}: legacy Sub-Store 写入未开启"
+                     f"（push_to_substore + allow_legacy_substore_write）"))
+        log("warn", "legacy Sub-Store 写入未开启，跳过 push_exports")
+        return results
     for key in keys:
         content = read_export(key)
         if content is None:
@@ -2629,7 +2646,7 @@ def push_exports(cfg, store, keys, log=None):
             "process": [],
         }
         try:
-            action = store.upsert("sub", sub_name, payload)
+            action = store.update_only("sub", sub_name, payload)
             results.append(_push_record(
                 key, sub_name, ok=True, level="ok", count=count,
                 text=f"{sub_name}: {action} ({count} 节点)"))
@@ -2638,7 +2655,7 @@ def push_exports(cfg, store, keys, log=None):
             results.append(_push_record(
                 key, sub_name, ok=False, level="error", count=count,
                 text=f"{sub_name}: 失败 {exc}"))
-            log("error", f"写入 Sub-Store 失败 {sub_name}: {exc}")
+            log("error", f"更新 Sub-Store 失败 {sub_name}: {exc}")
 
     _prune_local_subs(cfg, store, keys, results, log)
     return results

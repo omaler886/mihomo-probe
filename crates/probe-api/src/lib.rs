@@ -27,6 +27,7 @@ mod config_check;
 mod exports;
 mod metrics;
 mod read;
+mod sources;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -77,6 +78,11 @@ pub struct AppState {
     /// The config file this process was started from, when the caller
     /// provided one. Empty means the self-check endpoint cannot read a file.
     config_path: std::path::PathBuf,
+    /// Minimum seconds between two triggers for the same source
+    /// (workstreams/18). A faster second click coalesces into the run that
+    /// just happened instead of queueing another measurement of the same
+    /// nodes. `0` disables the spacing check and every trigger claims a slot.
+    pub min_run_interval_seconds: i64,
 }
 
 impl AppState {
@@ -90,8 +96,25 @@ impl AppState {
         // same convention `db_path` follows -- so the self-check needs no
         // extra wiring at each call site.
         let config_path = serve.root.join("data").join("config.json");
+        // Workstreams/18: the configured sources are the ledger's registry.
+        // Syncing here (not in the round) means every endpoint answers from
+        // real source_ids even before the first round, and a rename updates
+        // one row instead of forking the source.
+        let storage = Arc::new(Mutex::new(storage));
+        {
+            let sources = serve.sources.clone();
+            let synced = match storage.lock() {
+                Ok(guard) => probe_engine::sync_ledger_sources(&guard, &sources),
+                Err(poisoned) => {
+                    probe_engine::sync_ledger_sources(&poisoned.into_inner(), &sources)
+                }
+            };
+            if let Err(err) = synced {
+                tracing::warn!(%err, "source registry sync failed; runs may not resolve a source_id");
+            }
+        }
         Self {
-            storage: Arc::new(Mutex::new(storage)),
+            storage,
             auth_token,
             controller,
             kernel_config_path: serve.kernel_config_path,
@@ -112,9 +135,9 @@ impl AppState {
             in_flight: Arc::new(AtomicBool::new(false)),
             running: Arc::new(Mutex::new(None)),
             config_path,
+            min_run_interval_seconds: serve.min_run_interval_seconds,
         }
     }
-
     /// Record the config file this process was started from, so the config
     /// self-check can parse exactly what an operator is about to rely on.
     pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
@@ -263,6 +286,11 @@ pub struct ServeConfig {
     pub schedule: probe_config::ScheduleSection,
     /// The `policy` section snapshot: convergence thresholds and the guard.
     pub policy: probe_config::PolicySection,
+    /// Minimum seconds between two triggers for the same source
+    /// (workstreams/18). A faster second click coalesces into the run that
+    /// just happened instead of queueing another measurement of the same
+    /// nodes. `0` disables the spacing check and every trigger claims a slot.
+    pub min_run_interval_seconds: i64,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -570,7 +598,7 @@ async fn start_round(State(state): State<SharedState>) -> Response {
 }
 
 /// What claiming the single in-flight slot produced.
-enum RoundStart {
+pub(crate) enum RoundStart {
     Started(probe_domain::RoundId),
     Busy,
     Storage(probe_domain::DomainError),
@@ -587,9 +615,12 @@ const ROUND_LOCK_DRAIN_SLACK: std::time::Duration = std::time::Duration::from_se
 /// Claim the in-flight slot, open the round row, and spawn the round task.
 ///
 /// The one start path: `POST /api/v1/rounds` calls it with "api", the
-/// scheduler with "schedule". Everything through the spawn is synchronous, so
-/// two ticks -- or a tick and a POST -- can never race past the busy check.
-fn spawn_round(
+/// scheduler with "schedule", and the per-source trigger with "api-manual".
+/// Everything through the spawn is synchronous, so two ticks -- or a tick and
+/// a POST -- can never race past the busy check. `trigger` is a `'static str`
+/// because it is moved into the spawned task; a per-source trigger belongs on
+/// the source's run slot, which is where its history reads it from.
+pub(crate) fn spawn_round(
     state: &SharedState,
     trigger: &'static str,
     mode: Option<&'static str>,
@@ -1105,6 +1136,15 @@ pub(crate) async fn scheduler_tick(state: &SharedState, process_started: &str) {
             }
             Err(err) => tracing::warn!(%err, "orphan round reaping failed"),
         }
+        // Workstreams/18: a per-source claim whose round never appeared (the
+        // process died between the claim and the round start) would otherwise
+        // block that source forever. The reaper only closes claims older than
+        // the budget, so a slot the live process just opened is never touched.
+        match sources::reap_orphan_claims(&storage) {
+            Ok(0) => {}
+            Ok(abandoned) => tracing::info!(abandoned, "abandoned stale source run claims"),
+            Err(err) => tracing::warn!(%err, "source run claim reaping failed"),
+        }
         let last_started = storage
             .last_round()
             .ok()
@@ -1151,6 +1191,7 @@ pub fn build_router(state: SharedState) -> Router {
         .merge(read::admin_routes())
         .merge(metrics::routes())
         .merge(config_check::routes())
+        .merge(sources::admin_routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), guard));
     Router::new()
         .route("/healthz", get(healthz))
@@ -1158,6 +1199,13 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/", get(panel_index))
         .route("/panel", get(panel_index))
         .merge(exports::public_routes())
+        // The stable subscription URL, mounted outside the guarded group with
+        // its own credential check (the read-only publish token), and with the
+        // cache policy re-applied after `security_headers` would overwrite it.
+        .merge(
+            sources::public_routes()
+                .layer(middleware::from_fn(sources::subscription_cache_headers)),
+        )
         .merge(guarded)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
@@ -1606,6 +1654,7 @@ mod tests {
                 publish: cfg.publish.clone(),
                 schedule: cfg.schedule.clone(),
                 policy: cfg.policy.clone(),
+                min_run_interval_seconds: 0,
             },
         )
     }
