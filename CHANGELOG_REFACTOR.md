@@ -49,9 +49,27 @@
 - **测试**：`cargo test -p probe-api` 54/54（8 新增：安全头/401/CSRF 四种拒绝形态/审计行/DTO 白名单/XSS display_name 转义/未来契约降级）。
 - **回滚**：`git revert b50a306`（纯新增路由，旧 / 面板未动）。
 
-## 待办（B2 接线 / B5 / B7 未完成）
+## 2026-11-04 B5 核心 — Sub-Store 迁移 scan/apply/rollback
 
-- **B2 接线（A2 进行中）**：engine `publish_round_remote` 钩子（provider=local 零行为变化）、`create_gist`、CLI `gist init/test`、API `POST /api/v1/publishers/gist/test`、B4 测试 8 的 404 钉住更新。
-- **B5（C 进行中）**：scan/apply/rollback 核心；之后 API `POST /api/v1/migrations/substore/*`、CLI 子命令、`link_substore.py` 降级为 SSH 侧入口。
-- **B6**：指导 §11.1/11.2/11.3 + 功能清单 §10 红线逐条测试映射；100 轮稳定性与故障注入场景补齐。
-- **B7**：README/ARCHITECTURE 发布章节改写；`ARCHITECTURE_GIST_ONLY.md`、`MIGRATION_GIST_ONLY.md`、`cleanup-plan.json` 交付物。
+- **执行者**：实现 Agent C + 主控复核（commit `4f27413`）
+- **文件**：新增 `crates/probe-source/src/migrate.rs`（含测试）；`probe-source/src/lib.rs` 模块行+再导出。
+- **变更**：`MigrationStore` trait **无 delete 方法**（结构级禁删）+ stub 测试断言请求日志零 DELETE；scan 按 §4.2 优先级归并（saved_source_id > 同 URL > 节点集摘要(取回上限 50) > 名称相似度仅报告），keep/duplicate/uncertain 分类；apply 仅 update-only retarget + quarantine 改名 `deprecated-*`（`rename_supported` 默认 false，真实后端保守禁用）；rollback/rollback_plan 幂等还原；报告 URL 查询串脱敏（原文仅内存保留供精确回滚）。
+- **测试**：`cargo test -p probe-source` 78/78（23 新增）；clippy/fmt 干净。
+- **审查**：主控抽检——delete 仅存在于自我声明注释；lib.rs diff 精确为模块行；独立复跑 78/78。
+- **NOT_RUN**：collections 面（crate 内无 collection list/update 路径，plan 内如实记录）。
+- **回滚**：`git revert 4f27413`（纯新增模块，无调用方）。
+
+## 2026-11-04 B2 接线 — engine 远程发布腿 + CLI gist + API 端点
+
+- **执行者**：实现 Agent A2 + 主控门禁（commit `29cf9cd`）
+- **文件**：新增 `probe-engine/src/publish_remote.rs`、`probe-api/src/publishers.rs`、`probe-cli/tests/gist_commands.rs`、`migrations/0012_source_run_publish.sql`；改 probe-publish（create_gist）、probe-storage（0012 + record_source_publish_status 冻结词表）、probe-cli（round 远程腿 + gist test/init）、probe-api（挂载 + run_dto + gui_tests 钉住更新）。
+- **变更**：`publish_round_remote`——provider=local 零行为变化；Published→mark_artifact_published+published；NoChange→no_change 且**不写 artifact**（§3.4(5)：sha 只在真发布后推进）；Failed→publish_failed+error_code；gist_failed 随行不失败整体；构造失败→gist_config_error 轮次不受影响；stable_url 不写（§3.2 禁 revision URL）。`create_gist` 单次 POST、错误强制不可重试。
+- **测试**：workspace **cargo 664/0**（+45）；Python 598 不回退；fmt/clippy/scan_secrets/diff --check 干净。
+- **风险**：远程腿 spawn_blocking 持存储互斥跨 gist HTTP（沿 legacy push 先例，single-flight 限界）；create 丢失响应可孤儿 gist（注释+运维动作）。
+- **回滚**：`git revert 29cf9cd`（0012 additive，旧二进制忽略新列）。
+
+## 待办（B5 接线 / B6 / B7 未完成）
+
+- **B5 接线**：API `POST /api/v1/migrations/substore/{scan,apply,rollback}`（apply 默认 dry-run=true）、CLI `migrate` 子命令、`link_substore.py` 降级。
+- **B6**：指导 §11.1/11.2/11.3 + 功能清单 §10 红线逐条测试映射；缺口补测（仅新文件）。
+- **B7**：README/ARCHITECTURE 发布章节；`ARCHITECTURE_GIST_ONLY.md`、`MIGRATION_GIST_ONLY.md`；`/api/v1/publishers/gist/init` API 面（CLI 已有）。
