@@ -23,12 +23,17 @@
 
 pub mod fetch;
 pub mod identity;
+pub mod migrate;
 pub mod prepare;
 pub mod source;
 pub mod subscription;
 
 pub use fetch::{content_digest, Fetcher, SubAdmin, SubEntry, SubStoreClient};
 pub use identity::{fingerprint_proxy, variant_fingerprint, DROP_FIELDS, REQUIRED};
+pub use migrate::{
+    apply, rollback, rollback_plan, scan, ApplyReport, ArtifactRef, MigrationPlan, MigrationStore,
+    RollbackReport, ScanCaps, StoreRef, SubStoreHttpStore,
+};
 pub use prepare::{prepare, DroppedNode, PreparedNode, RawEntry, Role};
 pub use source::{collect_entries, FetchedSource, CAT_CHAIN, CAT_DIRECT, CAT_RELAY};
 pub use subscription::parse_proxies;
