@@ -1128,6 +1128,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "probe-publish"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "probe-config",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "probe-source"
 version = "0.1.0"
 dependencies = [

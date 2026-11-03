@@ -979,6 +979,146 @@ pub struct PublishSection {
     /// everything, which is what the publication module assumes by default:
     /// deleting history is an operator decision, not a silent default.
     pub keep_snapshots: Option<usize>,
+    /// Which publisher chain carries an artifact out (workstreams/18 B2).
+    /// `local` (default) keeps today's on-disk exports; `gist` publishes to a
+    /// GitHub Gist; `composite` writes locally first and then to the Gist,
+    /// where a Gist failure never fails the whole publish.
+    pub provider: PublishProvider,
+    /// The `publish.gist` sub-section: GitHub Gist credentials and retry
+    /// bounds. Parsed (and clamped) even when `provider` is `local`, so a
+    /// provider switch in the config file needs no other edit.
+    pub gist: GistSection,
+}
+
+/// The `publish.provider` choice. An unknown or blank stored value reads as
+/// `Local`: the conservative fallback is the pipeline that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishProvider {
+    /// On-disk exports only (today's default).
+    Local,
+    /// GitHub Gist only.
+    Gist,
+    /// Local first, then Gist; a Gist failure is reported, not fatal.
+    Composite,
+}
+
+impl PublishProvider {
+    /// The canonical config spelling of this provider.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Gist => "gist",
+            Self::Composite => "composite",
+        }
+    }
+
+    /// Parse a stored value. Matching is case-insensitive and trims
+    /// whitespace; anything unrecognized falls back to `Local` rather than
+    /// failing the whole config (the same tolerance every other section gets).
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "gist" => Self::Gist,
+            "composite" => Self::Composite,
+            // "local" and every typo: the default pipeline stays in charge.
+            _ => Self::Local,
+        }
+    }
+}
+
+/// The `publish.gist` sub-section: everything the Gist publisher needs.
+///
+/// The GitHub token itself never lives here -- only the PATH of the file that
+/// holds it (0600, outside config.json and SQLite). See `probe-publish`'s
+/// `GistPublisher`, which reads the file at construction time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GistSection {
+    /// The Gist id to publish into. `None` = not initialized yet; the CLI's
+    /// `gist init` creates one and fills this in.
+    pub gist_id: Option<String>,
+    /// Path of the file holding the GitHub token. `None` = Gist publishing
+    /// is unusable (the publisher refuses to construct).
+    pub token_file: Option<PathBuf>,
+    /// Whether `gist init` should create a public Gist. Default false; a
+    /// probe artifact is not something to expose to the world by accident.
+    pub public: bool,
+    /// Per-request HTTP timeout in seconds, clamped to `GIST_TIMEOUT_RANGE`.
+    pub timeout_seconds: u64,
+    /// Attempts per HTTP call (first try included), clamped to
+    /// `GIST_MAX_RETRIES_RANGE`.
+    pub max_retries: u32,
+}
+
+/// Default `publish.gist.timeout_seconds`: GitHub's API p95 is far below
+/// this; a slow proxy in front of it is the reason the number is not smaller.
+pub const DEFAULT_GIST_TIMEOUT_SECONDS: u64 = 30;
+
+/// The clamp a hand-edited timeout passes through: below one second a round
+/// trip to api.github.com is already unrealistic, above five minutes a hung
+/// publish would stall the whole round.
+pub const GIST_TIMEOUT_RANGE: (u64, u64) = (1, 300);
+
+/// Default `publish.gist.max_retries`: 1s -> 2s -> 4s backoff per the
+/// refactor plan (F-037).
+pub const DEFAULT_GIST_MAX_RETRIES: u32 = 3;
+
+/// The clamp for the attempt count: 0 still means "one attempt" (the first
+/// try is never skipped); above ten the round would spend minutes waiting.
+pub const GIST_MAX_RETRIES_RANGE: (u32, u32) = (0, 10);
+
+impl Default for GistSection {
+    fn default() -> Self {
+        Self {
+            gist_id: None,
+            token_file: None,
+            public: false,
+            timeout_seconds: DEFAULT_GIST_TIMEOUT_SECONDS,
+            max_retries: DEFAULT_GIST_MAX_RETRIES,
+        }
+    }
+}
+
+impl GistSection {
+    fn from_value(value: &Value) -> Self {
+        let defaults = Self::default();
+        let text = |key: &str| -> Option<String> {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        let number = |key: &str| -> Option<i64> {
+            value.get(key).and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_f64().map(|f| f as i64))
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+            })
+        };
+        Self {
+            gist_id: text("gist_id"),
+            // A stored path is trimmed but otherwise verbatim: Windows paths
+            // contain backslashes and colons that a whitelist would reject.
+            token_file: text("token_file").map(PathBuf::from),
+            public: value
+                .get("public")
+                .and_then(Value::as_bool)
+                .unwrap_or(defaults.public),
+            timeout_seconds: number("timeout_seconds")
+                .map(|secs| {
+                    secs.clamp(GIST_TIMEOUT_RANGE.0 as i64, GIST_TIMEOUT_RANGE.1 as i64) as u64
+                })
+                .unwrap_or(defaults.timeout_seconds),
+            max_retries: number("max_retries")
+                .map(|retries| {
+                    retries.clamp(
+                        GIST_MAX_RETRIES_RANGE.0 as i64,
+                        GIST_MAX_RETRIES_RANGE.1 as i64,
+                    ) as u32
+                })
+                .unwrap_or(defaults.max_retries),
+        }
+    }
 }
 
 /// Directory under the service root that holds exports by default.
@@ -1024,6 +1164,8 @@ impl Default for PublishSection {
             allow_legacy_substore_write: false,
             dir: None,
             keep_snapshots: None,
+            provider: PublishProvider::Local,
+            gist: GistSection::default(),
         }
     }
 }
@@ -1077,6 +1219,12 @@ impl PublishSection {
                 .and_then(Value::as_u64)
                 .filter(|keep| *keep >= 1)
                 .map(|keep| keep as usize),
+            provider: value
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(PublishProvider::parse)
+                .unwrap_or(defaults.provider),
+            gist: GistSection::from_value(value.get("gist").unwrap_or(&Value::Null)),
         }
     }
 }
@@ -1214,7 +1362,9 @@ pub fn default_tree() -> Value {
             "test_plain_nodes": false,
         },
         // Python's `publish` defaults; `dir` is Rust-only (Python derives the
-        // export root from its data directory).
+        // export root from its data directory). `provider`/`gist` are the B2
+        // Gist section: a fresh empty data dir must parse with every key
+        // present so the engine never meets a missing field on first boot.
         "publish": {
             "enabled": true,
             "push_to_substore": false,
@@ -1225,6 +1375,14 @@ pub fn default_tree() -> Value {
             "allow_legacy_substore_write": false,
             "dir": null,
             "keep_snapshots": null,
+            "provider": "local",
+            "gist": {
+                "gist_id": null,
+                "token_file": null,
+                "public": false,
+                "timeout_seconds": DEFAULT_GIST_TIMEOUT_SECONDS,
+                "max_retries": DEFAULT_GIST_MAX_RETRIES,
+            },
         },
         // Mirrors config.DEFAULTS["schedule"] (the Rust serve loop reads it).
         "schedule": {
@@ -1658,6 +1816,128 @@ mod tests {
         // A whitespace-only token is not a token.
         let blank = PublishSection::from_value(&serde_json::json!({"token": "   "}));
         assert_eq!(blank.token, None);
+    }
+
+    /// B2: the provider choice parses tolerantly. Anything the engine does
+    /// not recognize must fall back to `local` -- the pipeline that already
+    /// works -- never to an error and never to a provider that publishes.
+    #[test]
+    fn the_publish_provider_parses_with_a_conservative_fallback() {
+        let section = PublishSection::from_value(&serde_json::json!({"provider": " gist "}));
+        assert_eq!(section.provider, PublishProvider::Gist);
+        let section = PublishSection::from_value(&serde_json::json!({"provider": "COMPOSITE"}));
+        assert_eq!(section.provider, PublishProvider::Composite);
+        let section = PublishSection::from_value(&serde_json::json!({"provider": "local"}));
+        assert_eq!(section.provider, PublishProvider::Local);
+        // Unknown, blank and non-string values all read as the default.
+        for hostile in serde_json::json!(["rsync", "", null, 7, true])
+            .as_array()
+            .unwrap()
+        {
+            let json = serde_json::json!({ "provider": hostile });
+            let section = PublishSection::from_value(&json);
+            assert_eq!(
+                section.provider,
+                PublishProvider::Local,
+                "provider {hostile:?} must fall back to local"
+            );
+        }
+        // The canonical spelling round-trips through `as_str`.
+        for provider in [
+            PublishProvider::Local,
+            PublishProvider::Gist,
+            PublishProvider::Composite,
+        ] {
+            assert_eq!(PublishProvider::parse(provider.as_str()), provider);
+        }
+    }
+
+    /// B2: the gist sub-section reads, trims and clamps its values. A blank
+    /// gist_id or token_file reads as unconfigured (None), and hostile
+    /// numbers land inside the clamp instead of reaching the publisher.
+    #[test]
+    fn the_gist_section_reads_and_clamps_stored_values() {
+        let gist = GistSection::from_value(&serde_json::json!({
+            "gist_id": "  abc123  ",
+            "token_file": "C:\\secrets\\gist.token",
+            "public": true,
+            "timeout_seconds": 5,
+            "max_retries": 0,
+        }));
+        assert_eq!(gist.gist_id.as_deref(), Some("abc123"));
+        assert_eq!(
+            gist.token_file.as_deref(),
+            Some(Path::new("C:\\secrets\\gist.token"))
+        );
+        assert!(gist.public);
+        assert_eq!(gist.timeout_seconds, 5);
+        assert_eq!(gist.max_retries, 0, "0 keeps the single first attempt");
+
+        // Clamps: the publisher must never wait minutes per attempt or loop
+        // forever on retries because a config file says so.
+        let clamped = GistSection::from_value(&serde_json::json!({
+            "timeout_seconds": 100_000,
+            "max_retries": 99,
+        }));
+        assert_eq!(clamped.timeout_seconds, GIST_TIMEOUT_RANGE.1);
+        assert_eq!(clamped.max_retries, GIST_MAX_RETRIES_RANGE.1);
+        let zeroed = GistSection::from_value(&serde_json::json!({
+            "timeout_seconds": 0,
+            "max_retries": -5,
+        }));
+        assert_eq!(zeroed.timeout_seconds, GIST_TIMEOUT_RANGE.0);
+        assert_eq!(zeroed.max_retries, GIST_MAX_RETRIES_RANGE.0);
+
+        // Absent / blank / wrong-typed values read as unconfigured.
+        let empty = GistSection::from_value(&serde_json::json!({
+            "gist_id": "   ",
+            "token_file": 42,
+        }));
+        assert_eq!(empty.gist_id, None);
+        assert_eq!(empty.token_file, None);
+        assert_eq!(empty, GistSection::default());
+    }
+
+    /// B2: a fresh empty data dir parses with every publish/gist key present
+    /// (the repo P0 "no KeyError on first boot" rule). The stored file may
+    /// override any single key and the rest of the defaults survive.
+    #[test]
+    fn the_default_tree_carries_the_full_publish_and_gist_section() {
+        let tree = default_tree();
+        assert_eq!(
+            tree.pointer("/publish/provider").and_then(Value::as_str),
+            Some("local"),
+            "the default provider must stay `local`"
+        );
+        for key in [
+            "/publish/gist/gist_id",
+            "/publish/gist/token_file",
+            "/publish/gist/public",
+            "/publish/gist/timeout_seconds",
+            "/publish/gist/max_retries",
+        ] {
+            assert!(tree.pointer(key).is_some(), "default tree is missing {key}");
+        }
+        let cfg = Config::parse("{}").unwrap().0;
+        assert_eq!(cfg.publish.provider, PublishProvider::Local);
+        assert_eq!(cfg.publish.gist, GistSection::default());
+        assert_eq!(
+            cfg.publish.gist.timeout_seconds,
+            DEFAULT_GIST_TIMEOUT_SECONDS
+        );
+        assert_eq!(cfg.publish.gist.max_retries, DEFAULT_GIST_MAX_RETRIES);
+
+        // A stored override merges over the defaults without losing siblings.
+        let cfg = Config::parse(r#"{"publish": {"provider": "gist", "gist": {"gist_id": "g1"}}}"#)
+            .unwrap()
+            .0;
+        assert_eq!(cfg.publish.provider, PublishProvider::Gist);
+        assert_eq!(cfg.publish.gist.gist_id.as_deref(), Some("g1"));
+        assert_eq!(
+            cfg.publish.gist.timeout_seconds,
+            DEFAULT_GIST_TIMEOUT_SECONDS
+        );
+        assert!(cfg.publish.enabled, "siblings outside the override survive");
     }
 
     /// Retention is off by default: deleting publication history is an

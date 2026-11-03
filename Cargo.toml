@@ -6,6 +6,7 @@ members = [
     "crates/probe-dns",
     "crates/probe-storage",
     "crates/probe-source",
+    "crates/probe-publish",
     "crates/probe-mihomo",
     "crates/probe-substore",
     "crates/probe-engine",
