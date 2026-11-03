@@ -28,9 +28,30 @@
 - **审查**：新增用例覆盖「100 次发布只 1 个 artifact」「改名不新建 artifact」「gist_file 唯一冲突」「幂等键复用/跨源冲突/释放后可重试」「最小间隔 coalesce」「崩溃槽回收」「双门禁不放行」。
 - **回滚**：`git revert` 本提交即可（迁移为 additive，旧二进制读新表会忽略；如需彻底回退 schema，删除 `sources`/`artifacts`/`source_runs` 三表并 `DELETE FROM schema_migrations WHERE version IN (10,11)`）。
 
-## 待办（B2/B4/B5/B7 未完成，已记录）
+## 2026-11-04 B2 核心 — probe-publish crate（Gist 固定文件发布器）
 
-- **B2 Gist Publisher**：两次派发的实现 Agent 均在执行前失败（无产出）。现状：无 `probe-publish` crate、无 Gist 配置节、无 `gist init/test` 子命令、API 无 `POST /api/v1/publishers/gist/test`。合同与插入点已在 `workstreams/18_REFACTOR_PLAN.md` §B2 写明。
-- **B4 独立 GUI**：`/api/v1/sources` 等只读契约已就绪，但未提供 SPA 页面与 CSRF/重新认证。
-- **B5 Sub-Store 迁移工具**：Python `push_exports` 已降级为 update-only；`migrate/scan/rollback` 子命令与 `--dry-run/--report/--quarantine-hours` 未实现。
-- **B7**：README/ARCHITECTURE 的发布章节尚未改写。
+- **执行者**：实现 Agent A1 + 主控集成（commit `67317b0`）
+- **文件**：新增 `crates/probe-publish/`（lib/types/gist/local/composite + `tests/publish_stub.rs`）；`crates/probe-config/src/lib.rs`（`publish.provider` local|gist|composite 默认 local + `publish.gist.*` 钳制 + default_tree 全键）；根 `Cargo.toml`/`Cargo.lock`；`.env.example` 增 `GITHUB_TOKEN_FILE=`（假值）。
+- **变更**：`Publisher` trait（RPITIT+Send）；`GistPublisher`——token 仅从 token_file 读、构造期快速失败、Unix 0600 校验；sha 相同零请求；per-gist 进程内写锁+锁内重读合并；PATCH 仅触目标文件与 `manifest.json`、永不 `content:null`；401/403/404 终态、429 尊重 Retry-After 有界、5xx/网络退避 1s/2s/4s 可注入、409/422 重读合并一次；错误文本 token 脱敏。`LocalPublisher` 原子写；`CompositePublisher` 本地失败不碰 Gist、Gist 失败随行不失败整体。`POST /gists`（create_gist）留待 A2 接线批。
+- **原因**：指导 §3（首建一次、后续 PATCH 固定文件；sha 不变零 revision；同 Gist 写锁）。
+- **影响**：provider 默认 local，引擎尚未接线——现有发布路径零行为变化。
+- **测试**：`cargo test -p probe-publish -p probe-config` 68/68（stub api.github.com：零 PATCH 幂等、仅触目标文件、manifest 合并保外部条目、429/401/404/500/409 语义、同 Gist 并发 max in-flight==1）；全量门禁 cargo 617 / Python 598 / scan_secrets 干净。
+- **审查**：主控抽检——content:null 禁令有注释与用例钉住（含远端截断 null 边界）；Authorization 用常量构造 + 脱敏单测；成员注册确认。
+- **回滚**：`git revert 67317b0`（纯新增 crate + config 新键带 serde 默认值）。
+
+## 2026-11-04 B4 — 独立 GUI SPA(/gui) + CSRF 会话与审计
+
+- **执行者**：实现 Agent B4 + 主控集成（commit `b50a306`）
+- **文件**：新增 `crates/probe-api/src/gui.rs`（1284 行）+ `gui_tests.rs`（447 行）；`crates/probe-api/src/lib.rs`（`pub mod gui;` + 未守卫组 `.merge(gui::gui_routes())`）。
+- **变更**：`GET /gui` 内嵌 SPA 四页（总览/Source 详情/发布设置/清理中心；textContent 渲染零 innerHTML、亮暗主题、≥360px、aria-live）；`GET /api/v1/session`（复用 admin token 校验→CSRF token+HttpOnly SameSite=Strict cookie 双提交；内存会话表 TTL 8h 上限 256）；`POST /api/v1/gui/runs`（admin 401→CSRF 403→复用 spawn_round，全程 `record_event(security)` 审计）；未来契约端点 404 降级「未启用」。
+- **集成修正**：gui_tests.spawn 原二次挂载与正式挂载重叠→workspace 全量门禁暴露 axum 重叠路由 panic；改用真实 `build_router`（单包绿≠全量绿的实例，已记录）。
+- **偏差**：审计暂走 `record_event(level=security)`（probe-storage 的 `activate_and_audit` 为私有）；CSRF token 为 splitmix64（无 rand 依赖）。均为单点换接/可接受，记录于代码注释。
+- **测试**：`cargo test -p probe-api` 54/54（8 新增：安全头/401/CSRF 四种拒绝形态/审计行/DTO 白名单/XSS display_name 转义/未来契约降级）。
+- **回滚**：`git revert b50a306`（纯新增路由，旧 / 面板未动）。
+
+## 待办（B2 接线 / B5 / B7 未完成）
+
+- **B2 接线（A2 进行中）**：engine `publish_round_remote` 钩子（provider=local 零行为变化）、`create_gist`、CLI `gist init/test`、API `POST /api/v1/publishers/gist/test`、B4 测试 8 的 404 钉住更新。
+- **B5（C 进行中）**：scan/apply/rollback 核心；之后 API `POST /api/v1/migrations/substore/*`、CLI 子命令、`link_substore.py` 降级为 SSH 侧入口。
+- **B6**：指导 §11.1/11.2/11.3 + 功能清单 §10 红线逐条测试映射；100 轮稳定性与故障注入场景补齐。
+- **B7**：README/ARCHITECTURE 发布章节改写；`ARCHITECTURE_GIST_ONLY.md`、`MIGRATION_GIST_ONLY.md`、`cleanup-plan.json` 交付物。
