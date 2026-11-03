@@ -25,6 +25,7 @@ use probe_storage::Storage;
 
 mod config_check;
 mod exports;
+pub mod gui;
 mod metrics;
 mod read;
 mod sources;
@@ -1206,6 +1207,7 @@ pub fn build_router(state: SharedState) -> Router {
             sources::public_routes()
                 .layer(middleware::from_fn(sources::subscription_cache_headers)),
         )
+        .merge(gui::gui_routes())
         .merge(guarded)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
