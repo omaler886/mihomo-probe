@@ -1044,6 +1044,7 @@ dependencies = [
 name = "probe-cli"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "probe-api",
  "probe-config",
  "probe-domain",

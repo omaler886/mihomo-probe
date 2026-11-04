@@ -27,6 +27,9 @@ mod config_check;
 mod exports;
 pub mod gui;
 mod metrics;
+/// Public so `probe-cli migrate` reuses the exact stable-URL convention the
+/// API applies; the routes themselves stay crate-private.
+pub mod migrations;
 mod publishers;
 mod read;
 mod sources;
@@ -1278,6 +1281,7 @@ pub fn build_router(state: SharedState) -> Router {
         .merge(metrics::routes())
         .merge(config_check::routes())
         .merge(publishers::admin_routes())
+        .merge(migrations::admin_routes())
         .merge(sources::admin_routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), guard));
     Router::new()

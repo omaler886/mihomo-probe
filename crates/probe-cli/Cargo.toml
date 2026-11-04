@@ -25,3 +25,6 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# The migrate tests stub the Sub-Store backend with a loopback axum server
+# (already in the workspace lock; no new dependency enters it).
+axum = { workspace = true }

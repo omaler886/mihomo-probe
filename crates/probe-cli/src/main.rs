@@ -11,7 +11,11 @@
 //!     probe-cli --root <dir> db check | verify | backup [--out P]
 //!     probe-cli --root <dir> db migrate          # backup -> apply -> verify
 //!     probe-cli --root <dir> db rollback --from P [--yes]
+//!     probe-cli --root <dir> migrate scan [--prefix P] [--report FILE]
+//!     probe-cli --root <dir> migrate apply --plan FILE [--execute]
+//!     probe-cli --root <dir> migrate rollback --report FILE
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +26,7 @@ use probe_mihomo::Controller;
 // `healthcheck`/`publish` are trait methods; the trait must be in scope at
 // the `gist` subcommands.
 use probe_publish::Publisher;
+use probe_source::{ApplyReport, MigrationPlan, ScanCaps, SubStoreHttpStore};
 use probe_storage::{migrations, Storage};
 
 fn main() {
@@ -36,6 +41,12 @@ fn main() {
     let mut from: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut assume_yes = false;
+    // `migrate` subcommand flags.
+    let mut prefix: Option<String> = None;
+    let mut plan_file: Option<PathBuf> = None;
+    let mut report_file: Option<PathBuf> = None;
+    let mut execute = false;
+    let mut quarantine_hours: Option<u64> = None;
     // A value flag with no value token is not a default worth guessing: a
     // truncated `probe-cli --root` would silently operate on the fallback
     // root, and `db backup --from` reading an unintended file is worse. The
@@ -90,6 +101,26 @@ fn main() {
                 out = Some(PathBuf::from(flag_value(&args, &mut i, "--out")));
             }
             "--yes" => assume_yes = true,
+            "--prefix" => {
+                prefix = Some(flag_value(&args, &mut i, "--prefix"));
+            }
+            "--plan" => {
+                plan_file = Some(PathBuf::from(flag_value(&args, &mut i, "--plan")));
+            }
+            "--report" => {
+                report_file = Some(PathBuf::from(flag_value(&args, &mut i, "--report")));
+            }
+            "--execute" => execute = true,
+            "--quarantine-hours" => {
+                let value = flag_value(&args, &mut i, "--quarantine-hours");
+                match value.parse() {
+                    Ok(parsed) => quarantine_hours = Some(parsed),
+                    Err(_) => {
+                        eprintln!("--quarantine-hours expects a number of hours, got {value:?}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -126,6 +157,18 @@ fn main() {
             let sub = positionals.get(1).map(String::as_str).unwrap_or("");
             std::process::exit(cmd_gist(&root, sub));
         }
+        "migrate" => {
+            let sub = positionals.get(1).map(String::as_str).unwrap_or("");
+            std::process::exit(cmd_migrate(
+                &root,
+                sub,
+                prefix.as_deref(),
+                plan_file.as_deref(),
+                report_file.as_deref(),
+                quarantine_hours,
+                execute,
+            ));
+        }
         "substore" => {
             // The embedded Sub-Store's own default is 8299 (documented, and
             // `substore.listen` says the same): falling through to serve's
@@ -156,6 +199,9 @@ fn print_usage() {
 \x20   db <migrate|check|backup|verify|rollback>\n\
 \x20   substore [init|status]\n\
 \x20   gist <test|init>       test the Gist destination / create the one Gist\n\
+\x20   migrate <scan|apply|rollback>\n\
+\x20                          Sub-Store duplicate migration (F-058: plan-only\n\
+\x20                          output; never creates, never deletes)\n\
 \n\
 \x20 flags:\n\
 \x20   --root <dir>          service root (default: $MIHOMO_TEST_ROOT or /srv/mihomo-test)\n\
@@ -164,6 +210,14 @@ fn print_usage() {
 \x20   --trigger <name>      round trigger label (manual|schedule|...)\n\
 \x20   --mode direct|chain   round measurement mode\n\
 \x20   --from <file> --out <file> --yes   db backup/rollback arguments\n\
+\x20   --prefix <P>          migrate scan prefix (default: <publish.prefix>-)\n\
+\x20   --report <file>       migrate scan: write the plan JSON here;\n\
+\x20                         migrate rollback: the apply report to restore from\n\
+\x20   --plan <file>         migrate apply: the plan JSON to apply\n\
+\x20   --execute             migrate apply: really write (WITHOUT it the apply\n\
+\x20                         is a dry run)\n\
+\x20   --quarantine-hours N  migrate apply: quarantine window recorded on the\n\
+\x20                         report (default: the plan's, itself 24)\n\
 \x20   -h, --help            this text\n\
 \n\
 \x20 notes: RUST_LOG=info|debug|trace (round and serve both honour it).\n\
@@ -779,6 +833,298 @@ fn cmd_gist_init(root: &Path) -> i32 {
             }
         }
     })
+}
+
+/// `migrate` subcommands (workstreams/18 §B5): the Sub-Store duplicate
+/// migration, driven directly against the configured backend. The safety
+/// contract mirrors the API module (`probe_api::migrations`):
+///
+/// * `scan` is read-only by construction;
+/// * `apply` WITHOUT `--execute` is a DRY RUN -- the flag is opt-in, so a
+///   forgotten flag can only ever preview, never write;
+/// * `rollback` restores from the report a previous apply printed (update
+///   path only; the core has no delete to call).
+fn cmd_migrate(
+    root: &Path,
+    subcommand: &str,
+    prefix: Option<&str>,
+    plan_file: Option<&Path>,
+    report_file: Option<&Path>,
+    quarantine_hours: Option<u64>,
+    execute: bool,
+) -> i32 {
+    match subcommand {
+        "scan" => migrate_scan(root, prefix, report_file),
+        "apply" => migrate_apply(root, plan_file, execute, quarantine_hours),
+        "rollback" => migrate_rollback(root, report_file),
+        other => {
+            eprintln!("unknown migrate subcommand: {other:?} (expected scan | apply | rollback)");
+            2
+        }
+    }
+}
+
+/// The Sub-Store backend the migrate commands talk to, resolved the same way
+/// `serve` resolves it: `SUBSTORE_BACKEND` first, then the embedded
+/// section's listen + backend path (explicit, or the path a previous
+/// embedded run generated under `<root>/data/substore/`), then the plain
+/// environment default. The asset-creating resolver is deliberately not
+/// called here: a migration command must not materialize a Sub-Store
+/// install as a side effect of resolving a URL.
+fn migrate_backend(root: &Path, cfg: &Config) -> String {
+    if let Ok(url) = std::env::var("SUBSTORE_BACKEND") {
+        if !url.trim().is_empty() {
+            return url;
+        }
+    }
+    if cfg.substore.embedded {
+        let listen = cfg.substore.listen.trim_end_matches('/');
+        if let Some(explicit) = cfg.substore.backend_path.as_deref() {
+            let path = if explicit.starts_with('/') {
+                explicit.to_string()
+            } else {
+                format!("/{explicit}")
+            };
+            return format!("http://{listen}{path}");
+        }
+        let generated = root.join("data").join("substore").join("backend-path.txt");
+        if let Ok(text) = std::fs::read_to_string(&generated) {
+            let path = text.trim();
+            if !path.is_empty() {
+                return format!("http://{listen}{path}");
+            }
+        }
+        eprintln!(
+            "migrate: substore.embedded is on but no backend path is known yet \
+             (run `substore` once, or set SUBSTORE_BACKEND); using the default"
+        );
+    }
+    probe_engine::collect::backend_from_env()
+}
+
+/// The ledger's key→source_id registry, for the stable-URL resolution. A
+/// missing or unreadable ledger degrades to an empty map (the scan's tier-1
+/// evidence is simply absent) rather than failing a read-only command.
+fn ledger_source_map(root: &Path) -> HashMap<String, String> {
+    let path = db_path(root);
+    if !path.exists() {
+        return HashMap::new();
+    }
+    let storage = match Storage::open_without_migrating(&path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            eprintln!("migrate: cannot open the ledger ({err}); continuing without it");
+            return HashMap::new();
+        }
+    };
+    match storage.list_sources() {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| (row.key, row.source_id))
+            .collect(),
+        Err(err) => {
+            eprintln!("migrate: cannot read sources ({err}); continuing without them");
+            HashMap::new()
+        }
+    }
+}
+
+/// The scan prefix when `--prefix` is silent: the configured publish prefix
+/// plus the dash every sub name carries (`<prefix>-<key>`), matching the API
+/// module's default.
+fn migrate_prefix(cfg: &Config, prefix: Option<&str>) -> String {
+    match prefix.map(str::trim).filter(|prefix| !prefix.is_empty()) {
+        Some(prefix) => prefix.to_string(),
+        None if cfg.publish_prefix.is_empty() => probe_source::migrate::DEFAULT_PREFIX.to_string(),
+        None => format!("{}-", cfg.publish_prefix),
+    }
+}
+
+/// `migrate scan [--prefix P] [--report FILE]`: the read-only duplicate
+/// scan. The plan (redacted URLs only) prints to stdout, and with `--report`
+/// the same pretty JSON is written to a file for `migrate apply`.
+fn migrate_scan(root: &Path, prefix: Option<&str>, report: Option<&Path>) -> i32 {
+    let cfg = load(root);
+    let backend = migrate_backend(root, &cfg);
+    let prefix = migrate_prefix(&cfg, prefix);
+    let map = ledger_source_map(root);
+    println!(
+        "scanning {} for objects named {prefix}* (read-only; nothing is written)",
+        backend_display(&backend)
+    );
+    tokio_block(async move {
+        let store = SubStoreHttpStore::new(&backend);
+        match probe_source::scan(&store, &prefix, Some(&map), ScanCaps::default()).await {
+            Ok(plan) => {
+                let json = match serde_json::to_string_pretty(&plan) {
+                    Ok(json) => json,
+                    Err(err) => {
+                        eprintln!("scan failed to serialize the plan: {err}");
+                        return 1;
+                    }
+                };
+                if let Some(report) = report {
+                    match std::fs::write(report, format!("{json}\n")) {
+                        Ok(()) => println!("plan written: {}", report.display()),
+                        Err(err) => {
+                            eprintln!("cannot write {}: {err}", report.display());
+                            return 1;
+                        }
+                    }
+                }
+                println!("{json}");
+                0
+            }
+            Err(err) => {
+                eprintln!("scan failed: {err}");
+                1
+            }
+        }
+    })
+}
+
+/// `migrate apply --plan FILE [--execute] [--quarantine-hours N]`. Without
+/// `--execute` this is a dry run: the fact is printed, the report says
+/// `dry_run: true`, and no request that writes is built.
+fn migrate_apply(
+    root: &Path,
+    plan_file: Option<&Path>,
+    execute: bool,
+    quarantine_hours: Option<u64>,
+) -> i32 {
+    let Some(plan_file) = plan_file else {
+        eprintln!("apply needs --plan <file> (run `migrate scan --report` first)");
+        return 2;
+    };
+    let text = match std::fs::read_to_string(plan_file) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("cannot read {}: {err}", plan_file.display());
+            return 1;
+        }
+    };
+    let mut plan: MigrationPlan = match serde_json::from_str(&text) {
+        Ok(plan) => plan,
+        Err(err) => {
+            eprintln!("{} is not a migration plan: {err}", plan_file.display());
+            return 1;
+        }
+    };
+    if let Some(hours) = quarantine_hours {
+        // Advisory only: the window is recorded on the report so an operator
+        // reading it later knows how long the `deprecated-*` objects have
+        // been quarantined. Nothing is ever deleted, whatever the value.
+        plan.quarantine_hours = hours;
+    }
+    let dry_run = !execute;
+    if dry_run {
+        println!("dry run: no writes will be made (re-run with --execute to apply)");
+    } else {
+        println!(
+            "REAL APPLY: update-only writes will be sent (never creates, \
+             never deletes)"
+        );
+    }
+    let cfg = load(root);
+    let backend = migrate_backend(root, &cfg);
+    let hostname = cfg.publish.hostname.trim().to_string();
+    let map = ledger_source_map(root);
+    tokio_block(async move {
+        let store = SubStoreHttpStore::new(&backend);
+        let report = probe_source::apply(
+            &plan,
+            &store,
+            |artifact| probe_api::migrations::stable_artifact_url(&hostname, artifact, &map),
+            dry_run,
+        )
+        .await;
+        let json = match serde_json::to_string_pretty(&report) {
+            Ok(json) => json,
+            Err(err) => {
+                eprintln!("apply failed to serialize the report: {err}");
+                return 1;
+            }
+        };
+        println!("{json}");
+        if dry_run {
+            println!("dry run: nothing was written");
+        } else {
+            println!(
+                "applied={} failed={} skipped={}",
+                report.counts.applied, report.counts.failed, report.counts.skipped
+            );
+        }
+        if report.counts.failed > 0 {
+            1
+        } else {
+            0
+        }
+    })
+}
+
+/// `migrate rollback --report FILE`: restore from the apply report (the
+/// exact document a previous apply printed).
+fn migrate_rollback(root: &Path, report_file: Option<&Path>) -> i32 {
+    let Some(report_file) = report_file else {
+        eprintln!("rollback needs --report <file> (the apply report to restore from)");
+        return 2;
+    };
+    let text = match std::fs::read_to_string(report_file) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("cannot read {}: {err}", report_file.display());
+            return 1;
+        }
+    };
+    let report: ApplyReport = match serde_json::from_str(&text) {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("{} is not an apply report: {err}", report_file.display());
+            return 1;
+        }
+    };
+    let cfg = load(root);
+    let backend = migrate_backend(root, &cfg);
+    println!(
+        "restoring from {} (update-only writes; never deletes)",
+        backend_display(&backend)
+    );
+    tokio_block(async move {
+        let store = SubStoreHttpStore::new(&backend);
+        let rollback = probe_source::rollback(&report, &store).await;
+        let json = match serde_json::to_string_pretty(&rollback) {
+            Ok(json) => json,
+            Err(err) => {
+                eprintln!("rollback failed to serialize the report: {err}");
+                return 1;
+            }
+        };
+        println!("{json}");
+        println!(
+            "restored={} already_restored={} failed={} skipped={}",
+            rollback.counts.restored,
+            rollback.counts.already_restored,
+            rollback.counts.failed,
+            rollback.counts.skipped
+        );
+        if rollback.counts.failed > 0 {
+            1
+        } else {
+            0
+        }
+    })
+}
+
+/// The backend host:port only. The full URL (including the secret backend
+/// path) is a credential and never printed.
+fn backend_display(backend: &str) -> String {
+    let trimmed = backend.trim_end_matches('/');
+    match (trimmed.find("://"), trimmed.find('/')) {
+        (Some(scheme_end), Some(path_start)) if path_start > scheme_end + 2 => {
+            format!("{} (path redacted)", &trimmed[..path_start])
+        }
+        _ => trimmed.to_string(),
+    }
 }
 
 fn stamp() -> String {

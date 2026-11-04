@@ -405,25 +405,40 @@ async fn xss_display_name_never_reaches_the_page() {
     );
 }
 
-/// Batch boundary (B2 landed, B5 pending): the publisher test endpoint now
-/// EXISTS and is admin-gated (401 without the token, `configured:false` with
-/// it on an unconfigured deployment), while the migration endpoints do not
-/// exist yet and still answer 404 -- the exact condition the SPA renders as
-/// 「未启用」. The page itself is pinned to call those documented paths,
-/// degrade on 404/`configured:false`, double-confirm deletion, announce
-/// dynamic status and offer the light/dark theme.
+/// Batch boundary (B5 landed): the publisher test endpoint AND the migration
+/// endpoints now EXIST and are admin-gated -- 401 without the token, like
+/// every guarded endpoint. With the token, an unreachable Sub-Store backend
+/// fails honestly as a mapped error (the bad-gateway envelope), never as a
+/// success-shaped body. The page itself is pinned to call those documented
+/// paths, degrade on errors/`configured:false`, double-confirm deletion,
+/// announce dynamic status and offer the light/dark theme.
 #[tokio::test]
-async fn migrations_stay_unwired_and_gist_test_is_admin_gated() {
+async fn migrations_and_gist_test_are_admin_gated() {
     let tmp = tempfile::tempdir().unwrap();
     let base = spawn(gui_state(tmp.path(), Vec::new())).await;
     let client = reqwest::Client::new();
     for path in [
         "/api/v1/migrations/substore/scan",
         "/api/v1/migrations/substore/apply",
+        "/api/v1/migrations/substore/rollback",
     ] {
-        let response = post(&client, &base, path, Some(ADMIN), None, None).await;
-        assert_eq!(response.status(), 404, "{path} is a later batch");
+        let response = post(&client, &base, path, None, None, None).await;
+        assert_eq!(response.status(), 401, "{path} is guarded");
     }
+    // With the token, the unreachable stub backend (gui_state points at
+    // 127.0.0.1:1) surfaces as the mapped bad gateway -- the scan is the one
+    // endpoint whose backend failure is a hard answer; apply/rollback put
+    // per-action failures inside their report, so a body-less call is a
+    // malformed request, not a backend probe.
+    let response = client
+        .post(format!("{base}/api/v1/migrations/substore/scan"))
+        .header("X-Auth-Token", ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502, "the backend error is mapped");
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "backend", "{body}");
     // B2: the publisher test endpoint exists. Without the admin token it is
     // the guarded group's 401; with it, an unconfigured deployment answers
     // the masked `configured:false` the SPA renders as 「未启用」.
