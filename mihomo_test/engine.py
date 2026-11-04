@@ -2590,6 +2590,21 @@ def _push_record(key, name, ok, level, text, count=0):
             "text": text, "count": count}
 
 
+def legacy_substore_write_enabled(cfg):
+    """The legacy Sub-Store writeback double switch (workstreams/18).
+
+    Every legacy write path -- `push_exports`, the dashboard's `/api/link`,
+    the sources-save sync -- must answer to BOTH `publish.push_to_substore`
+    and `publish.allow_legacy_substore_write`, each defaulting to false, so
+    F-001's "no writeback by default" holds no matter which entrypoint is
+    reached. Truthiness, not `is True`: the settings form and hand-edited
+    files have shipped both `"1"` and `1`.
+    """
+    publish = cfg.get("publish") or {}
+    return bool(publish.get("push_to_substore")) and \
+        bool(publish.get("allow_legacy_substore_write"))
+
+
 def push_exports(cfg, store, keys, log=None):
     """Update the exported lists in Sub-Store as local subscriptions.
 

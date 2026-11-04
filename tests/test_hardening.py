@@ -596,6 +596,10 @@ class HttpSurfaceTest(unittest.TestCase):
         source -- on this fixture's single source that is two backend requests
         per checkbox click, for an outcome that is byte-identical, and the
         sync messages then rode along on a notice about a measurement toggle.
+
+        Workstreams/18 B5: on top of that, the sync itself is now gated
+        behind the legacy-write double switch (both default false), so a
+        default deployment never writes to Sub-Store from a sources save.
         """
         calls = []
         with unittest.mock.patch.object(
@@ -611,13 +615,27 @@ class HttpSurfaceTest(unittest.TestCase):
             stored = self.srv.stored_config()["sources"]
             self.assertEqual([s.get("direct") for s in stored], [False])
 
-            # A link-relevant change still syncs immediately.
+            # A link-relevant change used to sync immediately; with the
+            # legacy-write switches off (the default) it must not write.
             code, payload = self.srv.post(
                 f"/api/config?token={self.ADMIN}",
                 {"sources": [{"key": "air", "name": "air", "kind": "collection",
                               "enabled": False}]})
             self.assertEqual(code, 200, payload)
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls, [], "联动同步在双开关关闭时仍然写入了 Sub-Store")
+
+            # Flipping BOTH switches restores the immediate sync.
+            code, payload = self.srv.post(
+                f"/api/config?token={self.ADMIN}",
+                {"publish": {"push_to_substore": True,
+                             "allow_legacy_substore_write": True}})
+            self.assertEqual(code, 200, payload)
+            code, payload = self.srv.post(
+                f"/api/config?token={self.ADMIN}",
+                {"sources": [{"key": "air", "name": "air", "kind": "collection",
+                              "enabled": True}]})
+            self.assertEqual(code, 200, payload)
+            self.assertEqual(len(calls), 1, "双开关开启后联动同步应恢复")
 
     def test_a_normal_setting_still_saves(self):
         code, _ = self.srv.post(f"/api/config?token={self.ADMIN}",

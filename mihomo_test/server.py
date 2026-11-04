@@ -656,6 +656,19 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/alert-test":
                 return self._send(200, {"message": "；".join(notifier.test_channels(cfg))})
             if path == "/api/link":
+                # Workstreams/18 B5: the legacy create/refresh writeback is
+                # gated behind BOTH switches (both default false), so a
+                # default deployment never writes to Sub-Store from here --
+                # F-001's "no writeback by default". Migration is the Rust
+                # scan/apply/rollback surface (read-only scan, update-only
+                # apply, no delete at all).
+                if not engine.legacy_substore_write_enabled(cfg):
+                    message = ("legacy Sub-Store 联动写入已停用"
+                               "（push_to_substore + allow_legacy_substore_write "
+                               "未同时开启）；迁移请用 probe-cli migrate scan"
+                               "（只读扫描，绝不创建/删除）")
+                    db.log("warn", "legacy Sub-Store 联动写入未开启，/api/link 已拒绝写入")
+                    return self._send(200, {"message": message, "detail": [message]})
                 client = store_client(cfg)
                 messages = engine.link_substore(cfg, client)
                 return self._send(200, {"message": "；".join(messages), "detail": messages})
@@ -696,11 +709,18 @@ class Handler(BaseHTTPRequestHandler):
                     # every 直连/链式/relay checkbox click, for an outcome that
                     # is byte-identical and reported as sync noise besides.
                     if engine.link_signature(cfg) != engine.link_signature(new_cfg):
-                        try:
-                            sync = engine.link_substore(new_cfg,
-                                                        store_client(cfg))
-                        except StoreError as exc:
-                            sync = [f"联动同步失败: {exc}"]
+                        # Same double switch as /api/link above: without both
+                        # flags the save stays write-free by default; the
+                        # operator migrates via the Rust scan/apply surface.
+                        if not engine.legacy_substore_write_enabled(new_cfg):
+                            sync = []
+                            db.log("warn", "legacy Sub-Store 联动写入未开启，保存未触发联动同步")
+                        else:
+                            try:
+                                sync = engine.link_substore(new_cfg,
+                                                            store_client(cfg))
+                            except StoreError as exc:
+                                sync = [f"联动同步失败: {exc}"]
                 return self._send(200, {"saved": True, "config": redacted_config(new_cfg),
                                         "sources": new_cfg.get("sources", []),
                                         "link": sync, "notes": notes})
