@@ -1917,8 +1917,8 @@ fn names_similar(a: &str, b: &str) -> bool {
 
 /// RFC 3339 UTC timestamp from a Unix instant (`2026-11-04T12:34:56Z`).
 /// Hand-rolled because this crate's dependency set has no time crate and the
-/// format must not drift between entries.
-fn rfc3339_utc(secs: i64) -> String {
+/// format must not drift between entries. Shared with the B8 cleanup leg.
+pub(crate) fn rfc3339_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let tod = secs.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
@@ -1930,7 +1930,7 @@ fn rfc3339_utc(secs: i64) -> String {
     )
 }
 
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

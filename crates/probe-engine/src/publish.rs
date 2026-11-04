@@ -383,6 +383,11 @@ pub enum ExportDropReason {
     UnusableOriginal,
     /// Another variant of the same display name was selected instead.
     SupersededVariant,
+    /// B8 (`publish.dedup_nodes`): another, earlier mirror of the same node
+    /// -- same dial, same credential -- was selected instead. Aggregating
+    /// subscription lists mirror one node under several names; publishing
+    /// every mirror would carry the same dial once per name.
+    DuplicateNode,
     /// The node's dialer names something this file does not publish, and one
     /// dangling dialer makes a client kernel reject the whole file.
     UnclosedDialer,
@@ -398,6 +403,8 @@ struct SelectedExport {
     kind: String,
     display: String,
     country: Option<String>,
+    /// The round's verified exit (落地) address, already IP-normalized.
+    exit_ip: Option<String>,
     proxy: Value,
 }
 
@@ -443,8 +450,14 @@ pub fn select_source_exports(
             let candidates = alive
                 .get(source.key.as_str())
                 .map_or(&[][..], Vec::as_slice);
-            let (proxies, dropped) =
-                source_body(&source.key, candidates, collected, publish.add_region_tag);
+            let (proxies, dropped) = source_body(
+                &source.key,
+                candidates,
+                collected,
+                publish.add_region_tag,
+                publish.add_exit_tag,
+                publish.dedup_nodes,
+            );
             let skipped = proxies.is_empty().then_some(SkipReason::NoAliveNodes);
             SourceExport {
                 key: source.key.clone(),
@@ -456,13 +469,16 @@ pub fn select_source_exports(
         .collect()
 }
 
-/// Build one source's body: collapse variants, keep the original form, rewrite
-/// the region tag, then close every dialer inside the file.
+/// Build one source's body: collapse variants, drop mirrored nodes, keep the
+/// original form, rewrite the region tag and the exit (落地) tag, then close
+/// every dialer inside the file.
 fn source_body(
     source: &str,
     candidates: &[&NodeVerdict],
     collected: &Collected,
     add_region_tag: bool,
+    add_exit_tag: bool,
+    dedup_nodes: bool,
 ) -> (Vec<Value>, Vec<ExportDrop>) {
     let mut ordered = candidates.to_vec();
     ordered.sort_by(|left, right| {
@@ -496,7 +512,14 @@ fn source_body(
         }
     }
 
+    // B8: one entry per node, not per name an upstream list used for it. The
+    // chosen map already folds same-name variants; this folds the mirrors an
+    // aggregating source carries under several names -- same dial, same
+    // credential, cosmetic field differences. Iteration is over a BTreeMap
+    // keyed by display, so "which mirror survives" is deterministic, and an
+    // unchanged round still renders byte-identical content.
     let mut selected = Vec::with_capacity(chosen.len());
+    let mut seen_nodes: HashSet<String> = HashSet::new();
     for (verdict, _) in chosen.into_values() {
         let Some(original) = collected
             .originals
@@ -505,6 +528,10 @@ fn source_body(
             dropped.push(ExportDrop::of(verdict, ExportDropReason::MissingOriginal));
             continue;
         };
+        if dedup_nodes && !seen_nodes.insert(probe_source::identity::dedup_fingerprint(original)) {
+            dropped.push(ExportDrop::of(verdict, ExportDropReason::DuplicateNode));
+            continue;
+        }
         let Some(name) = original
             .get("name")
             .and_then(Value::as_str)
@@ -522,6 +549,7 @@ fn source_body(
                 .to_string(),
             display: name.to_string(),
             country: measured_country(verdict),
+            exit_ip: measured_exit_ip(verdict),
             proxy: original.clone(),
         });
     }
@@ -540,13 +568,20 @@ fn source_body(
         // as `[HK] 01`), and mihomo keys proxies by that final name -- a
         // duplicate would fail the whole source's topology validation every
         // round. The first (sort-stable) entry keeps the name; the loser is
-        // superseded, exactly like a same-name variant.
-        let published = match entry.country {
+        // superseded, exactly like a same-name variant. B8's exit tag can
+        // collide the same way (`A` and `B` through one exit), and the same
+        // seen-set handles it.
+        let mut published = match entry.country {
             Some(country) if add_region_tag => {
                 format!("[{country}] {}", strip_leading_region_tags(&entry.display))
             }
             _ => entry.display.clone(),
         };
+        if add_exit_tag {
+            if let Some(ip) = entry.exit_ip.as_deref() {
+                published = format!("{published} · {ip}");
+            }
+        }
         if !seen.insert(published.clone()) {
             dropped.push(ExportDrop {
                 identity: entry.identity,
@@ -693,6 +728,21 @@ fn measured_country(verdict: &NodeVerdict) -> Option<String> {
         .trim()
         .to_ascii_uppercase();
     probe_domain::geo::is_country_code(&country).then_some(country)
+}
+
+/// B8: the measured exit (落地) address, normalized through a real IP parse.
+///
+/// The suffix enters a published *name*, so only an IP-shaped measured value
+/// qualifies -- a trace body that somehow carried anything else would be
+/// refused here, keeping the name recognizable (and non-stacking) on the next
+/// round. The parsed-then-reformatted form also canonicalizes: `2001:0db8::1`
+/// publishes as `2001:db8::1`, the form the next trace reports back.
+fn measured_exit_ip(verdict: &NodeVerdict) -> Option<String> {
+    let ip = verdict.exit.as_ref()?.ip.as_deref()?;
+    ip.trim()
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| ip.to_string())
 }
 
 /// Everything one round's publication needs.

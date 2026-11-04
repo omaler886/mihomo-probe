@@ -41,6 +41,7 @@ fn gui_state(root: &std::path::Path, sources: Vec<SourceSpec>) -> SharedState {
             schedule: cfg.schedule.clone(),
             policy: cfg.policy.clone(),
             min_run_interval_seconds: 0,
+            substore_allow_delete: false,
         },
     ))
 }
@@ -474,9 +475,9 @@ async fn migrations_and_gist_test_are_admin_gated() {
     for path in [
         "/api/v1/publishers/gist/test",
         "/api/v1/publishers/gist/init",
-        "/api/v1/migrations/substore/scan",
-        "/api/v1/migrations/substore/apply",
-        "/api/v1/migrations/substore/rollback",
+        "/api/v1/migrations/substore/cleanup-plan",
+        "/api/v1/migrations/substore/cleanup-apply",
+        "/api/v1/migrations/substore/cleanup-rollback",
     ] {
         assert!(html.contains(path), "the SPA calls {path}");
     }

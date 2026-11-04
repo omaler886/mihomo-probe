@@ -545,15 +545,16 @@ footer{margin-top:22px;color:var(--muted);font-size:12px}
 
   <section id="page-clean" role="tabpanel" aria-labelledby="tab-clean" hidden>
     <div class="panel-note">
-      清理中心只对旧 Sub-Store 测活产物做 <strong>dry-run 扫描</strong>；
-      删除与回滚调用后续批次的契约端点（/api/v1/migrations/substore/*），
-      端点未上线时一律显示「未启用」，本页从不直接改动任何数据。
-      删除需要两次确认。
+      清理中心扫描旧 Sub-Store 测活产物（&lt;prefix&gt;-*-local、&lt;prefix&gt;-front-manual、
+      ipmap 实测映射订阅）并分类 keep / duplicate / uncertain。
+      「扫描」是 dry-run；「删除」针对 duplicate 类，需要两次确认，且部署侧必须
+      打开 substore.allow_delete（或 ALLOW_SUBSTORE_DELETE=1）才真正执行；
+      删除前每个对象先备份到本地，「回滚清理」用最近一次删除的备份还原。
     </div>
     <div class="row">
       <button type="button" id="clean-scan" class="btn primary">扫描（dry-run）</button>
-      <button type="button" id="clean-apply" class="btn">删除重复对象…</button>
-      <button type="button" id="clean-rollback" class="btn">回滚上次迁移…</button>
+      <button type="button" id="clean-apply" class="btn">删除测活产物…</button>
+      <button type="button" id="clean-rollback" class="btn">回滚清理…</button>
     </div>
     <div class="panel-note" id="clean-result">尚未扫描。</div>
   </section>
@@ -567,6 +568,8 @@ footer{margin-top:22px;color:var(--muted);font-size:12px}
 
 var tok = '';
 var csrf = '';
+// 最近一次清理删除写入的备份文件名（应答里的 backup_file）；回滚清理用。
+var lastCleanupBackup = null;
 var sourcesCache = [];
 var detailSeq = 0;
 var TABS = ['dash', 'detail', 'pub', 'clean'];
@@ -1181,22 +1184,24 @@ function publisherAction(path, label){
 
 // --- 清理中心 ---------------------------------------------------------------
 
-function runMigration(path, label){
+function runMigration(path, label, body){
   var panel = $('#clean-result');
   setPanelText(panel, label + '：请求中…');
-  api('POST', path, {}, true).then(function(res){
+  api('POST', path, body === undefined ? {} : body, true).then(function(res){
     if (res.status === 404) {
       setPanelText(panel, label + '未启用（404）：迁移端点将在后续批次提供，本次未做任何更改。');
       return;
     }
     if (res.status === 401 || res.status === 403) {
-      setPanelText(panel, label + '失败（' + res.status + '）：鉴权或 CSRF 未通过，未做任何更改。');
+      setPanelText(panel, label + '失败（' + res.status + '）：鉴权、CSRF 或删除门禁未通过，未做任何更改。');
       return;
     }
     if (!res.ok) {
       setPanelText(panel, errorNote(res, label) + '未做任何更改。');
       return;
     }
+    // 删除成功的应答带 backup_file：记住它，回滚清理就用这一份。
+    if (res.body && res.body.backup_file) { lastCleanupBackup = String(res.body.backup_file); }
     renderMigrationReport(res.body || {}, label);
   }).catch(function(){ setPanelText(panel, label + '：网络错误，未做任何更改。'); });
 }
@@ -1243,24 +1248,28 @@ function init(){
     }
     publisherAction('/api/v1/publishers/gist/init', '初始化 Gist');
   });
-  $('#clean-scan').addEventListener('click', function(){ runMigration('/api/v1/migrations/substore/scan', '扫描'); });
+  $('#clean-scan').addEventListener('click', function(){ lastCleanupBackup = null; runMigration('/api/v1/migrations/substore/cleanup-plan', '扫描清理'); });
   $('#clean-apply').addEventListener('click', function(){
-    if (!window.confirm('第一步确认：即将对旧 Sub-Store 测活重复对象执行删除（调用后续批次契约端点）。继续吗？')) {
+    if (!window.confirm('第一步确认：即将对旧 Sub-Store 测活产物（<prefix>-*-local、front-manual、ipmap 映射）执行删除。继续吗？')) {
       say('已取消删除（第一步确认）。');
       return;
     }
-    if (!window.confirm('第二步确认：删除不可自动撤销，确定要执行吗？')) {
+    if (!window.confirm('第二步确认：删除前会备份到本地，但删除本身需要部署侧打开 substore.allow_delete。确定要执行吗？')) {
       say('已取消删除（第二步确认）。');
       return;
     }
-    runMigration('/api/v1/migrations/substore/apply', '删除');
+    runMigration('/api/v1/migrations/substore/cleanup-apply', '删除测活产物', { execute: true });
   });
   $('#clean-rollback').addEventListener('click', function(){
-    if (!window.confirm('回滚将按最近一次迁移报告还原（调用后续批次契约端点）。继续吗？')) {
+    if (!lastCleanupBackup) {
+      say('还没有可回滚的备份：先执行一次「删除测活产物」。');
+      return;
+    }
+    if (!window.confirm('回滚将按最近一次删除的备份（' + lastCleanupBackup + '）还原这些对象。继续吗？')) {
       say('已取消回滚。');
       return;
     }
-    runMigration('/api/v1/migrations/substore/rollback', '回滚');
+    runMigration('/api/v1/migrations/substore/cleanup-rollback', '回滚清理', { backup: lastCleanupBackup });
   });
   Array.prototype.forEach.call(document.querySelectorAll('[data-placeholder]'), function(btn){
     btn.addEventListener('click', function(){

@@ -21,6 +21,7 @@
 //!   through Sub-Store rather than parsing them itself, and so does this crate:
 //!   ask Sub-Store for `target=ClashMeta` and it hands back Clash proxies.
 
+pub mod cleanup;
 pub mod fetch;
 pub mod identity;
 pub mod migrate;
@@ -28,8 +29,16 @@ pub mod prepare;
 pub mod source;
 pub mod subscription;
 
+pub use cleanup::{
+    apply_cleanup, backup_dir, read_backup, rollback_cleanup, scan_cleanup, CleanupApplyReport,
+    CleanupCaps, CleanupPlan, CleanupRollbackReport, CleanupRules, CleanupStore, CleanupTarget,
+    CleanupUncertain, DEFAULT_IPMAP_PREFIX, IPMAP_DISPLAY, MANUAL_FRONT_SUFFIX,
+};
 pub use fetch::{content_digest, Fetcher, SubAdmin, SubEntry, SubStoreClient};
-pub use identity::{fingerprint_proxy, variant_fingerprint, DROP_FIELDS, REQUIRED};
+pub use identity::{
+    dedup_fingerprint, fingerprint_proxy, variant_fingerprint, CREDENTIAL_FIELDS, DROP_FIELDS,
+    REQUIRED,
+};
 pub use migrate::{
     apply, rollback, rollback_plan, scan, ApplyReport, ArtifactRef, MigrationPlan, MigrationStore,
     RollbackReport, ScanCaps, StoreRef, SubStoreHttpStore,

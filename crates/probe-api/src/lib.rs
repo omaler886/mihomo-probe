@@ -68,6 +68,9 @@ pub struct AppState {
     pub policy: probe_config::PolicySection,
     /// The `schedule` section snapshot: the in-process round timer.
     pub schedule: probe_config::ScheduleSection,
+    /// The B8 deletion gate (`substore.allow_delete`, env-merged at config
+    /// load): the cleanup-apply endpoint refuses a real delete while closed.
+    pub substore_allow_delete: bool,
     /// The timer's last computed deadline, as `HH:MM:SS` UTC; `None` = off.
     schedule_next_run: Arc<Mutex<Option<String>>>,
     /// Process memory of what the manual-front sub was last written from.
@@ -141,6 +144,7 @@ impl AppState {
             running: Arc::new(Mutex::new(None)),
             config_path,
             min_run_interval_seconds: serve.min_run_interval_seconds,
+            substore_allow_delete: serve.substore_allow_delete,
         }
     }
     /// Record the config file this process was started from, so the config
@@ -296,6 +300,10 @@ pub struct ServeConfig {
     /// just happened instead of queueing another measurement of the same
     /// nodes. `0` disables the spacing check and every trigger claims a slot.
     pub min_run_interval_seconds: i64,
+    /// The B8 deletion gate (`substore.allow_delete`, env-merged at config
+    /// load): the cleanup-apply endpoint refuses a real delete while this is
+    /// closed, exactly like the CLI. Plans and dry runs never consult it.
+    pub substore_allow_delete: bool,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -1747,6 +1755,7 @@ mod tests {
                 schedule: cfg.schedule.clone(),
                 policy: cfg.policy.clone(),
                 min_run_interval_seconds: 0,
+                substore_allow_delete: false,
             },
         )
     }

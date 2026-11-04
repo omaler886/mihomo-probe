@@ -37,10 +37,16 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use probe_source::cleanup::{
+    apply_cleanup as core_apply_cleanup, backup_dir, read_backup,
+    rollback_cleanup as core_rollback_cleanup, scan_cleanup as core_scan_cleanup, CleanupCaps,
+    CleanupRules,
+};
 use probe_source::migrate::{
     apply as core_apply, rollback as core_rollback, scan as core_scan, ApplyReport, ArtifactRef,
     MigrationError, MigrationPlan, RollbackReport, ScanCaps, SubStoreHttpStore,
 };
+use probe_source::SubStoreClient;
 use serde::Deserialize;
 
 use crate::exports::{bad_request, error_response, internal};
@@ -55,6 +61,18 @@ pub(crate) fn admin_routes() -> Router<SharedState> {
         .route(
             "/api/v1/migrations/substore/rollback",
             post(rollback_substore),
+        )
+        .route(
+            "/api/v1/migrations/substore/cleanup-plan",
+            post(cleanup_plan_substore),
+        )
+        .route(
+            "/api/v1/migrations/substore/cleanup-apply",
+            post(cleanup_apply_substore),
+        )
+        .route(
+            "/api/v1/migrations/substore/cleanup-rollback",
+            post(cleanup_rollback_substore),
         )
 }
 
@@ -75,6 +93,156 @@ struct ApplyBody {
 #[derive(Debug, Deserialize)]
 struct RollbackBody {
     report: ApplyReport,
+}
+
+/// The cleanup endpoints' shared body: prefix overrides plus the apply
+/// switch. `execute` is `Option` (not `#[serde(default)]`) so an explicit
+/// `null` also reads as the safe default -- a silent or null body can only
+/// ever plan or dry-run.
+#[derive(Debug, Default, Deserialize)]
+struct CleanupBody {
+    prefix: Option<String>,
+    ipmap_prefix: Option<String>,
+    execute: Option<bool>,
+}
+
+impl CleanupBody {
+    fn rules(&self, state: &AppState) -> CleanupRules {
+        let mut rules = CleanupRules::default();
+        let push = self
+            .prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| state.publish_prefix.clone());
+        if !push.is_empty() {
+            rules.push_prefix = push;
+        }
+        if let Some(ipmap) = self
+            .ipmap_prefix
+            .as_deref()
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+        {
+            rules.ipmap_prefix = ipmap.to_string();
+        }
+        rules
+    }
+}
+
+/// `POST /api/v1/migrations/substore/cleanup-plan` -- the read-only 测活产物
+/// scan. Classifies every listed sub into keep / duplicate / uncertain;
+/// nothing here can write to the backend by construction.
+async fn cleanup_plan_substore(
+    State(state): State<SharedState>,
+    body: Option<Json<CleanupBody>>,
+) -> Response {
+    let rules = body
+        .map(|Json(body)| body)
+        .unwrap_or_default()
+        .rules(&state);
+    let store = SubStoreClient::new(&state.backend);
+    match core_scan_cleanup(&store, &rules, CleanupCaps::default()).await {
+        Ok(plan) => Json(plan).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, "backend", err),
+    }
+}
+
+/// `POST /api/v1/migrations/substore/cleanup-apply` -- rescan, then delete
+/// the 测活产物 the plan names. `execute` absent or false is a dry run; a
+/// real delete additionally requires the deployment gate
+/// (`substore.allow_delete` / `ALLOW_SUBSTORE_DELETE`), and every real apply
+/// leaves an audit row.
+async fn cleanup_apply_substore(
+    State(state): State<SharedState>,
+    request: Result<Json<CleanupBody>, JsonRejection>,
+) -> Response {
+    let Json(body) = match request {
+        Ok(json) => json,
+        Err(rejection) => {
+            return bad_request("invalid_body", format!("invalid cleanup body: {rejection}"))
+        }
+    };
+    let rules = body.rules(&state);
+    let execute = body.execute.unwrap_or(false);
+    if execute && !state.substore_allow_delete {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "deletion_disabled",
+            "Sub-Store deletion is disabled: set substore.allow_delete (or \
+             ALLOW_SUBSTORE_DELETE=1) to open it"
+                .to_string(),
+        );
+    }
+    let store = SubStoreClient::new(&state.backend);
+    // The plan is always regenerated here: the apply acts on what the backend
+    // holds NOW, not on a plan JSON that may be minutes old.
+    let plan = match core_scan_cleanup(&store, &rules, CleanupCaps::default()).await {
+        Ok(plan) => plan,
+        Err(err) => return error_response(StatusCode::BAD_GATEWAY, "backend", err),
+    };
+    match core_apply_cleanup(&plan, &store, &backup_dir(&state.root), execute).await {
+        Ok(report) => {
+            if execute {
+                record_migration_audit(
+                    &state,
+                    "migrations.cleanup_apply",
+                    &format!(
+                        "prefix={} deleted={} skipped={} failed={} backup={:?}",
+                        rules.push_prefix,
+                        report.deleted.len(),
+                        report.skipped.len(),
+                        report.failed.len(),
+                        report.backup_file
+                    ),
+                );
+            }
+            Json(report).into_response()
+        }
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, "backend", err),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CleanupRollbackBody {
+    /// The file NAME a previous cleanup-apply reported (resolved inside the
+    /// service's own `data/cleanup-backups/`; anything else is a 400).
+    backup: String,
+}
+
+/// `POST /api/v1/migrations/substore/cleanup-rollback` -- recreate the subs a
+/// previous apply deleted, from the backup document that apply wrote.
+async fn cleanup_rollback_substore(
+    State(state): State<SharedState>,
+    request: Result<Json<CleanupRollbackBody>, JsonRejection>,
+) -> Response {
+    let Json(body) = match request {
+        Ok(json) => json,
+        Err(rejection) => {
+            return bad_request(
+                "invalid_body",
+                format!("invalid cleanup-rollback body: {rejection}"),
+            )
+        }
+    };
+    let backup = match read_backup(&backup_dir(&state.root), &body.backup) {
+        Ok(backup) => backup,
+        Err(err) => return bad_request("invalid_backup", err),
+    };
+    let store = SubStoreClient::new(&state.backend);
+    let report = core_rollback_cleanup(&backup, &store).await;
+    record_migration_audit(
+        &state,
+        "migrations.cleanup_rollback",
+        &format!(
+            "backup={} restored={} failed={}",
+            body.backup.trim(),
+            report.restored.len(),
+            report.failed.len()
+        ),
+    );
+    Json(report).into_response()
 }
 
 /// `POST /api/v1/migrations/substore/scan` -- the read-only duplicate scan.
@@ -245,7 +413,7 @@ mod tests {
 
     use axum::extract::{Path as AxumPath, State as AxumState};
     use axum::http::StatusCode;
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use probe_config::SourceSpec;
     use probe_engine::RoundSettings;
@@ -289,6 +457,7 @@ mod tests {
                 schedule: cfg.schedule.clone(),
                 policy: cfg.policy.clone(),
                 min_run_interval_seconds: 0,
+                substore_allow_delete: false,
             },
         ))
     }
@@ -308,6 +477,8 @@ mod tests {
     struct StubSubs {
         records: Mutex<BTreeMap<String, Value>>,
         patches: AtomicUsize,
+        deletes: AtomicUsize,
+        posts: AtomicUsize,
         patch_ok: bool,
     }
 
@@ -329,12 +500,53 @@ mod tests {
                     ),
                 ])),
                 patches: AtomicUsize::new(0),
+                deletes: AtomicUsize::new(0),
+                posts: AtomicUsize::new(0),
                 patch_ok: true,
             })
         }
 
+        /// The B8 cleanup stub: legacy push artifacts (one `-local`, the
+        /// manual-front pool, one ipmap mapping) plus an unprefixed
+        /// bystander. Used only by the cleanup tests.
+        fn with_cleanup_entries() -> Arc<Self> {
+            let stub = Self::new();
+            {
+                let mut records = stub.records.lock().unwrap();
+                records.insert(
+                    "probe-air-local".to_string(),
+                    json!({
+                        "name": "probe-air-local",
+                        "source": "local",
+                        "displayName": "probe-air local",
+                    }),
+                );
+                records.insert(
+                    "probe-front-manual".to_string(),
+                    json!({"name": "probe-front-manual", "source": "local"}),
+                );
+                records.insert(
+                    "ipmap-demo".to_string(),
+                    json!({
+                        "name": "ipmap-demo",
+                        "source": "local",
+                        "displayName": "ipmap 实测映射(demo)",
+                    }),
+                );
+            }
+            stub
+        }
+
         fn patch_count(&self) -> usize {
             self.patches.load(Ordering::SeqCst)
+        }
+
+        fn delete_count(&self) -> usize {
+            self.deletes.load(Ordering::SeqCst)
+        }
+
+        fn post_count(&self) -> usize {
+            self.posts.load(Ordering::SeqCst)
         }
     }
 
@@ -342,6 +554,9 @@ mod tests {
         let list = AxumState(stub.clone());
         let record_get = AxumState(stub.clone());
         let record_patch = AxumState(stub.clone());
+        let record_delete = AxumState(stub.clone());
+        let record_post = AxumState(stub.clone());
+        let record_post_subs = AxumState(stub.clone());
         let app = Router::new()
             .route(
                 "/api/subs",
@@ -353,7 +568,7 @@ mod tests {
                             json!({
                                 "name": record["name"],
                                 "url": record["url"],
-                                "source": "remote",
+                                "source": record.get("source").unwrap_or(&json!("remote")),
                             })
                         })
                         .collect();
@@ -386,7 +601,37 @@ mod tests {
                         record_patch.patches.fetch_add(1, Ordering::SeqCst);
                         Json(json!({"ok": true})).into_response()
                     },
+                )
+                .delete(move |AxumPath(name): AxumPath<String>| async move {
+                    let mut records = record_delete.records.lock().unwrap();
+                    if records.remove(&name).is_none() {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    record_delete.deletes.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"ok": true})).into_response()
+                })
+                .post(
+                    move |AxumPath(name): AxumPath<String>, Json(payload): Json<Value>| async move {
+                        let mut records = record_post.records.lock().unwrap();
+                        records.insert(name, payload);
+                        record_post.posts.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({"ok": true})).into_response()
+                    },
                 ),
+            )
+            .route(
+                "/api/subs",
+                post(move |Json(payload): Json<Value>| async move {
+                    // Sub-Store's create route: the payload carries the name.
+                    let name = payload["name"].as_str().unwrap_or_default().to_string();
+                    if name.is_empty() {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    let mut records = record_post_subs.records.lock().unwrap();
+                    records.insert(name, payload);
+                    record_post_subs.posts.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"ok": true})).into_response()
+                }),
             )
             .route(
                 "/download/{name}",
@@ -427,6 +672,9 @@ mod tests {
             "/api/v1/migrations/substore/scan",
             "/api/v1/migrations/substore/apply",
             "/api/v1/migrations/substore/rollback",
+            "/api/v1/migrations/substore/cleanup-plan",
+            "/api/v1/migrations/substore/cleanup-apply",
+            "/api/v1/migrations/substore/cleanup-rollback",
         ] {
             let response = client.post(format!("{base}{path}")).send().await.unwrap();
             assert_eq!(response.status(), 401, "{path} is guarded");
@@ -677,5 +925,189 @@ mod tests {
         let again: Value = response.json().await.unwrap();
         assert_eq!(again["counts"]["already_restored"], 1, "{again}");
         assert_eq!(stub.patch_count(), 2, "one retarget + one restore PATCH");
+    }
+
+    /// B8: the cleanup plan endpoint answers the classification of every sub
+    /// the stub holds, and the scan itself never writes.
+    #[tokio::test]
+    async fn cleanup_plan_against_a_stub_answers_the_classification() {
+        let stub = StubSubs::with_cleanup_entries();
+        let backend = spawn_stub(stub.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = spawn(state(tmp.path(), &backend, Vec::new())).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{base}/api/v1/migrations/substore/cleanup-plan"))
+            .header("X-Auth-Token", ADMIN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let plan: Value = response.json().await.unwrap();
+        assert_eq!(plan["counts"]["duplicate"], 3, "{plan}");
+        assert_eq!(plan["counts"]["keep"], 3, "{plan}");
+        let names: Vec<&str> = plan["duplicate"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|target| target["name"].as_str())
+            .collect();
+        // Name-rule hits come first in listed order, then the record-confirmed
+        // ipmap candidates from the second pass.
+        assert_eq!(
+            names,
+            ["probe-air-local", "probe-front-manual", "ipmap-demo"]
+        );
+        assert_eq!(plan["scope"], "subs", "{plan}");
+        assert_eq!(
+            stub.patch_count() + stub.delete_count(),
+            0,
+            "a plan never writes"
+        );
+    }
+
+    /// B8: a cleanup-apply whose body stays silent on `execute` is a dry run
+    /// with zero DELETEs.
+    #[tokio::test]
+    async fn cleanup_apply_without_execute_is_a_dry_run_with_zero_deletes() {
+        let stub = StubSubs::with_cleanup_entries();
+        let backend = spawn_stub(stub.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = spawn(state(tmp.path(), &backend, Vec::new())).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{base}/api/v1/migrations/substore/cleanup-apply"))
+            .header("X-Auth-Token", ADMIN)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let report: Value = response.json().await.unwrap();
+        assert_eq!(report["dry_run"], true, "{report}");
+        assert_eq!(report["planned"], 3, "{report}");
+        assert_eq!(report["deleted"].as_array().unwrap().len(), 0, "{report}");
+        assert_eq!(stub.delete_count(), 0, "a dry run never deletes");
+    }
+
+    /// B8: even with `execute: true`, a closed deletion gate answers 403 and
+    /// the stub observed zero DELETEs.
+    #[tokio::test]
+    async fn cleanup_apply_with_execute_requires_the_deletion_gate() {
+        let stub = StubSubs::with_cleanup_entries();
+        let backend = spawn_stub(stub.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = spawn(state(tmp.path(), &backend, Vec::new())).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{base}/api/v1/migrations/substore/cleanup-apply"))
+            .header("X-Auth-Token", ADMIN)
+            .json(&json!({"execute": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "deletion_disabled", "{body}");
+        assert_eq!(stub.delete_count(), 0);
+    }
+
+    /// B8: with the gate open and `execute: true`, the 测活产物 leave the
+    /// stub, the backup document lands under the service root, and the
+    /// rollback endpoint recreates them from that file.
+    #[tokio::test]
+    async fn cleanup_apply_with_the_gate_deletes_backs_up_and_restores() {
+        let stub = StubSubs::with_cleanup_entries();
+        let backend = spawn_stub(stub.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app_state = state(tmp.path(), &backend, Vec::new());
+        let inner = Arc::get_mut(&mut app_state).expect("state not shared yet");
+        inner.substore_allow_delete = true;
+        let base = spawn(app_state).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("{base}/api/v1/migrations/substore/cleanup-apply"))
+            .header("X-Auth-Token", ADMIN)
+            .json(&json!({"execute": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let report: Value = response.json().await.unwrap();
+        assert_eq!(report["dry_run"], false, "{report}");
+        let deleted: Vec<&str> = report["deleted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|name| name.as_str())
+            .collect();
+        assert_eq!(deleted.len(), 3, "{report}");
+        assert_eq!(stub.delete_count(), 3);
+        // The backup file exists where the report says, inside the root.
+        let backup_file = report["backup_file"].as_str().expect("{report}");
+        let backup_path = tmp
+            .path()
+            .join("data")
+            .join("cleanup-backups")
+            .join(backup_file);
+        assert!(
+            backup_path.is_file(),
+            "{} must exist",
+            backup_path.display()
+        );
+
+        // The rollback recreates every deleted sub through the upsert path.
+        let response = client
+            .post(format!(
+                "{base}/api/v1/migrations/substore/cleanup-rollback"
+            ))
+            .header("X-Auth-Token", ADMIN)
+            .json(&json!({"backup": backup_file}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let rollback: Value = response.json().await.unwrap();
+        assert_eq!(
+            rollback["restored"].as_array().unwrap().len(),
+            3,
+            "{rollback}"
+        );
+        assert_eq!(
+            rollback["failed"].as_array().unwrap().len(),
+            0,
+            "{rollback}"
+        );
+        assert_eq!(stub.post_count(), 3);
+        {
+            let records = stub.records.lock().unwrap();
+            assert!(records.contains_key("probe-air-local"));
+            assert_eq!(records["ipmap-demo"]["displayName"], "ipmap 实测映射(demo)");
+        }
+    }
+
+    /// B8: a rollback name that leaves the backup directory is a 400, and
+    /// nothing is sent to the backend.
+    #[tokio::test]
+    async fn cleanup_rollback_rejects_a_hostile_backup_name() {
+        let stub = StubSubs::with_cleanup_entries();
+        let backend = spawn_stub(stub.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = spawn(state(tmp.path(), &backend, Vec::new())).await;
+        let client = reqwest::Client::new();
+        for hostile in ["../escape.json", "sub/dir.json", "", "note.txt"] {
+            let response = client
+                .post(format!(
+                    "{base}/api/v1/migrations/substore/cleanup-rollback"
+                ))
+                .header("X-Auth-Token", ADMIN)
+                .json(&json!({"backup": hostile}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 400, "{hostile:?}");
+        }
+        assert_eq!(stub.post_count(), 0);
     }
 }

@@ -14,6 +14,10 @@
 //!     probe-cli --root <dir> migrate scan [--prefix P] [--report FILE]
 //!     probe-cli --root <dir> migrate apply --plan FILE [--execute]
 //!     probe-cli --root <dir> migrate rollback --report FILE
+//!     probe-cli --root <dir> migrate clean [--prefix P] [--ipmap-prefix P]
+//!                                            [--report FILE | --plan FILE]
+//!                                            [--execute]
+//!     probe-cli --root <dir> migrate clean-rollback --backup NAME
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,7 +30,10 @@ use probe_mihomo::Controller;
 // `healthcheck`/`publish` are trait methods; the trait must be in scope at
 // the `gist` subcommands.
 use probe_publish::Publisher;
-use probe_source::{ApplyReport, MigrationPlan, ScanCaps, SubStoreHttpStore};
+use probe_source::{
+    ApplyReport, CleanupCaps, CleanupPlan, CleanupRules, MigrationPlan, ScanCaps, SubStoreClient,
+    SubStoreHttpStore,
+};
 use probe_storage::{migrations, Storage};
 
 fn main() {
@@ -47,6 +54,9 @@ fn main() {
     let mut report_file: Option<PathBuf> = None;
     let mut execute = false;
     let mut quarantine_hours: Option<u64> = None;
+    // `migrate clean` flags (B8).
+    let mut ipmap_prefix: Option<String> = None;
+    let mut backup_file: Option<String> = None;
     // A value flag with no value token is not a default worth guessing: a
     // truncated `probe-cli --root` would silently operate on the fallback
     // root, and `db backup --from` reading an unintended file is worse. The
@@ -121,6 +131,12 @@ fn main() {
                     }
                 }
             }
+            "--ipmap-prefix" => {
+                ipmap_prefix = Some(flag_value(&args, &mut i, "--ipmap-prefix"));
+            }
+            "--backup" => {
+                backup_file = Some(flag_value(&args, &mut i, "--backup"));
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -159,15 +175,16 @@ fn main() {
         }
         "migrate" => {
             let sub = positionals.get(1).map(String::as_str).unwrap_or("");
-            std::process::exit(cmd_migrate(
-                &root,
-                sub,
-                prefix.as_deref(),
-                plan_file.as_deref(),
-                report_file.as_deref(),
+            let args = MigrateArgs {
+                prefix: prefix.clone(),
+                ipmap_prefix: ipmap_prefix.clone(),
+                plan_file: plan_file.clone(),
+                report_file: report_file.clone(),
+                backup_file: backup_file.clone(),
                 quarantine_hours,
                 execute,
-            ));
+            };
+            std::process::exit(cmd_migrate(&root, sub, &args));
         }
         "substore" => {
             // The embedded Sub-Store's own default is 8299 (documented, and
@@ -202,6 +219,10 @@ fn print_usage() {
 \x20   migrate <scan|apply|rollback>\n\
 \x20                          Sub-Store duplicate migration (F-058: plan-only\n\
 \x20                          output; never creates, never deletes)\n\
+\x20   migrate <clean|clean-rollback>\n\
+\x20                          B8 测活产物 cleanup: scan/classify, back up then\n\
+\x20                          delete (--execute AND substore.allow_delete\n\
+\x20                          required), restore from a backup\n\
 \n\
 \x20 flags:\n\
 \x20   --root <dir>          service root (default: $MIHOMO_TEST_ROOT or /srv/mihomo-test)\n\
@@ -218,6 +239,11 @@ fn print_usage() {
 \x20                         is a dry run)\n\
 \x20   --quarantine-hours N  migrate apply: quarantine window recorded on the\n\
 \x20                         report (default: the plan's, itself 24)\n\
+\x20   --ipmap-prefix <P>    migrate clean: the ipmap naming prefix (default:\n\
+\x20                         ipmap-); display names decide, this only nominates\n\
+\x20   --backup <name>       migrate clean-rollback: the backup_file a previous\n\
+\x20                         clean --execute reported (resolved under\n\
+\x20                         <root>/data/cleanup-backups/)\n\
 \x20   -h, --help            this text\n\
 \n\
 \x20 notes: RUST_LOG=info|debug|trace (round and serve both honour it).\n\
@@ -835,30 +861,58 @@ fn cmd_gist_init(root: &Path) -> i32 {
     })
 }
 
-/// `migrate` subcommands (workstreams/18 §B5): the Sub-Store duplicate
-/// migration, driven directly against the configured backend. The safety
-/// contract mirrors the API module (`probe_api::migrations`):
+/// Every flag the `migrate` verbs read, bundled so the dispatcher stays
+/// under clippy's argument budget.
+struct MigrateArgs {
+    prefix: Option<String>,
+    ipmap_prefix: Option<String>,
+    plan_file: Option<PathBuf>,
+    report_file: Option<PathBuf>,
+    backup_file: Option<String>,
+    quarantine_hours: Option<u64>,
+    execute: bool,
+}
+
+/// `migrate` subcommands (workstreams/18 §B5 + B8 cleanup): driven directly
+/// against the configured backend. The safety contract mirrors the API
+/// module (`probe_api::migrations`):
 ///
 /// * `scan` is read-only by construction;
 /// * `apply` WITHOUT `--execute` is a DRY RUN -- the flag is opt-in, so a
 ///   forgotten flag can only ever preview, never write;
 /// * `rollback` restores from the report a previous apply printed (update
-///   path only; the core has no delete to call).
-fn cmd_migrate(
-    root: &Path,
-    subcommand: &str,
-    prefix: Option<&str>,
-    plan_file: Option<&Path>,
-    report_file: Option<&Path>,
-    quarantine_hours: Option<u64>,
-    execute: bool,
-) -> i32 {
+///   path only; the core has no delete to call);
+/// * `clean` plans a 测活产物 cleanup; a real delete needs `--execute` AND
+///   the deployment gate, and backs everything up before deleting;
+/// * `clean-rollback` restores from such a backup.
+fn cmd_migrate(root: &Path, subcommand: &str, args: &MigrateArgs) -> i32 {
+    let MigrateArgs {
+        prefix,
+        ipmap_prefix,
+        plan_file,
+        report_file,
+        backup_file,
+        quarantine_hours,
+        execute,
+    } = args;
     match subcommand {
-        "scan" => migrate_scan(root, prefix, report_file),
-        "apply" => migrate_apply(root, plan_file, execute, quarantine_hours),
-        "rollback" => migrate_rollback(root, report_file),
+        "scan" => migrate_scan(root, prefix.as_deref(), report_file.as_deref()),
+        "apply" => migrate_apply(root, plan_file.as_deref(), *execute, *quarantine_hours),
+        "rollback" => migrate_rollback(root, report_file.as_deref()),
+        "clean" => migrate_clean(
+            root,
+            prefix.as_deref(),
+            ipmap_prefix.as_deref(),
+            plan_file.as_deref(),
+            report_file.as_deref(),
+            *execute,
+        ),
+        "clean-rollback" => migrate_clean_rollback(root, backup_file.as_deref()),
         other => {
-            eprintln!("unknown migrate subcommand: {other:?} (expected scan | apply | rollback)");
+            eprintln!(
+                "unknown migrate subcommand: {other:?} (expected scan | apply | rollback | \
+                 clean | clean-rollback)"
+            );
             2
         }
     }
@@ -1111,6 +1165,197 @@ fn migrate_rollback(root: &Path, report_file: Option<&Path>) -> i32 {
             1
         } else {
             0
+        }
+    })
+}
+
+/// The B8 cleanup execute decision, pure for the test: a real delete needs
+/// BOTH the operator flag (`--execute`) and the deployment gate
+/// (`substore.allow_delete` after the environment merge at config load).
+fn clean_execute_decision(execute: bool, gate_open: bool) -> bool {
+    execute && gate_open
+}
+
+/// `migrate clean [--prefix P] [--ipmap-prefix P] [--report FILE |
+/// --plan FILE] [--execute]`: scan the backend for 测活产物, classify, and
+/// (only with `--execute` AND the deployment gate) back up and delete.
+/// Without `--execute` this is a plan-plus-dry-run: the plan prints and the
+/// report records what WOULD happen, with zero write requests built.
+///
+/// `--plan FILE` applies a reviewed plan instead of a fresh scan; the gate
+/// check runs either way.
+fn migrate_clean(
+    root: &Path,
+    prefix: Option<&str>,
+    ipmap_prefix: Option<&str>,
+    plan_file: Option<&Path>,
+    report_file: Option<&Path>,
+    execute: bool,
+) -> i32 {
+    let cfg = load(root);
+    // The operator asked for a delete; the decision table decides whether
+    // the deployment actually grants one.
+    let delete_allowed = clean_execute_decision(execute, cfg.substore.allow_delete);
+    if execute && !delete_allowed {
+        eprintln!(
+            "clean --execute refused: substore.allow_delete is false (set it in config, or \
+             ALLOW_SUBSTORE_DELETE=1). Plans and dry runs run without it."
+        );
+        return 2;
+    }
+    let rules = CleanupRules {
+        push_prefix: prefix
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| cfg.publish_prefix.clone()),
+        ipmap_prefix: ipmap_prefix
+            .map(|prefix| prefix.trim().to_string())
+            .filter(|prefix| !prefix.is_empty())
+            .unwrap_or_else(|| probe_source::DEFAULT_IPMAP_PREFIX.to_string()),
+    };
+    let dir = probe_source::backup_dir(root);
+    if execute {
+        println!(
+            "REAL CLEAN: matched 测活产物 will be backed up to {} and then deleted",
+            dir.display()
+        );
+    }
+    let backend = migrate_backend(root, &cfg);
+    tokio_block(async move {
+        let store = SubStoreClient::new(&backend);
+        let plan: CleanupPlan = match plan_file {
+            Some(path) => {
+                let text = match std::fs::read_to_string(path) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        eprintln!("cannot read {}: {err}", path.display());
+                        return 1;
+                    }
+                };
+                match serde_json::from_str(&text) {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        eprintln!("{} is not a cleanup plan: {err}", path.display());
+                        return 1;
+                    }
+                }
+            }
+            None => {
+                match probe_source::scan_cleanup(&store, &rules, CleanupCaps::default()).await {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        eprintln!("clean scan failed: {err}");
+                        return 1;
+                    }
+                }
+            }
+        };
+        let plan_json = match serde_json::to_string_pretty(&plan) {
+            Ok(json) => json,
+            Err(err) => {
+                eprintln!("clean failed to serialize the plan: {err}");
+                return 1;
+            }
+        };
+        if let Some(report) = report_file {
+            match std::fs::write(report, format!("{plan_json}\n")) {
+                Ok(()) => println!("plan written: {}", report.display()),
+                Err(err) => {
+                    eprintln!("cannot write {}: {err}", report.display());
+                    return 1;
+                }
+            }
+        }
+        println!("{plan_json}");
+        println!(
+            "counts: keep={} duplicate={} uncertain={}",
+            plan.counts.keep, plan.counts.duplicate, plan.counts.uncertain
+        );
+        let report = match probe_source::apply_cleanup(&plan, &store, &dir, execute).await {
+            Ok(report) => report,
+            Err(err) => {
+                eprintln!("clean apply failed: {err}");
+                return 1;
+            }
+        };
+        let report_json = match serde_json::to_string_pretty(&report) {
+            Ok(json) => json,
+            Err(err) => {
+                eprintln!("clean failed to serialize the report: {err}");
+                return 1;
+            }
+        };
+        println!("{report_json}");
+        if report.dry_run {
+            println!("dry run: nothing was written (re-run with --execute to apply)");
+        } else {
+            println!(
+                "deleted={} skipped={} failed={} backup={}",
+                report.deleted.len(),
+                report.skipped.len(),
+                report.failed.len(),
+                report.backup_file.as_deref().unwrap_or("-")
+            );
+        }
+        if report.failed.is_empty() {
+            0
+        } else {
+            1
+        }
+    })
+}
+
+/// `migrate clean-rollback --backup NAME`: recreate the subs a previous
+/// `migrate clean --execute` deleted, from the backup document it wrote
+/// under `<root>/data/cleanup-backups/`. The name is jailed to that
+/// directory by `read_backup`.
+fn migrate_clean_rollback(root: &Path, backup_file: Option<&str>) -> i32 {
+    let Some(name) = backup_file.map(str::trim).filter(|name| !name.is_empty()) else {
+        eprintln!(
+            "clean-rollback needs --backup <file name> (the backup_file a previous \
+             clean --execute reported)"
+        );
+        return 2;
+    };
+    let dir = probe_source::backup_dir(root);
+    let backup = match probe_source::read_backup(&dir, name) {
+        Ok(backup) => backup,
+        Err(err) => {
+            eprintln!("{err}");
+            return 2;
+        }
+    };
+    let cfg = load(root);
+    let backend = migrate_backend(root, &cfg);
+    println!(
+        "restoring {} entries from {name} (upsert writes; recreates what was deleted)",
+        backup
+            .get("entries")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0)
+    );
+    tokio_block(async move {
+        let store = SubStoreClient::new(&backend);
+        let report = probe_source::rollback_cleanup(&backup, &store).await;
+        let json = match serde_json::to_string_pretty(&report) {
+            Ok(json) => json,
+            Err(err) => {
+                eprintln!("clean-rollback failed to serialize the report: {err}");
+                return 1;
+            }
+        };
+        println!("{json}");
+        println!(
+            "restored={} failed={}",
+            report.restored.len(),
+            report.failed.len()
+        );
+        if report.failed.is_empty() {
+            0
+        } else {
+            1
         }
     })
 }
@@ -1387,6 +1632,7 @@ async fn cmd_serve(root: &Path, host: &str, port: u16) -> std::io::Result<()> {
                 schedule: cfg.schedule.clone(),
                 policy: cfg.policy.clone(),
                 min_run_interval_seconds: cfg.schedule.min_run_interval_seconds,
+                substore_allow_delete: cfg.substore.allow_delete,
             },
         )
         .with_publish(cfg.publish.clone()),
@@ -1482,5 +1728,27 @@ mod gist_init_tests {
             gist_init_decision(Some("gist0001abcd"), None),
             GistInitDecision::Create
         );
+    }
+}
+
+#[cfg(test)]
+mod clean_gate_tests {
+    use super::clean_execute_decision;
+
+    /// B8: a real cleanup delete is the AND of the operator flag and the
+    /// deployment gate -- either alone must never be enough, and a dry run
+    /// runs whatever the gate says.
+    #[test]
+    fn execution_needs_both_the_flag_and_the_gate() {
+        assert!(clean_execute_decision(true, true));
+        assert!(
+            !clean_execute_decision(true, false),
+            "flag without the gate"
+        );
+        assert!(
+            !clean_execute_decision(false, true),
+            "gate without the flag"
+        );
+        assert!(!clean_execute_decision(false, false));
     }
 }

@@ -68,8 +68,24 @@
 - **风险**：远程腿 spawn_blocking 持存储互斥跨 gist HTTP（沿 legacy push 先例，single-flight 限界）；create 丢失响应可孤儿 gist（注释+运维动作）。
 - **回滚**：`git revert 29cf9cd`（0012 additive，旧二进制忽略新列）。
 
-## 待办（B5 接线 / B6 / B7 未完成）
+## 2026-11-05 B8 — 落地重命名 + 发布去重 + Sub-Store 测活产物清理
 
-- **B5 接线**：API `POST /api/v1/migrations/substore/{scan,apply,rollback}`（apply 默认 dry-run=true）、CLI `migrate` 子命令、`link_substore.py` 降级。
+- **执行者**：主 Agent（会话内实现，commit 见 git log）
+- **文件**：`crates/probe-config/src/lib.rs`（`publish.add_exit_tag`/`publish.dedup_nodes` 默认 true、`substore.allow_delete` 默认 false + `ALLOW_SUBSTORE_DELETE` env 门禁 + default_tree/测试）；`crates/probe-source/src/identity.rs`（`dedup_fingerprint` + `CREDENTIAL_FIELDS`）；`crates/probe-source/src/fetch.rs`（`SubStoreClient::sub_record`、`bounded` 转 pub(crate)）；新增 `crates/probe-source/src/cleanup.rs`（`CleanupStore` trait + scan/classify/apply/rollback + 9 用例）；`crates/probe-source/src/migrate.rs`（`rfc3339_utc`/`now_rfc3339` 转 pub(crate)）；`crates/probe-source/Cargo.toml`（dev-dep tempfile）；`crates/probe-engine/src/publish.rs`（出口标签改名 + 指纹去重 + `ExportDropReason::DuplicateNode` + `measured_exit_ip`）与 `publish/tests.rs`（`exportable` 按名字派生凭据 + 4 新用例）；`crates/probe-api/src/{lib.rs,migrations.rs,gui.rs,gui_tests.rs}` + 其余 ServeConfig 字面量（`substore_allow_delete` 快照字段 ×11 处）；`crates/probe-api/src/migrations.rs` 三端点 + Stub 扩展（DELETE/POST 路由、计数器）+ 6 新用例；`crates/probe-cli/src/main.rs`（`MigrateArgs` 打包 + `migrate clean|clean-rollback` + 帮助文本 + 门禁决策纯函数）。
+- **变更**：
+  1. **落地重命名**（`publish.add_exit_tag`，默认开）：发布名追加实测出口 IP——`[US] Tokyo 01 · 203.0.113.7`，与 Python ipmap 标注同构；只接受能通过 `IpAddr` 解析的实测值（畸形值拒绝进名字），并规范化（`2001:0DB8::1`→`2001:db8::1`）；与 `add_region_tag` 组合、与 `seen` 集合去重共存（重名照旧 SupersededVariant）。
+  2. **发布去重**（`publish.dedup_nodes`，默认开）：body 内按 `dedup_fingerprint`（type+server+port+cipher+uuid/password/psk/auth，无凭据字段则退化为完整指纹）一节点一条，镜像节点保留排序稳定的首个，其余记 `DuplicateNode` 丢弃；同端点不同凭据绝不合并（F-014 endpoint_fingerprint 语义）。
+  3. **测活产物清理**：`CleanupStore` 是全仓库唯一有 Sub-Store DELETE 的面（B5 `MigrationStore` 结构级禁删不变）；扫描分类 `<prefix>-*-local`(source=local)/`<prefix>-front-manual`/ipmap(displayName 以「ipmap 实测映射」开头) → duplicate，其余 keep/uncertain（记录核验上限 50）；apply 三段式——先全部读记录备份（记录不可读→跳过不删）、备份落盘 `<root>/data/cleanup-backups/cleanup-*.json`（写不进去→整个 apply 中止在第一个删除之前）、再逐个 DELETE（单点失败不阻断）；rollback 从备份经 upsert 还原（备份文件名越狱被 `read_backup` 拒绝）。API：`POST /api/v1/migrations/substore/cleanup-{plan,apply,rollback}`（apply 默认 dry-run，真删需 `execute:true` 且 `substore.allow_delete`，审计 `migrations.cleanup_*`）；GUI 清理中心三按钮改接新端点（两次确认 + 记住 backup_file）；CLI：`migrate clean [--report|--plan] [--execute]` / `migrate clean-rollback --backup NAME`。扫描只列 subs，collections 永不触碰。
+- **原因**：用户需求三项（落地重命名/去重/Sub-Store 多重测活去除）；对应《最终功能清单》F-014 的发布面部分与 F-058/F-084 阶段 4（用户确认后清理旧 Sub-Store 产物，全程可回滚）。引擎级跨源「只测一次」（F-014 完整体）不在本批，记为后续。
+- **影响**：两个默认 true 的发布开关会让下一轮产物内容变化（去重后节点数下降、名字带出口 IP）——这是需求本身；`substore.allow_delete` 默认 false，清理功能默认只扫描。既有的 B5 重复对象迁移端点原样保留（GUI 旧按钮改指向清理端点，scan/apply/rollback 仍可从 API 调用）。
+- **风险**：删除路径有双重门禁 + 先备份后删 + 回滚命令；最大残余风险是「扫描误分类」——靠 source=local/displayName 双证据与 uncertain 兜底，uncertain 永不删除。跨源测试去重未做，多源重复节点仍各测各的（浪费车道但不影响正确性）。
+- **测试**：`cargo test --workspace` **709 passed / 0 failed**（+45：cleanup 9、identity 3、publish 4、api migrations 6、config 3 等）；`cargo clippy --workspace --all-targets -- -D warnings` exit 0；`cargo fmt --all -- --check` 通过；`python -m unittest discover -s tests` **605 passed, OK (skipped=2)**。
+- **审查**：删除三段式的中止点有专门用例（备份目录不可写→零删除）；门禁两向（缺 flag/缺 gate）各有 API 与 CLI 级用例；`exportable` 测试助手改为按名字派生凭据，保证既有用例的节点在 B8 去重下仍是互异节点。
+- **回滚**：`git revert` 本提交（无 DB 迁移、无 schema 变更；已发布的备份文件留在 `data/cleanup-backups/` 不受影响）。
+
+## 待办（B6 / B7 未完成）
+
+- **B5 接线**：已完成（`bdee87c` API/CLI + `618e659` link_substore 降级），条目移出待办。
 - **B6**：指导 §11.1/11.2/11.3 + 功能清单 §10 红线逐条测试映射；缺口补测（仅新文件）。
 - **B7**：README/ARCHITECTURE 发布章节；`ARCHITECTURE_GIST_ONLY.md`、`MIGRATION_GIST_ONLY.md`；`/api/v1/publishers/gist/init` API 面（CLI 已有）。
+- **B9（候选）**：F-014 完整体——跨源节点只测一次、结果映射回所有 Source（本批只做了发布面去重）。

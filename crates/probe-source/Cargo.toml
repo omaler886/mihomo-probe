@@ -20,3 +20,5 @@ tracing = { workspace = true }
 # way the probe-substore tests do: the request sequence (GET -> POST -> PATCH)
 # is the behaviour under test, not just the parsing.
 axum = { workspace = true }
+# The B8 cleanup tests write their backup documents into a throwaway dir.
+tempfile = "3"

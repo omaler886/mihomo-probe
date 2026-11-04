@@ -281,6 +281,36 @@ impl SubStoreClient {
         )))
     }
 
+    /// `GET /api/sub/{name}` as the raw record: `Ok(Some(record))` when
+    /// present, `Ok(None)` when Sub-Store answers "missing" (the same shapes
+    /// [`Self::sub_exists`] reads). The B8 cleanup leg snapshots this before
+    /// any delete, so a rollback can restore the object from the API side.
+    pub async fn sub_record(&self, name: &str) -> Result<Option<Value>, String> {
+        let path = format!("/api/sub/{}", encode(name));
+        let response = self
+            .http
+            .get(format!("{}{path}", self.backend))
+            .header("User-Agent", BROWSER_UA)
+            .send()
+            .await
+            .map_err(|err| bounded(&format!("{} {path}", kind_of(&err))))?;
+        let status = response.status();
+        let text = bounded_body(response).await.unwrap_or_default();
+        if status.is_success() {
+            return serde_json::from_str(&text)
+                .map(Some)
+                .map_err(|_| bounded("GET /api/sub returned unusable JSON"));
+        }
+        if status.as_u16() == 404 || is_missing(status.as_u16(), &text) {
+            return Ok(None);
+        }
+        Err(bounded(&format!(
+            "HTTP {} {path}: {}",
+            status.as_u16(),
+            summarize(&text)
+        )))
+    }
+
     async fn send_json(
         &self,
         method: reqwest::Method,
@@ -500,7 +530,9 @@ fn kind_of(err: &reqwest::Error) -> &'static str {
     }
 }
 
-fn bounded(text: &str) -> String {
+/// Bounded, one-line error text. Shared with the B8 cleanup leg: every
+/// backend-facing message passes through here before it can reach a report.
+pub(crate) fn bounded(text: &str) -> String {
     text.chars().take(ERROR_LIMIT).collect()
 }
 

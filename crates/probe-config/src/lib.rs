@@ -659,6 +659,14 @@ pub struct SubStoreSection {
     /// Produce-cache spec: `<cron>,<sub|col>,<names...>` entries separated by
     /// `;` — each name gets a host-side `/download/...` warm-up job.
     pub produce_cron: Option<String>,
+    /// Operator gate for the cleanup leg's real deletions (`migrate clean
+    /// --execute`, `POST …/cleanup-apply` with `execute: true`). Default
+    /// false: plans and dry runs run regardless, but a DELETE only leaves
+    /// this machine when the stored flag says so. The environment variable
+    /// `ALLOW_SUBSTORE_DELETE=1` turns it on without a config edit, and an
+    /// explicit `=0` disarms a stored `true` during an incident — the same
+    /// table `allow_legacy_substore_write` follows.
+    pub allow_delete: bool,
 }
 
 pub const DEFAULT_SUBSTORE_LISTEN: &str = "127.0.0.1:8299";
@@ -674,6 +682,7 @@ impl Default for SubStoreSection {
             push_service: None,
             sync_cron: None,
             produce_cron: None,
+            allow_delete: false,
         }
     }
 }
@@ -703,6 +712,16 @@ impl SubStoreSection {
             push_service: get_str("push_service"),
             sync_cron: get_str("sync_cron"),
             produce_cron: get_str("produce_cron"),
+            // Config first, environment second — the same table the legacy
+            // write gate uses, so an operator already knows how to flip it
+            // for one command without editing a JSON file under pressure.
+            allow_delete: substore_delete_for(
+                value
+                    .get("allow_delete")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(defaults.allow_delete),
+                std::env::var("ALLOW_SUBSTORE_DELETE").ok().as_deref(),
+            ),
         }
     }
 }
@@ -961,6 +980,19 @@ pub struct PublishSection {
     pub hostname: String,
     /// Rewrite the `[CC]` region tag from the measured exit country.
     pub add_region_tag: bool,
+    /// Append the measured exit (落地) IP to the published name, the ipmap
+    /// annotation carried over from the Python pipeline: `[US] name ·
+    /// 203.0.113.7`. The suffix only ever comes from the round's verified
+    /// exit identity (an IP-shaped string), so a node measured without one
+    /// keeps its name untouched and the tag can never stack a second time.
+    pub add_exit_tag: bool,
+    /// Collapse the nodes a body publishes to one entry per node identity
+    /// (`probe_source::identity::dedup_fingerprint`): aggregating sources
+    /// mirror the same node under several names, and every mirror that
+    /// survives to a body dials the same server with the same credential.
+    /// The first (sort-stable) mirror is kept; the rest are dropped with
+    /// `ExportDropReason::DuplicateNode`.
+    pub dedup_nodes: bool,
     /// Read-only credential for `GET /api/export/<key>.yaml`. `None` (or an
     /// empty/whitespace value) means no export download is authorized.
     pub token: Option<String>,
@@ -1141,6 +1173,14 @@ fn legacy_substore_write_for(stored: bool, env: Option<&str>) -> bool {
     }
 }
 
+/// The Sub-Store deletion gate: the same decision table as the legacy write
+/// gate (config first, environment second; `ALLOW_SUBSTORE_DELETE=1` opens
+/// the path without a config edit, `=0` closes it during an incident).
+/// Separately named so each gate's call site documents which door it opens.
+fn substore_delete_for(stored: bool, env: Option<&str>) -> bool {
+    legacy_substore_write_for(stored, env)
+}
+
 impl PublishSection {
     /// The absolute export root every caller must agree on: the configured
     /// `dir`, else `<service root>/exports`.
@@ -1160,6 +1200,8 @@ impl Default for PublishSection {
             prefix: DEFAULT_PUBLISH_PREFIX.to_string(),
             hostname: DEFAULT_PUBLISH_HOSTNAME.to_string(),
             add_region_tag: true,
+            add_exit_tag: true,
+            dedup_nodes: true,
             token: None,
             allow_legacy_substore_write: false,
             dir: None,
@@ -1191,6 +1233,8 @@ impl PublishSection {
             prefix: text("prefix", &defaults.prefix),
             hostname: text("hostname", &defaults.hostname),
             add_region_tag: get_bool("add_region_tag", defaults.add_region_tag),
+            add_exit_tag: get_bool("add_exit_tag", defaults.add_exit_tag),
+            dedup_nodes: get_bool("dedup_nodes", defaults.dedup_nodes),
             token: value
                 .get("token")
                 .and_then(Value::as_str)
@@ -1350,6 +1394,7 @@ pub fn default_tree() -> Value {
             "push_service": "",
             "sync_cron": null,
             "produce_cron": null,
+            "allow_delete": false,
         },
         // Mirrors config.DEFAULTS["chain"] (minus the doc-only fields). Same
         // rules as `substore`: unknown-key tolerant, disabled by default.
@@ -1371,6 +1416,8 @@ pub fn default_tree() -> Value {
             "prefix": DEFAULT_PUBLISH_PREFIX,
             "hostname": DEFAULT_PUBLISH_HOSTNAME,
             "add_region_tag": true,
+            "add_exit_tag": true,
+            "dedup_nodes": true,
             "token": "",
             "allow_legacy_substore_write": false,
             "dir": null,
@@ -1755,6 +1802,14 @@ mod tests {
         assert_eq!(cfg.publish.prefix, DEFAULT_PUBLISH_PREFIX);
         assert_eq!(cfg.publish.hostname, DEFAULT_PUBLISH_HOSTNAME);
         assert!(cfg.publish.add_region_tag);
+        assert!(
+            cfg.publish.add_exit_tag,
+            "B8: the 落地 rename is the requested default -- names carry the measured exit IP"
+        );
+        assert!(
+            cfg.publish.dedup_nodes,
+            "B8: mirrored nodes collapse to one published entry unless an operator opts out"
+        );
         assert_eq!(
             cfg.publish.token, None,
             "an empty token must deny export downloads, never allow them"
@@ -1795,6 +1850,48 @@ mod tests {
         }
     }
 
+    /// B8: the cleanup deletion gate reads config then environment through
+    /// the same decision table as the legacy write gate. The section parses
+    /// a stored `true`, defaults to closed, and `ALLOW_SUBSTORE_DELETE`
+    /// overrides in both directions.
+    #[test]
+    fn the_substore_delete_flag_reads_config_then_environment() {
+        let stored = SubStoreSection::from_value(&serde_json::json!({
+            "allow_delete": true,
+        }));
+        assert!(stored.allow_delete);
+        let absent = SubStoreSection::from_value(&serde_json::json!({}));
+        assert!(
+            !absent.allow_delete,
+            "deletion stays off until an operator opens it"
+        );
+
+        assert!(substore_delete_for(true, None));
+        assert!(!substore_delete_for(false, None));
+        assert!(substore_delete_for(true, Some("   ")));
+        for on in ["1", "true", " yes ", "on"] {
+            assert!(substore_delete_for(false, Some(on)), "{on}");
+        }
+        for off in ["0", "false", "off"] {
+            assert!(!substore_delete_for(true, Some(off)), "{off}");
+        }
+    }
+
+    /// B8: the default tree carries every new key, so a fresh install and a
+    /// hand-written partial config both parse with the knobs present.
+    #[test]
+    fn the_default_tree_carries_the_b8_keys() {
+        let tree = default_tree();
+        let publish = tree.get("publish").unwrap();
+        assert_eq!(publish.get("add_exit_tag"), Some(&serde_json::json!(true)));
+        assert_eq!(publish.get("dedup_nodes"), Some(&serde_json::json!(true)));
+        let substore = tree.get("substore").unwrap();
+        assert_eq!(
+            substore.get("allow_delete"),
+            Some(&serde_json::json!(false))
+        );
+    }
+
     #[test]
     fn the_publish_section_reads_a_stored_block_without_inventing_values() {
         let publish = PublishSection::from_value(&serde_json::json!({
@@ -1803,6 +1900,8 @@ mod tests {
             "prefix": "  mx  ",
             "hostname": "probe.example.net",
             "add_region_tag": false,
+            "add_exit_tag": false,
+            "dedup_nodes": false,
             "token": "  secret-token  ",
             "dir": "  /srv/exports  ",
         }));
@@ -1811,6 +1910,10 @@ mod tests {
         assert_eq!(publish.prefix, "mx");
         assert_eq!(publish.hostname, "probe.example.net");
         assert!(!publish.add_region_tag);
+        assert!(
+            !publish.add_exit_tag && !publish.dedup_nodes,
+            "a stored false must survive: both B8 knobs are opt-out"
+        );
         assert_eq!(publish.token.as_deref(), Some("secret-token"));
         assert_eq!(publish.dir.as_deref(), Some("/srv/exports"));
         // A whitespace-only token is not a token.

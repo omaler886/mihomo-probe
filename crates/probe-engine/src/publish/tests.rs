@@ -624,9 +624,12 @@ fn source(key: &str, enabled: bool, export: bool) -> SourceSpec {
 }
 
 /// A proxy dictionary in the original domain form, with a publication marker.
+/// Server and credential derive from the name: two `exportable` entries are
+/// different nodes by construction, so the B8 dedup never folds a setup that
+/// is not about dedup. A dedup test builds its own explicit mirrors instead.
 fn exportable(name: &str, kind: &str) -> Value {
-    json!({"name": name, "type": kind, "server": "entry.example.invalid", "port": 443,
-        "uuid": "00000000-0000-4000-8000-000000000001", "origin": "domain"})
+    json!({"name": name, "type": kind, "server": format!("{name}.example.invalid"),
+        "port": 443, "uuid": format!("uuid-{name}"), "origin": "domain"})
 }
 
 /// A job for one ledger identity in the configured (direct) role.
@@ -818,6 +821,144 @@ fn a_region_tag_collision_supersedes_the_loser_instead_of_failing_the_source() {
         exported[0].dropped[0].reason,
         ExportDropReason::SupersededVariant
     ));
+}
+
+/// B8: with the default publish section a node's measured exit (落地) address
+/// rides in the published name, the ipmap annotation the Python pipeline
+/// carried: `[US] name · 203.0.113.7`. Turning the flag off restores the
+/// region-tag-only name.
+#[test]
+fn the_exit_tag_appends_the_measured_landing_ip() {
+    let sources = [source("air", true, true)];
+    let collected = originals("air", &[("fp", exportable("Tokyo 01", "ss"))]);
+    let mut verdict = alive(job("air", "fp", "Tokyo 01"), Some("US"));
+    verdict.exit.as_mut().unwrap().ip = Some("203.0.113.7".to_string());
+    let tagged = select_source_exports(
+        &PublishSection::default(),
+        &sources,
+        &collected,
+        &[verdict.clone()],
+    );
+    assert_eq!(tagged[0].proxies[0]["name"], "[US] Tokyo 01 · 203.0.113.7");
+
+    let untagged_section = PublishSection {
+        add_exit_tag: false,
+        ..PublishSection::default()
+    };
+    let plain = select_source_exports(&untagged_section, &sources, &collected, &[verdict]);
+    assert_eq!(plain[0].proxies[0]["name"], "[US] Tokyo 01");
+}
+
+/// B8: the suffix is built from a measured value, so only an IP-shaped one
+/// qualifies (a hostile or broken trace value must not enter a name), and the
+/// published form is the canonicalized address the next round reports back.
+#[test]
+fn the_exit_tag_refuses_non_ip_values_and_canonicalizes_the_rest() {
+    let sources = [source("air", true, true)];
+    let collected = originals("air", &[("fp", exportable("node", "ss"))]);
+    let verdict_with_ip = |ip: &str| {
+        let mut verdict = alive(job("air", "fp", "node"), None);
+        verdict.exit = Some(probe_domain::ExitIdentity {
+            ip: Some(ip.to_string()),
+            ..probe_domain::ExitIdentity::default()
+        });
+        verdict
+    };
+    let broken = select_source_exports(
+        &PublishSection::default(),
+        &sources,
+        &collected,
+        &[verdict_with_ip("not an ip")],
+    );
+    assert_eq!(broken[0].proxies[0]["name"], "node");
+    let wide = select_source_exports(
+        &PublishSection::default(),
+        &sources,
+        &collected,
+        &[verdict_with_ip("2001:0DB8:0000:0000:0000:0000:0000:0001")],
+    );
+    assert_eq!(wide[0].proxies[0]["name"], "node · 2001:db8::1");
+}
+
+/// B8: mirrors of one node -- same dial, same credential, cosmetic field
+/// differences -- collapse to one published entry, the sort-stable first;
+/// turning `dedup_nodes` off publishes both again.
+#[test]
+fn dedup_collapses_mirrors_of_one_node_and_keeps_the_first() {
+    let sources = [source("air", true, true)];
+    let mirror = |name: &str, extra: Value| {
+        let mut proxy = json!({"name": name, "type": "ss", "server": "entry.example.invalid",
+            "port": 8388, "cipher": "aes-128-gcm", "password": "pw", "origin": "domain"});
+        if let (Some(object), Some(extra)) = (proxy.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+        proxy
+    };
+    let collected = originals(
+        "air",
+        &[
+            ("fp-a", mirror("a", json!({}))),
+            ("fp-b", mirror("b", json!({"udp": true}))),
+        ],
+    );
+    let verdicts = [
+        alive(job("air", "fp-a", "a"), None),
+        alive(job("air", "fp-b", "b"), None),
+    ];
+    let deduped =
+        select_source_exports(&PublishSection::default(), &sources, &collected, &verdicts);
+    let names: Vec<&str> = deduped[0]
+        .proxies
+        .iter()
+        .filter_map(|proxy| proxy["name"].as_str())
+        .collect();
+    assert_eq!(names, ["a"], "one entry per node");
+    assert!(matches!(
+        deduped[0].dropped[0].reason,
+        ExportDropReason::DuplicateNode
+    ));
+
+    let off = PublishSection {
+        dedup_nodes: false,
+        ..PublishSection::default()
+    };
+    let both = select_source_exports(&off, &sources, &collected, &verdicts);
+    assert_eq!(both[0].proxies.len(), 2);
+    assert!(both[0].dropped.is_empty());
+}
+
+/// Different credentials over one endpoint are different nodes: the dedup
+/// key must keep both, or a shared box would publish one account only.
+#[test]
+fn dedup_keeps_distinct_credentials_on_one_endpoint() {
+    let sources = [source("air", true, true)];
+    let account = |name: &str, uuid: &str| {
+        json!({"name": name, "type": "vless", "server": "s.example.invalid", "port": 443,
+            "uuid": uuid, "tls": true, "origin": "domain"})
+    };
+    let collected = originals(
+        "air",
+        &[
+            (
+                "fp-1",
+                account("acct-1", "11111111-1111-4111-8111-111111111111"),
+            ),
+            (
+                "fp-2",
+                account("acct-2", "22222222-2222-4222-8222-222222222222"),
+            ),
+        ],
+    );
+    let verdicts = [
+        alive(job("air", "fp-1", "acct-1"), None),
+        alive(job("air", "fp-2", "acct-2"), None),
+    ];
+    let exported =
+        select_source_exports(&PublishSection::default(), &sources, &collected, &verdicts);
+    assert_eq!(exported[0].proxies.len(), 2);
+    assert!(exported[0].dropped.is_empty());
 }
 
 /// Disabled and muted sources are skipped, never published with a stale body.

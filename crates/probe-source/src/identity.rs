@@ -61,6 +61,54 @@ pub fn variant_fingerprint(fp: &str, variant: &str) -> String {
     hex16(&format!("{fp}#{variant}"))
 }
 
+/// The credential fields two mirrors of one node must agree on, beyond the
+/// dial target. Presence-based: whatever subset a proxy carries joins the
+/// key, so a tuic node (uuid *and* password) splits on either.
+pub const CREDENTIAL_FIELDS: [&str; 4] = ["uuid", "password", "psk", "auth"];
+
+/// B8: the publish-dedup identity -- a node modulo its cosmetic fields.
+///
+/// `fingerprint_proxy` hashes every connection parameter, so two mirrors of
+/// one node that disagree on a non-routing detail (`udp`, a `ws-opts`
+/// spelling, an extra flag) hash apart, and an aggregating subscription list
+/// would publish the same dial with the same credential once per mirror.
+/// The dedup key keeps only what those mirrors must agree on: the protocol,
+/// the server:port and the credential material (`CREDENTIAL_FIELDS` plus
+/// `cipher`, which turns an ss password into a real key).
+///
+/// A proxy with none of the credential fields hashes to its full
+/// `fingerprint_proxy` instead: when the entry says nothing about what makes
+/// it the same node, merging would be a guess, and a wrong merge publishes
+/// one working node in place of two.
+pub fn dedup_fingerprint(proxy: &Value) -> String {
+    let Some(map) = proxy.as_object() else {
+        return fingerprint_proxy(proxy);
+    };
+    let mut key = serde_json::Map::new();
+    for field in ["type", "server", "port", "cipher"] {
+        if let Some(value) = map.get(field) {
+            if value.is_null() {
+                continue;
+            }
+            key.insert((*field).to_string(), value.clone());
+        }
+    }
+    let mut credentials = 0;
+    for field in CREDENTIAL_FIELDS {
+        if let Some(value) = map.get(field) {
+            if value.is_null() {
+                continue;
+            }
+            key.insert((*field).to_string(), value.clone());
+            credentials += 1;
+        }
+    }
+    if credentials == 0 {
+        return fingerprint_proxy(proxy);
+    }
+    hex16(&to_python_json(&sort_recursively(&Value::Object(key))))
+}
+
 /// The `name`/`_`-stripped, recursively sorted copy of a proxy.
 fn canonical_material(proxy: &Value) -> Value {
     let Some(map) = proxy.as_object() else {
@@ -236,6 +284,59 @@ mod tests {
             variant_fingerprint(&fp, "direct"),
             variant_fingerprint(&fp, "chain")
         );
+    }
+
+    #[test]
+    fn the_dedup_key_merges_cosmetic_mirrors_of_one_node() {
+        let plain = json!({"name": "a", "type": "ss", "server": "1.2.3.4",
+                           "port": 8388, "cipher": "aes-128-gcm", "password": "pw"});
+        let mut renamed = plain.clone();
+        renamed["name"] = json!("同一个节点的另一个名字");
+        renamed["udp"] = json!(true);
+        renamed["dialer-proxy"] = json!("front");
+        let mut decorated = plain.clone();
+        decorated["ws-opts"] = json!({"path": "/x", "headers": {"Host": "h"}});
+        assert_eq!(dedup_fingerprint(&plain), dedup_fingerprint(&renamed));
+        assert_eq!(dedup_fingerprint(&plain), dedup_fingerprint(&decorated));
+    }
+
+    #[test]
+    fn the_dedup_key_splits_different_credentials_on_one_endpoint() {
+        // Same server:port, different accounts: the doc's endpoint_fingerprint
+        // exists precisely to tell these apart, so dedup must never merge them.
+        let a = json!({"name": "a", "type": "vless", "server": "s.example", "port": 443,
+                       "uuid": "11111111-1111-1111-1111-111111111111", "tls": true});
+        let b = json!({"name": "b", "type": "vless", "server": "s.example", "port": 443,
+                       "uuid": "22222222-2222-2222-2222-222222222222", "tls": false});
+        assert_ne!(dedup_fingerprint(&a), dedup_fingerprint(&b));
+        // Same password over a different cipher is a different ss node too.
+        let ss1 = json!({"name": "c", "type": "ss", "server": "s.example", "port": 8388,
+                         "cipher": "aes-128-gcm", "password": "pw"});
+        let ss2 = json!({"name": "d", "type": "ss", "server": "s.example", "port": 8388,
+                         "cipher": "chacha20-ietf-poly1305", "password": "pw"});
+        assert_ne!(dedup_fingerprint(&ss1), dedup_fingerprint(&ss2));
+        // A different port is a different dial, whatever the credential says.
+        let mut other_port = ss1.clone();
+        other_port["port"] = json!(8389);
+        assert_ne!(dedup_fingerprint(&ss1), dedup_fingerprint(&other_port));
+    }
+
+    #[test]
+    fn a_proxy_without_a_known_credential_keeps_its_full_fingerprint_as_the_dedup_key() {
+        // No uuid/password/psk/auth: merging would be a guess, so the key
+        // degrades to the full fingerprint -- which still merges true mirrors
+        // and refuses to merge anything else.
+        let bare = json!({"name": "x", "type": "ss", "server": "s", "port": 1});
+        let mut renamed = bare.clone();
+        renamed["name"] = json!("y");
+        assert_eq!(dedup_fingerprint(&bare), dedup_fingerprint(&renamed));
+        assert_eq!(dedup_fingerprint(&bare), fingerprint_proxy(&bare));
+        let mut different = bare.clone();
+        different["server"] = json!("t");
+        assert_ne!(dedup_fingerprint(&bare), dedup_fingerprint(&different));
+        // Malformed entries stay droppable, not fatal.
+        assert_eq!(dedup_fingerprint(&json!(null)).len(), 16);
+        assert_eq!(dedup_fingerprint(&json!("nope")).len(), 16);
     }
 
     #[test]
