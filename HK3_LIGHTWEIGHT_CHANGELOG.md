@@ -57,3 +57,16 @@
 - **测试**：新 21 用例全绿；全量 `python -m unittest discover -s tests` → **661 OK (skipped=2)**（605 基线 + P1 35 + P2 21）；py_compile 四文件 OK；`tools/scan_secrets.py --include-untracked` clean。
 - **既有断言修正**：test_logic.py MigrationTest 2 处 glob 排除 `.bak-v3-*`（v3 快照是指导 §12 要求的备份，允许与旧 rebuild 备份并存）。
 - **回滚**：git revert 本次改动；删除 `data/config.json.bak-v3-*`、`data/state.db.bak-v3-*` 与三张新表即可（旧版忽略新表）。
+
+## P1/P2-R1 — Wave 1 审查观察项收口（2026-11-05）
+
+- **执行者**：主 Agent（依据独立审查 Agent 8d595bfd 报告观察项 1）
+- **文件**：`mihomo_test/config.py`、`tests/test_config_v3.py`。
+- **变更**：`validate_config_v3` 的 probes[] 条目校验由「四个已知明文字段名黑名单」升级为「键白名单」——新增 `PROBE_ENTRY_KEYS`（id/name/enabled/endpoint/token_env/weight/tags，指导 §3 探测点形状），未列出的键一律拒绝；新增 1 条用例（authorization/apikey/access_key/cookie 拒绝）。
+- **原因**：审查发现黑名单拦不住非标准命名的敏感键，运维手写后会过闸并随 /api/status 到前端（低危，默认 probes=[] 需误配才触发）。白名单 fail-closed，与 normalize_sources 同范式。
+- **影响**：手写配置多写键会被拒（fail-closed，方向正确）；DEFAULTS 与迁移产物只产白名单内键，无误拒。
+- **风险**：低。
+- **测试**：`tests.test_config_v3` 22 OK；全量 **662 OK (skipped=2)**（661 + 新 1）。
+- **审查**：审查 Agent 报告 A-G 全通过、无阻断项后实施。
+- **回滚**：git revert 本次改动。
+- **审查报告存档要点**：A §3 五条代码+测试双侧钉死；B §12 三表 SQL 逐字一致、备份在前、nodes 不重建；C §7 八条 35 用例读断言核实（引擎级全走真实状态机+真实 SQLite，mock 仅在网络/内核边界）；D §13 新键无泄漏路径（本条目收口其唯一缺口）；E CHANGELOG 数字与独立复跑一致（56/661）；F 独立复跑通过；G 迁移必然落盘、既有合法配置不误拒、probes=[] 一致性由全量回归实证。观察项 2（executescript 未显式单事务，与既有 SCHEMA 同范式）与 3（v2 显式 manual_push_only=false 迁移置 true 且有报告，属升级路径合理裁决）记录不改。

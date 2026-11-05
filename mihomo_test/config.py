@@ -42,6 +42,12 @@ SOURCE_KINDS = ("collection", "sub")
 PROBE_ID_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{1,31}$')
 ENV_NAME_RE = re.compile(r'^[A-Z][A-Z0-9_]*$')
 PROBE_PLAINTEXT_TOKEN_KEYS = ("token", "secret", "api_key", "password")
+# probes[] 条目的合法键（指导 §3）。白名单外的键一律拒绝：一个不在名单里的
+# 敏感键名（authorization/apikey/...）会绕过明文字段拦截并随 /api/status
+# 泄漏到前端。
+PROBE_ENTRY_KEYS = frozenset({
+    "id", "name", "enabled", "endpoint", "token_env", "weight", "tags",
+})
 
 
 def safe_key(value, fallback="src"):
@@ -589,6 +595,16 @@ def validate_config_v3(cfg):
     for index, entry in enumerate(probes):
         if not isinstance(entry, dict):
             raise ValueError(f"probes[{index}] 必须是对象")
+        # 键白名单（指导 §3 的探测点形状）。只拦四个已知敏感键名不够：
+        # 运维手写 `authorization`/`apikey`/`access_key` 会过闸并随
+        # /api/status 到前端。白名单 fail-closed——未列出的键一律拒绝，
+        # 与 normalize_sources 的白名单重建同范式。
+        unknown = sorted(set(entry) - PROBE_ENTRY_KEYS)
+        if unknown:
+            raise ValueError(
+                f"probes[{index}] 含未知键 {unknown}：只允许 "
+                f"{sorted(PROBE_ENTRY_KEYS)}（token 只能经 token_env 引用"
+                "环境变量，指导 §3）")
         probe_id = entry.get("id")
         if not isinstance(probe_id, str) or not PROBE_ID_RE.match(probe_id):
             raise ValueError(

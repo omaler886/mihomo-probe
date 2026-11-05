@@ -139,6 +139,15 @@ class ValidateConfigV3Test(unittest.TestCase):
                 cfgmod.validate_config_v3(
                     self._cfg(probes=[{"id": "hk3-a", key: "x"}]))
 
+    def test_unknown_probe_keys_are_refused(self):
+        """白名单（Wave 1 审查观察项 1）：非标准命名的敏感键——如
+        `authorization`/`apikey`/`access_key`——不在四个明文字段名里，
+        会过闸并随 /api/status 到前端。未列出的键一律拒绝。"""
+        for key in ("authorization", "apikey", "access_key", "cookie"):
+            with self.assertRaises(ValueError, msg=key):
+                cfgmod.validate_config_v3(
+                    self._cfg(probes=[{"id": "hk3-a", key: "x"}]))
+
     def test_valid_probes_pass(self):
         cfg = self._cfg(probes=[
             {"id": "hk3-a", "name": "HK3 主探测点", "enabled": True,
