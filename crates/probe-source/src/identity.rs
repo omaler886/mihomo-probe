@@ -160,6 +160,13 @@ fn to_python_json(value: &Value) -> String {
     String::from_utf8(buf).expect("serde_json emits UTF-8")
 }
 
+/// `json.dumps(value, sort_keys=True, ensure_ascii=False)` for callers that
+/// need Python-serialized bytes beyond the fingerprint itself — the canonical
+/// connection digest hashes exactly this byte string (workstreams/24).
+pub fn to_python_json_sorted(value: &Value) -> String {
+    to_python_json(&sort_recursively(value))
+}
+
 /// serde_json's default formatter is compact; Python's `json.dumps` default is
 /// `separators=(', ', ': ')`. Only the two separators differ.
 struct PythonJson;

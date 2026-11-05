@@ -668,7 +668,10 @@ fn close_dialers(
 /// begin with a bracket, so a name already carrying a flag emoji grew one tag
 /// per round inside a self-feeding collection. This strips any number of region
 /// tags and flag emojis, in any order, separated by optional spaces.
-fn strip_leading_region_tags(name: &str) -> &str {
+///
+/// `pub(crate)`: the canonical builder (G-1) reuses this exact semantics for
+/// its sort key and rename display name — one strip, one behavior.
+pub(crate) fn strip_leading_region_tags(name: &str) -> &str {
     let mut rest = name;
     loop {
         let trimmed = rest.trim_start();

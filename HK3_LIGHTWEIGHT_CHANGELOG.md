@@ -175,3 +175,17 @@
 - **回滚**：git revert 本批；B6/B7 产物入库不携带任何行为。
 - **交接**：HK3 工程闭环。后续 = Rust 平价（21 号 G-1→G-4 移植，另立批次）。
 
+## G1-R1 — Rust 移植 G-1：canonical 唯一产物模型（2026-11-06）
+
+- **执行者**：实现 Agent（G-1，workstreams/24）
+- **文件**：新增 `crates/probe-engine/src/canonical.rs`（约 400 行）、`crates/probe-engine/tests/canonical_invariants.rs`（15 用例）、`workstreams/24_RUST_G1_CANONICAL.md`（简报+验收映射+裁决）；修改 `crates/probe-engine/src/lib.rs`（注册模块）、`crates/probe-engine/src/publish.rs`（`strip_leading_region_tags` 改 pub(crate)）、`crates/probe-source/src/identity.rs`（新增 `to_python_json_sorted` 公开包装）、`workstreams/21_RUST_PARITY.md`（G-1 标记 Rust 已落地）。Python 侧零改动。
+- **变更**：`build_canonical(sources, rename_config) -> Option<CanonicalArtifact>`——多来源按连接参数指纹去重（首来源为主、其余记 source_aliases）→ 固定排序（country→protocol→normalized name→fp）→ 重命名只动 name（模板受控子集：已知占位符/`{{}}`转义/未知回退显示名；冲突 ` #2/#3`）→ 组拓扑合并（重名组保首个、成员剔除缺失项）→ 复用 `render_clash_meta` 渲染；meta 携带 count/digest/content_sha256/renames/source_aliases。**digest 跨实现同字节串**：复用 identity 的 Python 兼容序列化，测试钉住 Python `_proxy_digest` 直算值 `fd73535266…`。空输入返回 None（上一稳定产物站住）。
+- **原因**：21 号平价缺口 G-1（指导 §8 去重保证 / §18-2）。
+- **影响**：Rust 侧获得 canonical 模型（纯函数，未接发布链路——接线属 G-2 批次）；Python 行为零变化。
+- **风险**：低。新增模块 + 两处可见性放宽（pub/pub(crate)），既有 709 用例不回退。
+- **测试**：`cargo test --locked --workspace` → **724 passed / 0 failed**（29 个测试目标，含新增 15）；`cargo clippy -D warnings` 通过；`cargo fmt --all -- --check` 通过。验收映射（15 条行为↔指名测试）见 workstreams/24 §2。
+- **审查**：待独立审查 Agent 复核（下一波）。
+- **回滚**：git revert 本批（纯新增模块，无数据交互）。
+- **交接**：G-2 = 四文件 Gist 布局对接 probe-publish（round 产出 → canonical → 存储/发布引擎级接线 + 场景测试）；G-3 聚合、G-4 人工推送随后。
+
+

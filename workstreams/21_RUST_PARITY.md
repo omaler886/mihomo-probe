@@ -22,7 +22,7 @@
 
 | # | 能力 | Python 侧状态 | Rust 侧状态 |
 |---|---|---|---|
-| G-1 | canonical 唯一订阅产物（`data/exports/mihomo-alive.yaml` + meta） | P4 已落地（canonical_export.py + engine 接线） | 无对应物：Rust 发布模型是 per-source `<key>.yaml`+manifest（20_PLAN 裁决 1 已记录） |
+| G-1 | canonical 唯一订阅产物（`data/exports/mihomo-alive.yaml` + meta） | P4 已落地（canonical_export.py + engine 接线） | **已落地（G1-R1，workstreams/24）**：`probe-engine::canonical` 纯函数模型 + 15 条不变量测试，digest 跨实现同字节串；发布链路接线属 G-2 |
 | G-2 | Gist 固定四文件 + canonical 幂等门禁（digest 未变零 PATCH） | P4 已落地（gist_store.py） | probe-publish 有 sha 幂等，但文件模型不同（G-1 的下游） |
 | G-3 | 多探测点聚合（probes[]/aggregation/any_alive + probe agent CLI） | P3 已落地 | 无（Rust scheduler 是单进程本地模型） |
 | G-4 | 人工 Sub-Store 推送三件套（preview/confirm-token/push） | **P5 已落地**（manual_publish.py 三步 + 防重放 + 删自动回灌；P6 发布中心 UI） | 无（Rust 有自动 push 双门禁，语义不同） |
