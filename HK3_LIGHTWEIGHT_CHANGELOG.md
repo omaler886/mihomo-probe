@@ -70,3 +70,35 @@
 - **审查**：审查 Agent 报告 A-G 全通过、无阻断项后实施。
 - **回滚**：git revert 本次改动。
 - **审查报告存档要点**：A §3 五条代码+测试双侧钉死；B §12 三表 SQL 逐字一致、备份在前、nodes 不重建；C §7 八条 35 用例读断言核实（引擎级全走真实状态机+真实 SQLite，mock 仅在网络/内核边界）；D §13 新键无泄漏路径（本条目收口其唯一缺口）；E CHANGELOG 数字与独立复跑一致（56/661）；F 独立复跑通过；G 迁移必然落盘、既有合法配置不误拒、probes=[] 一致性由全量回归实证。观察项 2（executescript 未显式单事务，与既有 SCHEMA 同范式）与 3（v2 显式 manual_push_only=false 迁移置 true 且有报告，属升级路径合理裁决）记录不改。
+
+## P3-1 — 观察聚合层 + engine 接线 + front_dead 语义修复（2026-11-05）
+
+- **执行者**：实现 Agent（P3a）
+- **文件**：新增 `mihomo_test/aggregation.py`（约 340 行纯函数）、`tests/test_aggregation.py`（57 用例）；修改 `mihomo_test/engine.py`（12 个函数/接线点）、`tests/test_logic.py`（5 处 front_dead 断言修正）。
+- **变更**：
+  1. **aggregation.py**：`aggregate_round`（§4.3 三规则：任一活即活 → 全败且达 minimum 才判败 → 不足则 inconclusive；探测点离线/未知/digest 不符/超时未回传 = 观测缺失不计完成数）；`normalize_observation`/`local_observation`（probe_id="local"）/`filter_observations`（round/known_probes/digest 校验，违规只入 rejected 不采用）；聚合完成才对每节点每轮跑一次 policy.apply。
+  2. **engine 接线**：`config_digest(cfg)`（DIGEST_SECTIONS 六段，Job 与 API 共用）；`_probe_jobs`/`_dispatch_probe_jobs`（契约钩子，延迟 import probe_dispatch，缺模块/异常 → warn 返回 {} 不让轮次失败）；`_collect_probe_observations`（在 publish 阶段下发 Job → 轮询回传 → 落 local 观测 → 聚合；等待窗口夹紧到轮次剩余预算，探测点全离线不阻塞）；`_converge_bucket` 增可选 observation 参数（inconclusive 不推 streak，写 results 行 inconclusive/insufficient_probes）；`_apply_and_publish` 走 `_round_observations` 聚合。
+  3. **front_dead 修复（§5.4）**：`_record_chain_failures` 去掉 policy.apply——results 行照写 fail+front_dead+chain，节点行只刷 display/proto/server/category，status/consec_fail 原样保留。同步修正 test_logic.py 5 处旧断言（3744/3759/3769/4441/4527）为新语义，均带 §5.4 注释。
+  4. **灰度第 1 步（§16）**：probes==[] → 不下发不等待，只落一条 local 观测，节点结论与改造前逐字段一致（用例直接对比 `_score_bucket`+`_resolve_exit` 手算结果）。
+- **原因**：指导 §15 Phase 3 + §4.3 聚合门禁 + §5.4 前置失败不推进目标死亡计数。
+- **影响**：front_dead 不再推进 streak（行为变更，指导明文要求）；多探测点接入但默认 probes=[] 行为不变；本地诊断信息（ip_alive/detail/attempts）仍由 _score_bucket 取。
+- **风险**：中。engine 核心改动；已用 57 新用例 + P1 35 契约用例 + 605 基线回归锁死。
+- **测试**：`tests.test_aggregation` 57 OK；全量 **770 OK (skipped=2)**（662 + P3a 57 + P3b ~51）。
+- **回滚**：git revert 本批。
+- **与 P3b 的接口裁决（§17.8）**：① dispatch_round 返回 `{probe_id: "ok"|"err"}`，`_dispatched_probe_ids` 兼容、err 状态绝不等待；② probe_observations.payload_digest 存 ProbeResult 整体 sha256 而非 config_digest，config_digest 校验交还 API 层（verify_result 在唯一拥有完整报文处比对报文自带 config_digest），本地单探测点模式下引擎侧才严格拒绝。已记入代码注释与用例。
+- **已知限制**：真实多探测点端到端需 agent CLI + 可达探测点（P3b 交付后联调）；无 docker，compose 集成 NOT_RUN。
+
+## P3-2 — 探测点分发 + Probe Agent 模式 + Controller API（2026-11-05）
+
+- **执行者**：实现 Agent（P3b）
+- **文件**：新增 `mihomo_test/probe_dispatch.py`（525 行）、`tests/test_probe_dispatch.py`（1138 行，53 用例）；修改 `mihomo_test/server.py`（+约 330 行）、`mihomo_test/__main__.py`（agent 子命令）。engine.py/aggregation.py/config.py/db.py/web/ 零改动。
+- **变更**：
+  1. **probe_dispatch**：`dispatch_round`（urllib POST 每 Job 到 endpoint+"/jobs"；Bearer token 取自 probes[].token_env + X-Probe-Timestamp + X-Probe-Signature（HMAC-SHA256，body+5 分钟时间窗）+ Content-Type；超时/连接失败/5xx/缺 token/非 HTTPS endpoint 全部 warn 后 continue 不抛，观测缺失由聚合层当「未完成」兜底；token 与请求体凭据从不进日志）；`verify_result`（BAD_PAYLOAD→ROUND_STALE→UNKNOWN_PROBE→DIGEST_MISMATCH→RESULT_LATE 五项校验，违规只 db.log 审计、绝不落观测/推进死亡计数；合法则 record_observation 幂等 + touch_probe_seen；deadline 落盘 data/probe_deadlines.json 跨重启仍拦过期回传）；`sign_request/verify_signature`（纯函数，compare_digest）；`config_digest`（优先 engine 版，回退六 section 逐字对齐，等价性有测试钉死）。
+  2. **server /api/v1 路由 11 条**：读（admin）dashboard / rounds?limit / rounds/{id} / nodes?q&status&proto&source&page&page_size / probes（db∪cfg 合并视图，不回显 token）；写（probe token，Bearer 常量时间比较，与 admin 两套互不通）heartbeat / jobs/{round_id}/result；写（admin）gist/publish + substore/{preview,confirm-token,push}（501/PUSH_CONFIRM_REQUIRED 占位，P4/P5 落地，写 publish_audit）。写接口统一鉴权+Content-Type(415)+体积上限(413)+审计 ID(uuid4)+稳定错误码。
+  3. **agent 模式**：`python -m mihomo_test agent --id --token-env [--port --controller ...]`；GET /healthz、POST /jobs（验签后 202、后台单工作线程、并发 409 BUSY）→ core.prepare/build_config 到临时目录 → 一次性内核容器 → Core.delay 逐节点 → 组 ProbeResult（egress_country=null）→ 回传 Controller → finally 停容器+rmtree 临时配置、启动清扫；agent 分支先于 cfgmod.load()——不连 Sub-Store、不写 Gist、不读业务配置。
+- **原因**：指导 §15 Phase 3 + §4.1/§4.2 Job 下发/结果回传 + §10 API 契约 + §13 安全。
+- **影响**：新增面，不改既有 /api/* 路由与状态机；payload_digest=整个 ProbeResult 的 sha256，config_digest 校验在 API 层（与 P3a 分工）。
+- **风险**：低（全部新增代码路径，engine 侧降级/异常均 warn 不失败）。
+- **测试**：本模块 53 OK；全量 **772 OK (skipped=2)**（770 + 2 个 digest 对齐用例）；scan_secrets clean；socket stderr 噪音 0（修了 addCleanup LIFO 与超时桩点两处根因）。
+- **回滚**：git revert 本批；data/probe_deadlines.json 可删，不影响账本。
+- **交接**：dashboard 的 gist/substore 时间戳与 gist/publish、substore 三口为 501/null 占位，P4/P5 填。

@@ -13,6 +13,7 @@ import urllib.request
 
 import yaml
 
+from . import aggregation
 from . import config as cfgmod
 from . import core as coremod
 from . import doh as dohmod
@@ -178,6 +179,406 @@ CATEGORIES = (CAT_DIRECT, CAT_RELAY, CAT_CHAIN)
 CATEGORY_LABELS = {CAT_DIRECT: "直连节点", CAT_RELAY: "中转节点", CAT_CHAIN: "链式代理"}
 
 _round_lock = threading.Lock()
+
+# Sections of `config.json` a probe's verdict depends on (指导 §4.1). The
+# digest travels with every Job and comes back on every ProbeResult, so a
+# result measured against a config this Controller no longer holds can be
+# refused instead of folded into the ledger. Deliberately NOT `sources`,
+# `publish` or `substore`: a node's alive/fail verdict cannot change because
+# an export switch moved, and hashing them would invalidate every in-flight
+# probe for a reason that has nothing to do with the measurement.
+DIGEST_SECTIONS = ("probes", "aggregation", "chain", "test", "policy", "verify")
+
+
+def config_digest(cfg):
+    """`sha256:<hex>` over the config sections a probe's verdict depends on.
+
+    Stable across processes (sorted keys, compact separators) because the
+    Probe Agent computes nothing -- it echoes the digest the Job carried -- and
+    the API side must be able to recompute the same value to refuse a stale
+    result (指导 §4.2). Shared with P3b: `probe_dispatch` imports this rather
+    than keeping a second implementation that could drift.
+    """
+    sections = {}
+    for key in DIGEST_SECTIONS:
+        block = (cfg or {}).get(key)
+        if block is not None:
+            sections[key] = block
+    blob = json.dumps(sections, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"), default=str)
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _enabled_probes(cfg):
+    """The probes a round must collect from. `[]` = 本地单探测点兼容模式.
+
+    An empty list is not a degenerate case to be tolerated -- it is the
+    documented 灰度第 1 步 (指导 §16): one implicit probe (`local`), one
+    observation per node, and node verdicts byte-for-byte what they were
+    before this refactor.
+    """
+    probes = [p for p in ((cfg or {}).get("probes") or [])
+              if isinstance(p, dict) and p.get("id")]
+    return [p for p in probes if p.get("enabled", True)]
+
+
+def _probe_states():
+    """`{probe_id: {"state", "age_s"}}` from the probes registry, or {}.
+
+    Read-only and best-effort: the registry is what tells a round which probes
+    are known-dark, so the wait for results does not sit out a full interval
+    for a box that has not heartbeated in days. A missing table (a ledger
+    migrated by an older build) simply means "no information", never an error.
+    """
+    try:
+        rows = db.query("SELECT probe_id, state, enabled, last_seen_at FROM probes")
+    except Exception:  # noqa: BLE001 - diagnostics only; never fail a round
+        return {}
+    now = time.time()
+    out = {}
+    for row in rows:
+        probe_id = row.get("probe_id")
+        if not probe_id:
+            continue
+        age = now - _stored_epoch(row.get("last_seen_at")) \
+            if _stored_epoch(row.get("last_seen_at")) else None
+        out[str(probe_id)] = {
+            "state": ("disabled" if not row.get("enabled")
+                      else (row.get("state") or "unknown")),
+            "age_s": age,
+        }
+    return out
+
+
+def _iso_stamp(offset_s=0):
+    """UTC ISO8601, the shape `db.now()` writes and `_stored_epoch` reads."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S",
+                         time.gmtime(time.time() + max(0, offset_s)))
+
+
+def _probe_jobs(cfg, round_id, by_name, proxies, deadline_iso):
+    """One lightweight Job per enabled probe (指导 §4.1).
+
+    `nodes` carries only what a probe needs to re-measure: the ledger
+    fingerprint, the kernel-facing name and the proxy itself. Nothing here is
+    persisted by the probe -- `probe_dispatch` is responsible for cleaning up
+    whatever it materialises.
+    """
+    digest = config_digest(cfg)
+    chain_enabled = bool((cfg.get("chain") or {}).get("enabled"))
+    proxy_by_mihomo = {p.get("name"): p for p in (proxies or []) if isinstance(p, dict)}
+    nodes = []
+    for mihomo, entry in (by_name or {}).items():
+        proxy = proxy_by_mihomo.get(mihomo) or entry.get("orig_proxy") \
+            or entry.get("proxy") or {}
+        nodes.append({"fingerprint": entry.get("fp"),
+                      "mihomo_name": mihomo,
+                      "proxy": proxy})
+    jobs = []
+    for probe in _enabled_probes(cfg):
+        jobs.append({
+            "round_id": str(round_id),
+            "probe_id": probe["id"],
+            "config_digest": digest,
+            "deadline": deadline_iso,
+            "chain_enabled": chain_enabled,
+            "nodes": nodes,
+        })
+    return jobs
+
+
+def _dispatch_probe_jobs(cfg, round_id, jobs, log):
+    """Hook into `probe_dispatch` (P3b). Never fails a round.
+
+    Deliberately a late import inside the function: `probe_dispatch` owns the
+    HTTP side of the probe protocol and is developed in parallel with this
+    module. Until it exists -- or if it raises -- the round logs and carries on
+    with the Controller's own measurement, which is exactly the 本地单探测点
+    compatibility mode (指导 §16).
+
+    Returns whatever `dispatch_round` returns; an empty result means "no probe
+    took the job", which the caller reads as "nothing to wait for".
+    """
+    try:
+        from . import probe_dispatch
+        return probe_dispatch.dispatch_round(cfg, round_id, jobs, log)
+    except ImportError:
+        log("warn", "probe_dispatch 未安装，本轮仅使用本地探测点测量"
+                    "（本地单探测点兼容模式，指导 §16）")
+        return {}
+    except Exception as exc:  # noqa: BLE001 - a probe transport failure is not
+        # a node verdict and must never abort a round that already measured
+        # everything locally.
+        log("warn", f"探测点任务下发失败（不影响本轮，仅用本地测量）: "
+                    f"{type(exc).__name__}: {exc}")
+        return {}
+
+
+def _digest_gate():
+    """Who owns the config-digest check for this deployment, or None.
+
+    `probe_dispatch.verify_result` enforces 指导 §4.2's digest rule at the API
+    boundary -- the only place the whole ProbeResult exists -- and stores a
+    *payload* digest in `probe_observations.payload_digest`, which the
+    aggregation layer cannot recompute. Naming it here lets
+    `aggregation.filter_observations` defer the check there instead of refusing
+    every remote observation over a column convention. When `probe_dispatch` is
+    absent (本地单探测点兼容模式, or P3b not deployed) this process is the only
+    gate, so the engine enforces the rule itself.
+    """
+    try:
+        from . import probe_dispatch  # noqa: F401 - presence is the whole point
+    except Exception:  # noqa: BLE001 - an unimportable dispatch module means
+        return None   # there is no API gate to defer to
+    return "probe_dispatch.verify_result"
+
+
+def _audit_rejected(rejected, deferred, log):
+    """One audit line per refused observation (指导 §4.2: audit, never a streak).
+
+    `deferred` rows are *used*, not refused -- see
+    `aggregation.filter_observations`'s `digest_gate`. They get one summary line
+    so the round log says which layer made the digest decision.
+    """
+    for item in rejected or []:
+        row = item["observation"]
+        log("warn", f"观测不采用（{item['why']}）: probe={row['probe_id']} "
+                    f"fp={row['fingerprint'][:8]} round={row['round_id']}")
+    if deferred:
+        log("warn", f"{len(deferred)} 条观测的 payload_digest 无法在本层重算，"
+                    f"由 {deferred[0]['gate']} 在 API 侧校验（指导 §4.2）")
+
+
+def _dispatched_probe_ids(result, expected):
+    """Which probes actually took a job, from `dispatch_round`'s return value.
+
+    Permissive on purpose, and deliberately so: `probe_dispatch` returns
+    `{probe_id: "ok" | "err"}` (its own docstring's shape), which is not the
+    `{"dispatched": [...]}` envelope a reader of this function alone would
+    guess. A hook that silently stops waiting because it could not parse a
+    success report looks exactly like a probe that never answered -- and the
+    round then converges on the local measurement alone, which is a silent
+    downgrade rather than a visible one.
+
+    So the shapes handled are, in order: an explicit list/count under a known
+    key, a `{probe_id: status}` map (P3b's actual shape), and finally "everything
+    expected". A probe whose status says it failed is never waited for.
+    """
+    expected = set(expected or ())
+    if not result:
+        return set()
+    if isinstance(result, (list, tuple, set)):
+        return {str(p) for p in result if p}
+    if isinstance(result, int) and not isinstance(result, bool):
+        return set(expected) if result > 0 else set()
+    if not isinstance(result, dict):
+        return set(expected)
+    for key in ("dispatched", "accepted", "probes", "jobs", "probe_ids"):
+        value = result.get(key)
+        if isinstance(value, (list, tuple, set)):
+            return {str(p) for p in value if p}
+        if isinstance(value, dict):
+            return {str(p) for p in value if p}
+        if isinstance(value, int) and not isinstance(value, bool):
+            return set(expected) if value > 0 else set()
+    # An explicit success count plus an explicit failure list.
+    ok_count = result.get("ok")
+    if isinstance(ok_count, int) and not isinstance(ok_count, bool):
+        bad = {str(p) for p in (result.get("failed") or result.get("errors") or [])
+               if p}
+        return {p for p in expected if p not in bad} if ok_count else set()
+    # `{probe_id: "ok" | "err"}` -- probe_dispatch.dispatch_round's shape.
+    picked = {str(k) for k, v in result.items() if k and _status_means_sent(v)}
+    if picked:
+        return picked
+    named = {str(k) for k in result if k}
+    return set() if named else set(expected)
+
+
+# Statuses that mean "this probe never got the job". Anything else -- including
+# a status word this module has never seen -- counts as sent, because waiting
+# for a probe that did take the job only costs time, while not waiting for it
+# silently drops its observations from the round.
+_NOT_SENT_STATUSES = {"err", "error", "failed", "fail", "skipped", "skip",
+                      "rejected", "refused", "denied", "timeout", "offline",
+                      "disabled", "unknown", "no", "false", "400", "401", "403",
+                      "404", "429", "500", "502", "503", "504"}
+
+
+def _status_means_sent(value):
+    if value is None or value is True:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return 200 <= value < 300
+    if isinstance(value, str):
+        return value.strip().lower() not in _NOT_SENT_STATUSES
+    return True
+
+
+def _record_local_observations(cfg, round_id, by_name, proxies, results, countries,
+                               log=None):
+    """Store the Controller's own measurement as one `local` observation.
+
+    Same formula `_converge_bucket` uses when it is handed no observation, so
+    the two paths cannot drift: whatever the aggregation layer concludes from
+    this row is exactly what the pre-refactor engine concluded directly.
+    """
+    excluded = {c.upper() for c in verify_cfg_excludes(cfg)}
+    domain_pass = str((cfg.get("verify") or {}).get("domain_pass", "any")).lower()
+    digest = config_digest(cfg)
+    written = 0
+    for bucket in group_by_fingerprint(results, by_name).values():
+        fingerprint = bucket["entry"]["fp"]
+        ok, delay, reason, _detail, _ip_alive, _ip_total = _score_bucket(
+            bucket, domain_pass)
+        country, exit_failure = _resolve_exit(countries, bucket["names"], excluded)
+        if ok and exit_failure:
+            # The node answers but egresses somewhere we refuse to publish, so
+            # it does not count as alive this round -- recorded as such, not as
+            # a measurement the probe never made.
+            ok, reason = False, exit_failure
+        db.record_observation(round_id, aggregation.LOCAL_PROBE_ID, fingerprint,
+                              ok, delay, reason, country, digest)
+        written += 1
+    if written and log:
+        log("info", f"本地探测点观测已落库: {written} 个节点")
+    return written
+
+
+def _collect_probe_observations(cfg, round_id, by_name, proxies, results, countries,
+                                deadline, log):
+    """Dispatch this round's ProbeJobs, wait for their observations, record local.
+
+    Called from `_run_round` after egress verification and before
+    `_apply_and_publish`, which is the only place that knows both the round's
+    measurements and the round's remaining budget.
+
+    `probes == []` (本地单探测点兼容模式) skips dispatch and waiting entirely:
+    there is nobody to ask, so the local measurement is the round.
+
+    Returns a small summary dict for the round log; the observations themselves
+    live in `probe_observations`, keyed by (round_id, probe_id, fingerprint),
+    which is what makes a re-report idempotent (指导 §2).
+    """
+    try:
+        return _collect_probe_observations_inner(
+            cfg, round_id, by_name, proxies, results, countries, deadline, log)
+    except Exception as exc:  # noqa: BLE001 - observation collection is an
+        # optimisation over the local measurement, never a reason to lose a
+        # round that has already measured every node.
+        log("warn", f"探测点观测收集失败（本轮仅用本地测量）: "
+                    f"{type(exc).__name__}: {exc}")
+        return {"dispatched": [], "collected": [], "local": 0}
+
+
+def _collect_probe_observations_inner(cfg, round_id, by_name, proxies, results,
+                                      countries, deadline, log):
+    probes = _enabled_probes(cfg)
+    if not probes:
+        # 灰度第 1 步 (指导 §16): no probe registry means one implicit probe.
+        # Nothing is dispatched and nothing is waited for; the local
+        # measurement is recorded and aggregated as the single observation, so
+        # the node verdict is byte-for-byte what it was before this refactor.
+        written = _record_local_observations(
+            cfg, round_id, by_name, proxies, results, countries, log)
+        return {"dispatched": [], "collected": [aggregation.LOCAL_PROBE_ID],
+                "local": written}
+
+    digest = config_digest(cfg)
+    aggregation_cfg = cfg.get("aggregation") if isinstance(cfg.get("aggregation"), dict) else {}
+    late = aggregation_cfg.get("late_result_seconds")
+    try:
+        late = max(0, int(late))
+    except (TypeError, ValueError):
+        late = 90
+    interval = (cfg.get("probe_policy") or {}).get("interval_minutes")
+    try:
+        interval = max(1, int(interval))
+    except (TypeError, ValueError):
+        interval = 30
+
+    deadline_iso = _iso_stamp(interval * 60)
+    jobs = _probe_jobs(cfg, round_id, by_name, proxies, deadline_iso)
+    dispatched = _dispatched_probe_ids(
+        _dispatch_probe_jobs(cfg, round_id, jobs, log), [p["id"] for p in probes])
+    if dispatched:
+        log("info", f"已向 {len(dispatched)} 个探测点下发第 {round_id} 轮任务"
+                    f"（截止 {deadline_iso}）")
+    else:
+        log("warn", "没有探测点接受本轮任务，仅使用本地测量"
+                    "（本地单探测点兼容模式，指导 §16）")
+
+    known = set(dispatched) | {p["id"] for p in probes} | {aggregation.LOCAL_PROBE_ID}
+    states = _probe_states()
+    # A probe that has not heartbeated in two intervals is not going to answer
+    # this round either; waiting out the full window for it would stall every
+    # round on a box that has been dark for days. A probe with no registry row
+    # at all is still waited for once -- it may simply not have heartbeated yet.
+    stale_after = 2 * interval * 60
+    waitable = {p for p in dispatched if not _probe_is_dark(states.get(p), stale_after)}
+    collected = set()
+    if waitable:
+        window = max(0.0, _stored_epoch(deadline_iso) + late - time.time())
+        # The wait is clamped to what is left of the round budget: a probe that
+        # is slow must not get the round killed by its own watchdog, which
+        # would throw away every verdict already measured. A caller with no
+        # budget to report (a direct call outside `_run_round`) is not clamped
+        # -- "unknown" is not "none left".
+        reserve = 60.0
+        budget_left = ((deadline - time.monotonic() - reserve)
+                       if deadline is not None else window)
+        wait_s = max(0.0, min(window, budget_left))
+        if wait_s < window:
+            log("warn", f"探测点等待窗口被轮次预算压窄: {window:.0f}s -> {wait_s:.0f}s")
+        if wait_s <= 0:
+            log("warn", "轮次预算不足，本轮不等待探测点回传")
+        else:
+            log("info", f"等待探测点回传（最多 {wait_s:.0f}s，需 {len(waitable)} 个）")
+            deadline_at = time.monotonic() + wait_s
+            while True:
+                accepted, rejected, deferred = aggregation.filter_observations(
+                    db.get_observations(round_id), round_id=round_id,
+                    known_probes=known, config_digest=digest,
+                    digest_gate=_digest_gate())
+                _audit_rejected(rejected, deferred, log)
+                collected = {r["probe_id"] for r in accepted
+                             if r["probe_id"] != aggregation.LOCAL_PROBE_ID}
+                if collected >= waitable or time.monotonic() >= deadline_at:
+                    break
+                time.sleep(1.0)
+            missing = sorted(waitable - collected)
+            if missing:
+                # 指导 §4.3: a probe that never answered is not a node
+                # failure. It is simply absent from the observations, so it
+                # never counts towards `minimum_completed_probes` -- which is
+                # the whole guard against "探测点越多，节点死得越快".
+                log("warn", f"{len(missing)} 个探测点本轮未回传，不计入完成数: "
+                            + "、".join(missing))
+    written = _record_local_observations(
+        cfg, round_id, by_name, proxies, results, countries, log)
+    return {"dispatched": sorted(dispatched), "collected": sorted(collected),
+            "local": written}
+
+
+def _probe_is_dark(state, stale_after_s):
+    """True when the registry says this probe will not answer this round.
+
+    `state` is one `_probe_states()` value. Named for grep-ability: this is the
+    one place a round decides a probe is dark, and it is deliberately
+    conservative -- an unknown probe is waited for, because a box that has
+    never heartbeated may simply be starting up.
+    """
+    if not state:
+        return False
+    if state.get("state") == "disabled":
+        return True
+    age = state.get("age_s")
+    if age is not None and stale_after_s and age > stale_after_s:
+        return True
+    return False
+
 
 # The round this process currently has open. `_abandon_round` used to recover
 # the id solely from round.state.json, so a crash on a machine where that file
@@ -1370,6 +1771,13 @@ def _run_round(cfg, trigger, only_source, log, mode=None):
 
     _checkpoint(deadline, "publish", round_id)
     _set_phase("publish")
+    # Phase 3 (指导 §15): collect this round's observations *before* converging,
+    # so `_apply_and_publish` folds every probe's answer into one verdict per
+    # node and calls the state machine once. With `probes` empty this is the
+    # 本地单探测点兼容模式: one `local` observation per node, no dispatch, no
+    # wait, and node verdicts identical to the pre-refactor engine.
+    _collect_probe_observations(cfg, round_id, by_name, proxies, results, countries,
+                                deadline, log)
     try:
         summary = _apply_and_publish(cfg, round_id, store, by_name, proxies, results,
                                      countries, sources, log,
@@ -1907,7 +2315,7 @@ def _score_bucket(bucket, domain_pass):
 
 
 def _converge_bucket(cfg, round_id, bucket, proxy_by_name, countries, excluded,
-                     domain_pass, log):
+                     domain_pass, log, observation=None):
     """Converge every alias of one endpoint and write the round's result rows.
 
     Returns ("drop" | "restore" | None, [alive primary names], alive category).
@@ -1915,17 +2323,56 @@ def _converge_bucket(cfg, round_id, bucket, proxy_by_name, countries, excluded,
     a failed bucket: the export uses it to publish the form that actually
     passed (a chained node whose chain failed the round but whose direct twin
     passed must go out direct, not as a chain the round just disproved).
+
+    `observation` is this fingerprint's aggregated verdict
+    (`aggregation.aggregate_round`, 指导 §4.3). When it is present the verdict,
+    latency, reason and egress country come from *every* probe that answered
+    this round rather than from this bucket's local addresses -- the Controller
+    aggregates once and calls the state machine exactly once, which is what
+    stops "探测点越多，节点死得越快". `ip_alive`/`ip_total`/`detail` stay local
+    on purpose: they describe this box's own address-level measurement, and the
+    probes do not report per-address detail.
+
+    `None` keeps the pre-refactor path verbatim -- every existing caller and
+    test passes nothing, which is what makes 灰度第 1 步 (指导 §16) a no-op.
     """
     entry = bucket["entry"]
     source, fingerprint = entry["source"], entry["fp"]
     display = entry["original"]
 
-    ok, delay, reason, detail, ip_alive, ip_total = _score_bucket(bucket, domain_pass)
-    country, exit_failure = _resolve_exit(countries, bucket["names"], excluded)
-    if ok and exit_failure:
-        # The node answers the probe but egresses somewhere we refuse to
-        # publish, so it does not count as alive this round.
-        ok, reason = False, exit_failure
+    scored_ok, scored_delay, scored_reason, detail, ip_alive, ip_total = _score_bucket(
+        bucket, domain_pass)
+    primary = bucket["names"][0]
+    category = entry.get("category") or CAT_DIRECT
+    if observation is None:
+        ok, delay, reason = scored_ok, scored_delay, scored_reason
+        country, exit_failure = _resolve_exit(countries, bucket["names"], excluded)
+        if ok and exit_failure:
+            # The node answers the probe but egresses somewhere we refuse to
+            # publish, so it does not count as alive this round.
+            ok, reason = False, exit_failure
+    else:
+        ok = bool(observation.get("alive"))
+        delay = observation.get("delay_ms")
+        reason = observation.get("reason")
+        country = observation.get("egress_country")
+
+    if observation is not None and observation.get("verdict") == aggregation.VERDICT_INCONCLUSIVE:
+        # 指导 §4.3 / §7.7: too few probes answered, so this round says nothing
+        # about the node. That is a round-level uncertainty, not a node
+        # failure: `policy.apply` is deliberately NOT called, so `status` and
+        # `consec_fail` are left exactly as the previous round left them. The
+        # results row is still written -- otherwise the node looks like it
+        # vanished from the round -- but with `inconclusive`, never `fail`.
+        db.upsert_node(source, fingerprint, display,
+                       proto=proxy_by_name[primary].get("type"),
+                       server=proxy_by_name[primary].get("server"),
+                       category=category)
+        db.record_result(round_id, source, fingerprint, display,
+                         aggregation.VERDICT_INCONCLUSIVE, None,
+                         aggregation.INSUFFICIENT_PROBES, country, 0,
+                         "探测点结果不足，本轮不判定", category=category)
+        return None, [], None
 
     node = db.get_node(source, fingerprint)
     if node is None:
@@ -1937,13 +2384,11 @@ def _converge_bucket(cfg, round_id, bucket, proxy_by_name, countries, excluded,
         fields["country"] = country
     if ip_total:
         fields.update({"ip_alive": ip_alive, "ip_total": ip_total})
-    primary = bucket["names"][0]
     fields.update({"proto": proxy_by_name[primary].get("type"),
                    "server": proxy_by_name[primary].get("server")})
     # Re-stamped every round rather than only on insert: a node moves between
     # categories when its source is re-marked as a relay, and a stale category
     # would keep feeding the old bucket forever.
-    category = entry.get("category") or CAT_DIRECT
     fields["category"] = category
     db.upsert_node(source, fingerprint, display, **fields)
 
@@ -2051,22 +2496,32 @@ def _record_rejected_nodes(cfg, round_id, entries, log):
 
 
 def _record_chain_failures(cfg, round_id, entries, log):
-    """Fail chained nodes that had no live front, without dialling them.
+    """Record chained nodes that had no live front, without dialling them.
 
     The round tests the fronts first and only then the chains, so by the time
     this runs it already knows which fronts carry traffic. A chained node whose
     every front is dead cannot succeed through any of them, so dialling it would
     burn a timeout per front to learn what the front's own result already says.
 
-    The verdict is `fail`, which is the requested rule: a chain whose front
-    carries nothing is not usable. Only the recorded reason differs from a real
-    dial -- `front_dead` instead of `timeout` -- so the dashboard blames the
-    front instead of reporting a node that was never tried as timing out. The
-    streak advances through `policy.apply` exactly as a dial failure would.
+    **前置失败是基础设施事件，不推进目标节点死亡计数**（指导 §5.4 / §4.3 /
+    §7.5）。The results row is still written -- verdict `fail`, reason
+    `front_dead`, category `chain` -- so the panel and the round history can
+    see that the chain was not carried and why. But `policy.apply` is
+    deliberately NOT called: the node's `status` and `consec_fail` are left
+    exactly as the previous round left them, and only the display / proto /
+    server / category columns are refreshed.
+
+    An earlier version advanced the streak here, so a front-pool outage killed
+    every chained node after `drop_after_consecutive_failures` rounds of a
+    problem that had nothing to do with the nodes -- precisely the
+    "探测点越多，节点死得越快" failure mode 指导 §4.3 exists to prevent, and
+    the reason the guide's §5.4 spells the rule out. The front's own health is
+    still visible: it is a tested node with ledger rows of its own
+    (`FRONT_SOURCE_KEY`), and `front_dead` on the chain names the culprit.
 
     Returns (by_source, fps) so `_prune_removed_nodes` keeps these rows: they
     are absent from `by_name` (nothing was dialled), and the complement-based
-    prune would otherwise delete them and reset the very streak being advanced.
+    prune would otherwise delete them.
     """
     by_source = collections.defaultdict(list)
     fps = collections.defaultdict(set)
@@ -2077,21 +2532,23 @@ def _record_chain_failures(cfg, round_id, entries, log):
         fps[source].add(fingerprint)
         by_source[source].append(entry)
         display = entry["original"]
-        node = db.get_node(source, fingerprint)
-        if node is None:
-            db.upsert_node(source, fingerprint, display)
-            node = db.get_node(source, fingerprint)
-        fields, _ = policy.apply(node, False, None, FRONT_DEAD_REASON, cfg["policy"])
-        fields.update({"proto": entry.get("proto"), "server": entry.get("server")})
-        # Always `chain`: this path only ever sees chained entries (they are the
-        # ones with a front to be dead). Leaving it out wrote NULL, which the
-        # stats read as `direct` -- so every chain killed by a dead front pool
-        # silently inflated 直连's failure count.
-        db.upsert_node(source, fingerprint, display, category=CAT_CHAIN, **fields)
+        # No `policy.apply`: 指导 §5.4 — 前置失败不推进目标节点死亡计数。
+        # `upsert_node` only touches the columns it is given, so status and
+        # consec_fail survive untouched while the row keeps its identity for
+        # `_prune_removed_nodes`.
+        db.upsert_node(source, fingerprint, display,
+                       proto=entry.get("proto"), server=entry.get("server"),
+                       # Always `chain`: this path only ever sees chained
+                       # entries (they are the ones with a front to be dead).
+                       # Leaving it out wrote NULL, which the stats read as
+                       # `direct` -- so every chain killed by a dead front pool
+                       # silently inflated 直连's failure count.
+                       category=CAT_CHAIN)
         db.record_result(round_id, source, fingerprint, display, "fail", None,
                          FRONT_DEAD_REASON, None, 0, "前置全部不通，链式未测",
                          category=CAT_CHAIN)
-        log("warn", f"{display}: 前置全部不通，链式判失败（{FRONT_DEAD_REASON}）")
+        log("warn", f"{display}: 前置全部不通，链式判失败（{FRONT_DEAD_REASON}，"
+                    "不计入目标节点连续失败）")
     return by_source, fps
 
 
@@ -2178,6 +2635,14 @@ def _publish_sources(cfg, store, sources, alive_by_source, proxy_by_name, countr
     at all -- then the last recorded pool from `_write_front_state` stands in.
     `alive_forms` maps source -> display -> which measured form ("chain" or
     "direct") earned the node its alive verdict this round.
+
+    Phase 4 (指导 §8): besides the per-source diagnostics it also writes the ONE
+    canonical artifact -- `data/exports/mihomo-alive.yaml` from
+    `canonical_export.build`. That is the only file Gist publishes, Sub-Store
+    manually pushes, and the subscription API serves; the per-source files stay
+    on disk for diagnosis (plan §2.3 裁决) but are no longer a subscription
+    entry. An empty `alive_by_source` writes nothing canonical: whatever is on
+    disk is the previous stable round, and the guardrail exists to keep it.
     """
     if not cfg["publish"].get("enabled", True):
         return False
@@ -2192,9 +2657,144 @@ def _publish_sources(cfg, store, sources, alive_by_source, proxy_by_name, countr
             continue
         _write_export(cfg, key, alive_by_source.get(key, []), proxy_by_name, countries,
                       chain_fronts=chain_fronts, alive_forms=(alive_forms or {}).get(key))
+    canonical = _write_canonical_export(cfg, sources, alive_by_source, proxy_by_name,
+                                        countries, chain_fronts, alive_forms, log)
     if cfg["publish"].get("push_to_substore"):
         push_exports(cfg, store, [s["key"] for s in sources if s["key"] in keys], log)
-    return True
+    return True, canonical
+
+
+def _write_canonical_export(cfg, sources, alive_by_source, proxy_by_name, countries,
+                            chain_fronts, alive_forms, log):
+    """Deduplicate + rename + sort the round's live nodes into one canonical file.
+
+    Returns the canonical bytes, or None when this round published no node
+    (the previous file stands -- the guardrail's whole point). Metadata goes to
+    `mihomo-alive.meta.json` alongside it.
+    """
+    from . import canonical_export
+    live = {key: names for key, names in (alive_by_source or {}).items() if names}
+    if not live:
+        return None
+    by_display = {str(proxy.get("name") or ""): proxy
+                  for proxy in proxy_by_name.values()}
+    sources_in = []
+    for source in sources:
+        key = source["key"]
+        names = live.get(key)
+        if not names:
+            continue
+        proxies, groups = _export_proxies(names, proxy_by_name, countries, cfg, key,
+                                          chain_fronts=chain_fronts,
+                                          alive_forms=(alive_forms or {}).get(key))
+        meta_map = {}
+        for name in names:
+            proxy = proxy_by_name.get(name) or by_display.get(name)
+            if not proxy:
+                continue
+            fingerprint = coremod.fingerprint_proxy(proxy)
+            bucket = countries.get(name) or {}
+            meta_map[name] = {
+                "alive": True,
+                "delay": bucket.get("delay"),
+                "egress_country": bucket.get("country"),
+                "best_probe": bucket.get("probe") or key,
+            }
+            meta_map.setdefault(fingerprint, meta_map[name])
+        sources_in.append({"key": key, "proxies": proxies, "groups": groups,
+                           "meta": meta_map})
+    try:
+        content, meta = canonical_export.build(sources_in, cfg)
+    except Exception as exc:  # noqa: BLE001 - a canonical failure must not take
+        # the per-source diagnostics down with it.
+        log("warn", f"canonical export 生成失败: {type(exc).__name__}: {exc}")
+        return None
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    path = EXPORT_DIR / CANONICAL_NAME
+    tmp = path.with_suffix(".yaml.tmp")
+    tmp.write_bytes(content)
+    tmp.replace(path)
+    (EXPORT_DIR / "mihomo-alive.meta.json").write_text(
+        json.dumps({"count": meta["count"], "digest": meta["digest"],
+                    "content_sha256": meta["content_sha256"],
+                    "source_aliases": meta["source_aliases"],
+                    "renames": meta["renames"]},
+                   ensure_ascii=False),
+        encoding="utf-8")
+    log("info", f"canonical export 已生成 {CANONICAL_NAME}: {meta['count']} 节点, "
+                f"digest={meta['digest']}")
+    return content
+
+
+CANONICAL_NAME = "mihomo-alive.yaml"
+
+
+def _gist_probe_status(round_id, total, alive, suspect, note):
+    """`probe-status.json` body: the round headline, no node credentials."""
+    probes = {}
+    try:
+        for row in db.query("SELECT probe_id, state, last_seen_at, version"
+                            " FROM probes"):
+            probes[row["probe_id"]] = {
+                "state": row["state"], "last_seen_at": row["last_seen_at"],
+                "version": row["version"]}
+    except Exception:  # noqa: BLE001 - probes table may predate v3
+        pass
+    return {"round_id": round_id, "total": total, "alive": alive,
+            "suspect": bool(suspect), "note": note, "probes": probes,
+            "updated_at": db.now()}
+
+
+def _round_observations(cfg, round_id, by_name, proxies, results, countries,
+                        excluded, domain_pass, log):
+    """One verdict per fingerprint for this round, from every probe that answered.
+
+    This is the join the whole Phase 3 hangs off (指导 §4.3): the Controller
+    collects observations -- its own `local` measurement plus whatever the
+    probe agents 回传 -- drops the ones that must never reach the ledger
+    (旧轮次 / 未知探测点 / digest 不符, 指导 §4.2), and folds the rest into a
+    single verdict per node before the state machine runs once.
+
+    Two entry shapes reach here:
+
+    * a round driven by `_run_round`, which already wrote the `local`
+      observations in `_collect_probe_observations` and waited for the probes;
+    * a direct call to `_apply_and_publish` -- which is how every existing
+      unit test drives the pipeline. There the observations table is empty, so
+      the local measurement is written here and aggregated on its own. That is
+      the 本地单探测点兼容模式 (指导 §16 灰度第 1 步), and it is why the node
+      verdict is byte-for-byte what it was before this refactor.
+
+    Returns a plain `{fingerprint: verdict}` dict. A fingerprint with no
+    observation at all is simply absent -- never a verdict -- so a caller can
+    tell "the round said nothing" from "the round said fail".
+    """
+    digest = config_digest(cfg)
+    known = ({p["id"] for p in _enabled_probes(cfg)}
+             | {aggregation.LOCAL_PROBE_ID})
+    gate = _digest_gate()
+    accepted, rejected, deferred = aggregation.filter_observations(
+        db.get_observations(round_id) if round_id else [],
+        round_id=round_id, known_probes=known, config_digest=digest,
+        digest_gate=gate)
+    _audit_rejected(rejected, deferred, log)
+    seen = {row["fingerprint"] for row in accepted}
+    for bucket in group_by_fingerprint(results, by_name).values():
+        fingerprint = bucket["entry"]["fp"]
+        if fingerprint in seen:
+            continue
+        ok, delay, reason, _detail, _ip_alive, _ip_total = _score_bucket(
+            bucket, domain_pass)
+        country, exit_failure = _resolve_exit(countries, bucket["names"], excluded)
+        if ok and exit_failure:
+            ok, reason = False, exit_failure
+        db.record_observation(round_id, aggregation.LOCAL_PROBE_ID, fingerprint,
+                              ok, delay, reason, country, digest)
+        accepted.append(aggregation.local_observation(
+            round_id, fingerprint, ok, delay, reason, country, digest))
+        seen.add(fingerprint)
+    aggregated = aggregation.aggregate_round(accepted, cfg.get("aggregation"))
+    return dict(aggregated)
 
 
 def _apply_and_publish(cfg, round_id, store, by_name, proxies, results, countries, sources, log,
@@ -2212,10 +2812,18 @@ def _apply_and_publish(cfg, round_id, store, by_name, proxies, results, countrie
     delay test passed are what the chained exports publish as their dialer
     targets. A front the round could not carry traffic through must not be
     published -- that is exactly how a panel-alive chain breaks in a client.
+
+    Phase 3 (指导 §4.3): the verdict each bucket converges on is no longer
+    necessarily its own local measurement. `_round_observations` folds this
+    round's `local` row together with every probe that answered, and the
+    aggregated verdict is what reaches `_converge_bucket` -- so `policy.apply`
+    runs exactly once per node per round, however many probes reported.
     """
     excluded = {c.upper() for c in verify_cfg_excludes(cfg)}
     domain_pass = str(cfg.get("verify", {}).get("domain_pass", "any")).lower()
     proxy_by_name = _index_original_proxies(by_name, proxies)
+    observations = _round_observations(cfg, round_id, by_name, proxies, results,
+                                       countries, excluded, domain_pass, log)
     alive_by_source = {}
     alive_forms = {}
     dropped = restored = new_alive = 0
@@ -2223,7 +2831,8 @@ def _apply_and_publish(cfg, round_id, store, by_name, proxies, results, countrie
 
     for bucket in group_by_fingerprint(results, by_name).values():
         transition, alive_names, alive_cat = _converge_bucket(
-            cfg, round_id, bucket, proxy_by_name, countries, excluded, domain_pass, log)
+            cfg, round_id, bucket, proxy_by_name, countries, excluded, domain_pass, log,
+            observation=observations.get(bucket["entry"]["fp"]))
         if transition == "drop":
             dropped += 1
         elif transition == "restore":

@@ -3746,9 +3746,9 @@ class ChainTest(unittest.TestCase):
         _by_source, fps = engine._record_chain_failures(
             self._cfg(), round_id, [self._chain_entry()], _nolog)
         node = engine.db.get_node("air", "a" * 16)
-        self.assertEqual(node["consec_fail"], 1)
-        self.assertEqual(node["last_reason"], engine.FRONT_DEAD_REASON)
-        # A node that never passed stays `unknown`; the streak is what counts.
+        # 指导 §5.4：前置失败不推进目标节点死亡计数。`policy.apply` 不再被
+        # 调用，所以 streak 与 status 都保持上一轮的原样。
+        self.assertEqual(node["consec_fail"], 0)
         self.assertEqual(node["status"], policy.UNKNOWN)
         row = engine.db.one("SELECT verdict, reason FROM results WHERE round_id=?",
                             (round_id,))
@@ -3757,14 +3757,19 @@ class ChainTest(unittest.TestCase):
         self.assertEqual(fps["air"], {"a" * 16})
 
     def test_a_chain_failure_moves_a_previously_alive_node_to_pending(self):
-        """The verdict is a real failure: it must advance the state machine."""
         entry = self._chain_entry()
         engine.db.upsert_node("air", entry["fp"], "N", status=policy.ALIVE, consec_fail=0)
         round_id = engine.db.start_round("test")
         engine._record_chain_failures(self._cfg(), round_id, [entry], _nolog)
         node = engine.db.get_node("air", entry["fp"])
-        self.assertEqual(node["status"], policy.PENDING)
-        self.assertEqual(node["consec_fail"], 1)
+        # 指导 §5.4：前置失败不推进目标节点死亡计数。前置全死是基础设施事件，
+        # 节点保持 alive、streak 不动；results 行仍记 fail + front_dead。
+        self.assertEqual(node["status"], policy.ALIVE)
+        self.assertEqual(node["consec_fail"], 0)
+        row = engine.db.one("SELECT verdict, reason FROM results WHERE round_id=?",
+                            (round_id,))
+        self.assertEqual((row["verdict"], row["reason"]),
+                         ("fail", engine.FRONT_DEAD_REASON))
 
     def test_a_chain_failure_reaches_dead_at_the_threshold(self):
         entry = self._chain_entry()
@@ -3772,8 +3777,15 @@ class ChainTest(unittest.TestCase):
         round_id = engine.db.start_round("test")
         engine._record_chain_failures(self._cfg(), round_id, [entry], _nolog)
         node = engine.db.get_node("air", entry["fp"])
-        self.assertEqual(node["status"], policy.DEAD)
-        self.assertEqual(node["consec_fail"], 3)
+        # 指导 §5.4：前置失败不推进目标节点死亡计数。第三轮前置全死也不会把
+        # consec_fail=2 的节点推过阈值判死——它已经悬在阈值上，恰恰是最需要
+        # 这条保护的情形。
+        self.assertEqual(node["status"], policy.PENDING)
+        self.assertEqual(node["consec_fail"], 2)
+        row = engine.db.one("SELECT verdict, reason FROM results WHERE round_id=?",
+                            (round_id,))
+        self.assertEqual((row["verdict"], row["reason"]),
+                         ("fail", engine.FRONT_DEAD_REASON))
 
     def test_the_prune_keeps_a_chain_failure_but_would_drop_it_otherwise(self):
         """The row was never dialled, so it is absent from `by_name`.
@@ -4456,15 +4468,22 @@ class ChainRoundTest(unittest.TestCase):
                 unittest.mock.patch.object(engine, "lookup_countries",
                                            return_value={"1.2.3.4": "US"}), \
                 unittest.mock.patch.object(notifier, "send", lambda *a, **k: None):
-            engine._run_round(cfg, "test", None, _nolog)
+            summary = engine._run_round(cfg, "test", None, _nolog)
 
         # The chained variant specifically: its direct twin is alive (the dialer
         # is stripped, so the dead front never enters its path) and would
         # otherwise win the race in `next()` depending on ledger order.
         node = next(n for n in engine.db.list_nodes(source="air")
                     if n["category"] == engine.CAT_CHAIN)
-        self.assertEqual(node["last_reason"], engine.FRONT_DEAD_REASON)
-        self.assertEqual(node["consec_fail"], 1)
+        # 指导 §5.4：前置失败不推进目标节点死亡计数。results 行记
+        # fail + front_dead，但节点行的 status/consec_fail 原样保留。
+        self.assertIsNone(node["last_reason"])
+        self.assertEqual(node["consec_fail"], 0)
+        row = engine.db.one(
+            "SELECT verdict, reason FROM results WHERE round_id=? AND category=?",
+            (summary["round_id"], engine.CAT_CHAIN))
+        self.assertEqual((row["verdict"], row["reason"]),
+                         ("fail", engine.FRONT_DEAD_REASON))
 
     def test_an_empty_front_pool_fails_the_chain_and_still_alerts(self):
         """The pool never arrived at all -- the shape no unit test covered.
@@ -4524,8 +4543,16 @@ class ChainRoundTest(unittest.TestCase):
 
         nodes = engine.db.list_nodes(source="air")
         chain_node = next(n for n in nodes if n["category"] == engine.CAT_CHAIN)
-        self.assertEqual(chain_node["last_reason"], engine.FRONT_DEAD_REASON)
-        self.assertEqual(chain_node["consec_fail"], 1)
+        # 指导 §5.4：前置失败不推进目标节点死亡计数。前置池根本没拉到是基础
+        # 设施事件，节点行不记 reason、streak 不动；results 行仍记 fail +
+        # front_dead，面板因此知道该责怪前置池而不是节点。
+        self.assertIsNone(chain_node["last_reason"])
+        self.assertEqual(chain_node["consec_fail"], 0)
+        row = engine.db.one(
+            "SELECT verdict, reason FROM results WHERE round_id=? AND category=?",
+            (summary["round_id"], engine.CAT_CHAIN))
+        self.assertEqual((row["verdict"], row["reason"]),
+                         ("fail", engine.FRONT_DEAD_REASON))
         direct_node = next(n for n in nodes if n["category"] == engine.CAT_DIRECT)
         self.assertIsNone(direct_node["last_reason"])
         self.assertEqual(summary["alive"], 1)
