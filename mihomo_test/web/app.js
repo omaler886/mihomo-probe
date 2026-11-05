@@ -322,6 +322,7 @@ async function load() {
   if (cs && !cs.error && changed("cats", cs)) renderCategories(cs);
   if (st.config && changed("config", st.config)) { renderSettings(st.config); renderSources(); }
   if (!SOURCES_LOADED) loadSources();
+  loadV1();
 }
 
 function showLoadError(msg) {
@@ -975,7 +976,7 @@ function renderNodes(nd) {
   const rows = (nd.nodes || []).filter(n => !want || (n.category || "direct") === want);
   document.getElementById("node-count").textContent =
     want ? `${rows.length}/${nd.nodes.length} 个` : nd.nodes.length + " 个";
-  tb.innerHTML = rows.map(n => {
+  tb.innerHTML = rows.map((n, i) => {
     const [label, cls] = STATUS[n.status] || STATUS.unknown;
     const trend = (n.trend || []).map(v => v === "ok" ? '<i class="s-ok">●</i>' : v === "excluded" ? '<i class="s-unknown">·</i>' : '<i class="s-dead">○</i>').join("");
     const cat = n.category || "direct";
@@ -991,9 +992,25 @@ function renderNodes(nd) {
       <td class="${cls}">${label}</td>
       <td class="trend">${trend || "—"}</td>
       <td class="detail" title="${esc(n.last_reason)}">${esc(n.last_reason || "—")}</td>
+      <td><button class="tiny-btn" data-diag="${i}" title="复制该节点的完整测量 JSON（不含凭据字段）">诊断</button></td>
     </tr>`;
-  }).join("") || `<tr><td colspan="11" class="tiny">${want ? "该分类下暂无节点。" : "还没有节点，先跑一轮。"}</td></tr>`;
+  }).join("") || `<tr><td colspan="12" class="tiny">${want ? "该分类下暂无节点。" : "还没有节点，先跑一轮。"}</td></tr>`;
 }
+
+/* 诊断复制走事件委托（CSP 无内联处理器）。JSON 来自 /api/nodes 的行数据 ——
+   它本来就是页面渲染所用的那份，不含 uuid/password 等凭据字段。 */
+bindEvent("nodes", "click", ev => {
+  const btn = ev.target.closest("button[data-diag]");
+  if (!btn) return;
+  const n = ((NODES_CACHE || {}).nodes || [])[+btn.dataset.diag];
+  if (!n) return;
+  const done = () => { btn.textContent = "已复制"; setTimeout(() => btn.textContent = "诊断", 1200); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(JSON.stringify(n, null, 2)).then(done).catch(done);
+  } else {
+    showNotice("诊断 JSON", "此浏览器不支持剪贴板 API，内容如下：", [{ text: JSON.stringify(n) }], "warn");
+  }
+});
 
 /* ---------------- 分类统计 ---------------- */
 /* Which round the panel is showing; "" means "newest round with results", which
@@ -1220,16 +1237,9 @@ async function runMode(btnId, label, mode) {
 
 bind("btn-run-direct", () => runMode("btn-run-direct", "直连测活", "direct"));
 bind("btn-run-chain", () => runMode("btn-run-chain", "链式测活", "chain"));
-bind("btn-push", async () => {
-  const btn = document.getElementById("btn-push");
-  btn.disabled = true;
-  try {
-    const r = await api("/api/push", { method: "POST", body: "{}" }).then(r => r.json());
-    noticeResult("推送 Sub-Store", r);
-  } finally { btn.disabled = false; load(); }
-});
-bind("btn-settings", () =>
-  document.getElementById("settings-panel").classList.toggle("hide"));
+/* 旧的「一键推送 Sub-Store」按钮已删除（P5）：无确认、无审计的推送正是
+   指导 §0.6 清除的行为。推送入口 = 发布中心的人工三步（预览 → confirm-token
+   → push），见下方 P6 段的 substore 流程。 */
 bind("btn-clear-log", load);
 
 bind("btn-theme", () => applyTheme(nextTheme()));
@@ -1352,6 +1362,312 @@ function tokenRejected() {
   if (input) input.value = "";
   showGate("令牌被拒绝（401）：可能已经换过，或者本机存的这份不对。重新粘贴一次即可。");
 }
+
+/* ================= P6：视图路由 + /api/v1 页面 ================= */
+/* 四个主视图（指导 §9）+ 保留的设置页。路由用 location.hash：无框架、无构建、
+   刷新后停留在当前页；所有动作都是 JS 按钮（无表单），刷新不会重复提交 POST。 */
+const VIEWS = ["overview", "nodes", "probes", "publish", "settings"];
+
+function currentView() {
+  const v = String(location.hash || "").replace(/^#/, "");
+  return VIEWS.indexOf(v) >= 0 ? v : "overview";
+}
+
+function showView(v) {
+  VIEWS.forEach(name => {
+    const el = document.getElementById("view-" + name);
+    if (el) el.classList.toggle("hide", name !== v);
+  });
+  document.querySelectorAll("#main-nav a").forEach(a =>
+    a.classList.toggle("active", (a.dataset || {}).nav === v));
+}
+
+function route() { showView(currentView()); }
+bindEvent(window, "hashchange", route);
+document.querySelectorAll("#main-nav a").forEach(a => {
+  a.addEventListener("click", () => showView((a.dataset || {}).nav));
+});
+route();
+
+/* /api/v1 面板的数据（P3b/P4/P5 契约）。轮询型的页面，单次失败静默等下一拍。 */
+async function loadV1() {
+  let dR, pR, rR;
+  try {
+    [dR, pR, rR] = await Promise.all([
+      api("/api/v1/dashboard"),
+      api("/api/v1/probes"),
+      api("/api/v1/rounds?limit=20"),
+    ]);
+  } catch (err) { return; }
+  if (dR.status === 401 || pR.status === 401 || rR.status === 401) {
+    tokenRejected();
+    return;
+  }
+  try {
+    const dash = await dR.json();
+    const probes = await pR.json();
+    const rounds = (await rR.json()).rounds || [];
+    renderProbesBrief(probes);
+    renderProbesFull(CONFIG.probes, probes);
+    renderRounds(rounds);
+    renderPublish(dash);
+  } catch (err) { /* 下一拍再来 */ }
+}
+
+bind("btn-probes-refresh", loadV1);
+bind("btn-rounds-refresh", loadV1);
+bind("btn-probe-reload", loadV1);
+
+const PROBE_PILL = {
+  online: ["在线", "s-ok"], offline: ["离线", "s-dead"], never: ["未心跳", "s-unknown"],
+};
+
+function probePill(p) {
+  const k = p.online ? "online" : (p.last_seen_at ? "offline" : "never");
+  return PROBE_PILL[k];
+}
+
+function renderProbesBrief(rows) {
+  const el = document.getElementById("probes-brief");
+  if (!el) return;
+  const tb = el.querySelector("tbody");
+  const pill = document.getElementById("probes-online");
+  if (pill) pill.textContent = `在线 ${(rows || []).filter(p => p.online).length}/${(rows || []).length}`;
+  tb.innerHTML = (rows || []).map(p => {
+    const [label, cls] = probePill(p);
+    return `<tr>
+      <td>${esc(p.name)}</td>
+      <td>${esc((p.tags || []).join(" / ") || "—")}</td>
+      <td class="${cls}">${p.enabled ? label : "已禁用"}</td>
+      <td class="mono">${esc(p.last_seen_at || "—")}</td>
+      <td class="mono">${esc(p.version || "—")}</td>
+      <td>${p.enabled ? (p.online ? "待命" : "等待心跳") : "不下发"}</td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="6" class="tiny">还没有配置探测点（probes=[]，单探测点模式）。</td></tr>`;
+}
+
+function renderProbesFull(cfgProbes, rows) {
+  const el = document.getElementById("probes-table");
+  if (!el) return;
+  const tb = el.querySelector("tbody");
+  const pill = document.getElementById("probes-full-count");
+  if (pill) pill.textContent = `${(rows || []).length} 个`;
+  const cfgMap = {};
+  (cfgProbes || []).forEach(p => { cfgMap[p.id] = p; });
+  tb.innerHTML = (rows || []).map(p => {
+    const [label, cls] = probePill(p);
+    const cfg = cfgMap[p.probe_id];
+    const action = cfg
+      ? `<button data-toggle-probe="${esc(p.probe_id)}" data-next="${cfg.enabled ? "0" : "1"}">${cfg.enabled ? "禁用" : "启用"}</button>`
+      : `<span class="tiny">仅账本记录</span>`;
+    return `<tr>
+      <td>${esc(p.name)}<div class="tiny mono">${esc(p.probe_id)}</div></td>
+      <td>${esc((p.tags || []).join(" / ") || "—")}</td>
+      <td class="${cls}">${p.enabled ? label : "已禁用"}</td>
+      <td class="mono">${esc(p.last_seen_at || "—")}</td>
+      <td class="mono">${esc(p.version || "—")}</td>
+      <td class="mono tiny">${esc(p.endpoint || "—")}</td>
+      <td>${action}</td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="7" class="tiny">还没有配置探测点。</td></tr>`;
+  const note = document.getElementById("probes-note");
+  if (note) note.textContent = "状态 = 最近心跳是否落在在线窗口内；「任务/错误分布」的机器视图见 GET /api/v1/probes 与 /api/v1/rounds/{id}。";
+}
+
+/* 禁用/启用 = 把整份 probes[] 写回 /api/config（数组整体替换），带确认框。
+   探测点永远拿不到独立节点配置 —— 这正是指导 §0.2 要删除的模型。 */
+bindEvent("probes-table", "click", async ev => {
+  const btn = ev.target.closest("button[data-toggle-probe]");
+  if (!btn || btn.disabled) return;
+  const id = btn.getAttribute("data-toggle-probe");
+  const next = btn.getAttribute("data-next") === "1";
+  if (!window.confirm(`${next ? "启用" : "禁用"}探测点 ${id}？${next ? "" : "下一轮起不再向它下发任务。"}`)) return;
+  btn.disabled = true;
+  try {
+    const probes = (CONFIG.probes || []).map(p =>
+      p.id === id ? Object.assign({}, p, { enabled: next }) : p);
+    const r = await api("/api/config", {
+      method: "POST", body: JSON.stringify({ probes: probes }),
+    }).then(x => x.json());
+    if (r.error) { showNotice("写入失败", r.error, [], "error"); return; }
+    CONFIG = r.config || CONFIG;
+    showNotice(`探测点已${next ? "启用" : "禁用"}`, "已写回 config，下一轮生效。", [], "ok");
+    loadV1();
+  } catch (err) {
+    showNotice("写入失败", String(err && err.message || err), [], "error");
+  } finally { btn.disabled = false; }
+});
+
+function renderRounds(rows) {
+  const el = document.getElementById("rounds");
+  if (!el) return;
+  const tb = el.querySelector("tbody");
+  tb.innerHTML = (rows || []).map(r => `<tr>
+    <td class="mono">#${esc(r.id)}</td>
+    <td class="mono">${esc(r.started_at || "—")}</td>
+    <td class="mono">${r.duration_s != null ? r.duration_s + "s" : "进行中"}</td>
+    <td>${esc(r.trigger || "—")}${r.mode ? " · " + esc(r.mode) : ""}</td>
+    <td class="mono num">${r.total || 0}</td>
+    <td class="mono num s-ok">${r.ok || 0}</td>
+    <td class="mono num s-dead">${r.failed || 0}</td>
+    <td>${r.suspect ? '<span class="badge s-pending">可疑</span>' : '<span class="badge s-ok">正常</span>'}</td>
+  </tr>`).join("") || `<tr><td colspan="8" class="tiny">还没有轮次记录。</td></tr>`;
+}
+
+/* ---- 发布中心（指导 §9.4）---- */
+
+function kv(label, value) {
+  return `<div class="kv"><div class="k">${esc(label)}</div><div class="v">${value}</div></div>`;
+}
+
+function renderPublish(dash) {
+  const gist = (dash || {}).gist || {};
+  const sub = (dash || {}).substore || {};
+  const gi = document.getElementById("gist-info");
+  if (gi) gi.innerHTML =
+    kv("canonical 文件", '<span class="mono">mihomo-alive.yaml</span>（data/exports/）') +
+    kv("最近发布", esc(gist.last_published_at || "从未")) +
+    kv("revision", '<span class="mono">' + esc(gist.revision || "—") + "</span>") +
+    kv("digest", '<span class="mono">' + esc(gist.digest || "—") + "</span>") +
+    kv("节点数", gist.node_count != null ? gist.node_count : "—") +
+    kv("与稳定轮一致", gist.consistent_with_stable_round == null
+      ? "—"
+      : (gist.consistent_with_stable_round
+        ? '<span class="s-ok">一致</span>'
+        : '<span class="s-pending">不一致（有新稳定轮尚未发布）</span>'));
+  const si = document.getElementById("substore-info");
+  if (si) si.innerHTML =
+    kv("目标资源", '<span class="mono">' + esc(sub.target || "—") + "</span>") +
+    kv("backend", esc(sub.backend_origin || "—") + (sub.backend_origin ? "（完整地址可能含密钥路径，不回显）" : "")) +
+    kv("最近人工推送", esc(sub.last_pushed_at || "从未")) +
+    kv("最近结果", esc(sub.last_result || "—"));
+}
+
+bind("btn-gist-publish", async () => {
+  const btn = document.getElementById("btn-gist-publish");
+  btn.disabled = true;
+  try {
+    const r = await api("/api/v1/gist/publish", { method: "POST", body: "{}" })
+      .then(x => x.json());
+    if (r.error) {
+      showNotice("Gist 发布失败", `${r.error}${r.message ? "：" + r.message : ""}`,
+        r.audit_id ? [{ text: "审计 ID：" + r.audit_id }] : [], "error");
+      return;
+    }
+    showNotice(r.status === "no_change" ? "Gist 内容未变化" : "Gist 已发布",
+      r.status === "no_change"
+        ? `digest 未变，零 PATCH、零 revision（幂等门禁）。`
+        : `digest ${r.digest} · revision ${r.revision || "—"}`,
+      (r.changed || []).map(f => ({ text: "更新：" + f })), "ok");
+  } catch (err) {
+    showNotice("Gist 发布失败", String(err && err.message || err), [], "error");
+  } finally { btn.disabled = false; loadV1(); }
+});
+
+let SUBSTORE_PREVIEW = null;
+
+function samplesHtml(samples) {
+  const s = samples || {};
+  const table = (head, rowsHtml) =>
+    `<div class="scroll" style="max-height:180px"><table class="samples"><thead><tr>${head}</tr></thead><tbody>${rowsHtml}</tbody></table></div>`;
+  const parts = [];
+  if ((s.added || []).length) {
+    parts.push(`<h3 class="s-ok">新增样例</h3>` +
+      table("<th>名称</th><th>协议</th>", s.added.map(x =>
+        `<tr><td class="mono">${esc(x.name)}</td><td class="mono">${esc(x.type)}</td></tr>`).join("")));
+  }
+  if ((s.removed || []).length) {
+    parts.push(`<h3 class="s-dead">删除样例</h3>` +
+      table("<th>名称</th><th>协议</th>", s.removed.map(x =>
+        `<tr><td class="mono">${esc(x.name)}</td><td class="mono">${esc(x.type)}</td></tr>`).join("")));
+  }
+  if ((s.renamed || []).length) {
+    parts.push(`<h3 class="s-pending">改名样例</h3>` +
+      table("<th>原名</th><th>新名</th>", s.renamed.map(x =>
+        `<tr><td class="mono">${esc(x.from)}</td><td class="mono">${esc(x.to)}</td></tr>`).join("")));
+  }
+  return parts.join("") || `<div class="urlbox">无样例（目标与 canonical 已一致）。</div>`;
+}
+
+bind("btn-substore-preview", async () => {
+  const btn = document.getElementById("btn-substore-preview");
+  const box = document.getElementById("substore-preview-box");
+  btn.disabled = true;
+  try {
+    const r = await api("/api/v1/substore/preview", { method: "POST", body: "{}" })
+      .then(x => x.json());
+    box.classList.remove("hide");
+    if (r.error) {
+      SUBSTORE_PREVIEW = null;
+      document.getElementById("btn-substore-push").disabled = true;
+      box.innerHTML = `<div class="err">${esc(r.error)}${r.message ? "：" + esc(r.message) : ""}</div>`;
+      return;
+    }
+    SUBSTORE_PREVIEW = r;
+    const p = r.preview || {};
+    box.innerHTML =
+      `<div class="kvgrid">` +
+      kv("新增", p.added) + kv("删除", p.removed) + kv("改名", p.renamed) + kv("不变", p.unchanged) +
+      kv("目标对象", r.missing_target
+        ? '<span class="s-dead">不存在（update-only 将拒绝，本服务绝不新建）</span>'
+        : '<span class="s-ok">已绑定</span>') +
+      kv("digest", '<span class="mono">' + esc(r.digest || "—") + "</span>") +
+      kv("节点数", r.node_count != null ? r.node_count : "—") +
+      `</div>` + samplesHtml(p.samples);
+    document.getElementById("btn-substore-push").disabled = !!r.missing_target;
+  } catch (err) {
+    box.classList.remove("hide");
+    box.innerHTML = `<div class="err">${esc(String(err && err.message || err))}</div>`;
+  } finally { btn.disabled = false; }
+});
+
+bind("btn-substore-push", () => {
+  if (!SUBSTORE_PREVIEW) {
+    showNotice("先预览差异", "推送前必须先预览（指导 §9.4）：确认 token 只绑定预览时的 digest。", [], "warn");
+    return;
+  }
+  const box = document.getElementById("confirm-box");
+  document.getElementById("confirm-detail").innerHTML =
+    kv("目标资源", '<span class="mono">' + esc(SUBSTORE_PREVIEW.target || "") + "</span>") +
+    kv("节点数", SUBSTORE_PREVIEW.node_count != null ? SUBSTORE_PREVIEW.node_count : "—") +
+    kv("digest", '<span class="mono">' + esc(SUBSTORE_PREVIEW.digest || "") + "</span>") +
+    kv("写入方式", "update-only：覆盖目标对象内容；目标不存在将拒绝");
+  box.classList.remove("hide");
+});
+
+bind("btn-confirm-cancel", () =>
+  document.getElementById("confirm-box").classList.add("hide"));
+
+bind("btn-confirm-push", async () => {
+  const btn = document.getElementById("btn-confirm-push");
+  btn.disabled = true;
+  try {
+    const tok = await api("/api/v1/substore/confirm-token", { method: "POST", body: "{}" })
+      .then(x => x.json());
+    if (tok.error) {
+      showNotice("签发确认 token 失败", `${tok.error}${tok.message ? "：" + tok.message : ""}`, [], "error");
+      return;
+    }
+    const r = await api("/api/v1/substore/push", {
+      method: "POST", body: JSON.stringify({ confirm_token: tok.confirm_token }),
+    }).then(x => x.json());
+    if (r.error) {
+      showNotice("推送被拒绝", `${r.error}${r.message ? "：" + r.message : ""}`,
+        r.audit_id ? [{ text: "审计 ID：" + r.audit_id }] : [], "error");
+      return;
+    }
+    showNotice("已推送到 Sub-Store",
+      `${r.target} · ${r.count} 节点 · digest ${r.digest} · Sub-Store 返回 ${r.substore_action}`,
+      [{ text: "审计 ID：" + r.audit_id }], "ok");
+    document.getElementById("confirm-box").classList.add("hide");
+    SUBSTORE_PREVIEW = null;
+    document.getElementById("btn-substore-push").disabled = true;
+    document.getElementById("substore-preview-box").classList.add("hide");
+    loadV1();
+  } catch (err) {
+    showNotice("推送失败", String(err && err.message || err), [], "error");
+  } finally { btn.disabled = false; }
+});
 
 if (TOKEN) start();
 else showGate();

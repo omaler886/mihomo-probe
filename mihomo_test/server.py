@@ -490,16 +490,19 @@ def canonical_artifact():
     return content, meta
 
 
-def canonical_meta_digest():
-    """Digest recorded beside the artifact; '' when there is none yet."""
+def canonical_meta():
+    """Meta dict recorded beside the artifact; {} when there is none yet."""
     _yaml_path, meta_path = _canonical_paths()
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return ""
-    if not isinstance(meta, dict):
-        return ""
-    return str(meta.get("digest") or "")
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def canonical_meta_digest():
+    """Digest recorded beside the artifact; '' when there is none yet."""
+    return str(canonical_meta().get("digest") or "")
 
 
 def _substore_audit(audit_id, target, digest, status, summary=None):
@@ -512,10 +515,11 @@ def _gist_publication_state():
     """Dashboard 的 gist 块：最近一次真实发布的时间 / revision / 一致性。
 
     Only `published` / `no_change` rows count as a publication timeline entry:
-    rejected or failed attempts are audit events, not a publish time.
+    rejected or failed attempts are audit events, not a publish time. digest
+    与节点数取自磁盘上的 canonical meta —— 它是「下一次发布会写什么」的事实。
     """
-    state = {"last_published_at": None, "revision": None,
-             "consistent_with_stable_round": None}
+    state = {"last_published_at": None, "revision": None, "digest": None,
+             "node_count": None, "consistent_with_stable_round": None}
     try:
         rows = db.list_publish_audit(50)
     except Exception:  # noqa: BLE001 - table may predate v3
@@ -524,11 +528,41 @@ def _gist_publication_state():
                    and r["status"] in ("published", "no_change")), None)
     if latest is None:
         return state
-    digest = canonical_meta_digest()
+    meta = canonical_meta()
     state["last_published_at"] = latest["created_at"]
     state["revision"] = latest["revision"]
+    state["digest"] = str(meta.get("digest") or "")
+    state["node_count"] = meta.get("count")
     state["consistent_with_stable_round"] = bool(
-        digest and str(latest["digest"] or "") == digest)
+        state["digest"] and str(latest["digest"] or "") == state["digest"])
+    return state
+
+
+def _backend_origin(cfg):
+    """Origin of substore.backend, for display only.
+
+    The URL may embed a secret path (config.py documents that this
+    deployment's does), so the dashboard shows the origin and says so -- the
+    full value is exactly the kind of thing §13.6 keeps away from the front
+    end.
+    """
+    url = str((cfg.get("substore") or {}).get("backend") or "")
+    match = re.match(r"^[a-z][a-z0-9+.\-]*://[^/?#]+", url)
+    return match.group(0).rstrip("/") if match else ""
+
+
+def _substore_publication_state():
+    """Dashboard 的 substore 块：最近一次人工推送（P5 端点）的时间与结果。"""
+    state = {"last_pushed_at": None, "last_result": None}
+    try:
+        rows = db.list_publish_audit(50)
+    except Exception:  # noqa: BLE001 - table may predate v3
+        return state
+    latest = next((r for r in rows if r["kind"] == "substore"
+                   and r["status"] == "pushed"), None)
+    if latest is not None:
+        state["last_pushed_at"] = latest["created_at"]
+        state["last_result"] = "pushed"
     return state
 
 
@@ -573,10 +607,13 @@ def v1_dashboard(cfg):
         "probes": {"total": len(probes), "enabled": len(enabled),
                    "online": len(online)},
         "busy": BUSY.locked(),
-        # P4 已落地 gist（数据源 publish_audit）；substore 仍等 P5。
+        # P4 已落地 gist（数据源 publish_audit）；substore 自 P5 起同样由
+        # publish_audit 供给，target/backend_origin 是展示用的配置投影
+        # （backend 只给 origin，完整地址可能含密钥路径）。
         "gist": _gist_publication_state(),
-        "substore": {"last_pushed_at": None, "last_result": None,
-                     "target": (cfg.get("substore") or {}).get("target_name")},
+        "substore": dict(_substore_publication_state(),
+                         target=(cfg.get("substore") or {}).get("target_name"),
+                         backend_origin=_backend_origin(cfg)),
     }
 
 

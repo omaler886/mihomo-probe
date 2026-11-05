@@ -94,3 +94,57 @@ services:
       options:
         max-size: "5m"
         max-file: "2"
+
+  # ---- HK3 P6：多探测点角色（指导 §4.1/§4.2）----
+  # Controller 是上面的 mihomo-test（config.json 配 probes[] 后每轮向各探测点
+  # 下发 Job）。下面是「探测点角色」模板：同一镜像、agent 模式运行，不连
+  # Sub-Store、不写 Gist、不读业务配置；内核由 agent 按轮一次性创建
+  # （容器名默认 mihomo-agent，配置目录 core-agent/，与 Controller 的
+  # mihomo-probe 互不相干）。
+  #
+  #   docker compose --profile probe-agent up -d
+  #
+  # 前置条件（Controller 的 config.json）：probes: [{id: hk3-b, endpoint:
+  #   https://<probe-host>:8090, token_env: PROBE_TOKEN_HK3_B, enabled: true}]
+  # 探测点机器的 .env：MIHOMO_TEST_AGENT_ID=hk3-b 与 PROBE_TOKEN=<共享值>。
+  #
+  # 安全边界（指导 §13）：endpoint 必须 HTTPS（非 HTTPS 由 dispatch 拒绝）；
+  # token 每探测点独立；HMAC 签名 + 5 分钟时间窗由 probe_dispatch 强制；
+  # agent 只开放 /healthz 与 /jobs，无任意命令执行。
+  probe-agent:
+    profiles: ["probe-agent"]
+    build: .
+    image: mihomo-test:local
+    container_name: mihomo-agent-host
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MIHOMO_TEST_ROOT: /srv/mihomo-test
+      MIHOMO_TEST_HOST_ROOT: ${MIHOMO_TEST_HOST_ROOT:-/srv/mihomo-test}
+      # agent 自己拉起的一次性内核容器名（默认 mihomo-agent，别与 Controller
+      # 的 mihomo-probe 撞名）。
+      MIHOMO_TEST_AGENT_CONTAINER: ${MIHOMO_TEST_AGENT_CONTAINER:-mihomo-agent}
+      # 与 Controller probes[].token_env 指向的值一致的共享 token。
+      PROBE_TOKEN: ${PROBE_TOKEN:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        exec python -m mihomo_test agent
+        --id "$${MIHOMO_TEST_AGENT_ID:?set MIHOMO_TEST_AGENT_ID}"
+        --token-env PROBE_TOKEN
+        --host 0.0.0.0
+        --port "$${MIHOMO_TEST_AGENT_PORT:-8090}"
+        --controller "$${MIHOMO_TEST_AGENT_CONTROLLER:-http://127.0.0.1:8088}"
+    volumes:
+      - ./data-agent:/srv/mihomo-test/data
+      # agent 的内核配置目录（cfgmod.ROOT/core-agent）与临时产物
+      - ./core-agent:/srv/mihomo-test/core-agent
+      # agent 用宿主 daemon 启动/停止一次性内核容器
+      - /var/run/docker.sock:/var/run/docker.sock
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

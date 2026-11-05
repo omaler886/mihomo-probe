@@ -139,3 +139,22 @@
 - **审查**：待独立审查 Agent 复核（下一波）。
 - **回滚**：git revert 本批。注意：回滚后轮末自动回灌恢复依赖 `push_to_substore`+`allow_legacy_substore_write` 双开关（默认关），无静默写风险。
 - **交接**：Web 发布中心（Gist 区+Sub-Store 区 UI、二次确认弹窗）→ P6；`workstreams/21_RUST_PARITY.md` G-4 随本批从「无」变「Python 已落地、Rust 待移植」。
+
+## P6-1 — Web 控制台四页重构 + compose 探测点角色（2026-11-06）
+
+- **执行者**：实现 Agent（P6）
+- **文件**：修改 `mihomo_test/web/index.html`（hash 路由五视图 + 导航条 + 新面板结构）、`mihomo_test/web/app.js`（+约 300 行：路由、v1 面板渲染、发布中心流程、探测点启停、节点诊断复制；删除失效的旧一键推送绑定）、`mihomo_test/web/app.css`（+约 70 行：导航/kv 卡/确认框/样例表）、`mihomo_test/server.py`（dashboard 的 gist 块补 digest/node_count，substore 块改由 publish_audit 供给 + backend_origin 脱敏投影）、`docker-compose.yml`（probe-agent 角色模板，profile=probe-agent）、`.env.example`（PROBE_TOKEN / MIHOMO_TEST_AGENT_ID / GITHUB_GIST_TOKEN）。
+- **变更**：
+  1. **视图路由**：`#overview/#nodes/#probes/#publish/#settings` 五视图互斥，`hashchange` 驱动，无框架无构建（指导 §9.5「继续现有轻量前端技术」）；刷新不重复提交 POST（全部动作走 JS 按钮）。
+  2. **总览页**（§9.1）：状态卡（原有）+ 探测点概要表（名称/标签/状态/心跳/版本/本轮，来自 /api/v1/probes）+ 最近 20 轮表（#/开始/耗时/触发/总数/存活/死亡/状态，来自 /api/v1/rounds；"状态"列只写 可疑/正常，不声称发布——rounds 表没有发布列）。
+  3. **节点页**（§9.2）：保留既有表格与分类筛选（结构字符串契约不动：table#nodes、class="card" 等），新增每行「诊断」按钮——复制 /api/nodes 行数据的 JSON（页面本就渲染的那份，不含 uuid/password 凭据字段），事件委托适配 CSP。
+  4. **探测点页**（§9.3）：全量表 + 「禁用/启用」——写回 config 的 probes[].enabled（整份 probes[] 数组 POST /api/config，数组语义为整体替换），带原生确认框；探测点不会因此获得独立节点配置（§0.2 红线）。任务/错误分布的机器视图给出 API 指引。
+  5. **发布中心**（§9.4）：Gist 区显示 canonical 文件/最近发布/revision/digest/节点数/与稳定轮一致性（dashboard gist 块补 digest+node_count，取自磁盘 canonical meta），「立即重新发布 Gist」→ POST /api/v1/gist/publish，明确标注"内容未变则零 PATCH、零 revision，不重新测活"；Sub-Store 区显示目标资源 + backend **origin**（完整地址可能含密钥路径，按 §13.6 不回显）+ 最近人工推送时间/结果（publish_audit 供给，替换 P3b 的 null 占位）；「预览差异」→ preview 端点渲染 增/删/改/不变 计数 + 前 20 样例表 + missing_target 红色警示；主按钮文案「确认推送到 Sub-Store」→ 页内二次确认框（目标/节点数/digest/update-only 提示）→ confirm-token → push → 展示结果与审计 ID；推送成功后清空预览态并禁用主按钮（60s token 已消费，防重复提交）。
+  6. **compose 角色**：probe-agent 服务（profile 隔离），参数与 `__main__.py agent` argparse 逐字对齐（--id/--token-env/--host 0.0.0.0/--port 8090 默认/--controller 默认 8088），内核容器名默认 mihomo-agent（不与 Controller 的 mihomo-probe 撞名）、配置目录 core-agent/，标注 §13 安全边界；.env.example 补 PROBE_TOKEN/MIHOMO_TEST_AGENT_ID/GITHUB_GIST_TOKEN。
+- **原因**：指导 §15 Phase 6（§9 全部 + §16 部署）。
+- **影响**：四页信息密度与操作路径符合 §9；旧「推送 Sub-Store」头部按钮删除（其行为在 P5 已变更为 409，保留只会误导）；仪表盘新字段向后兼容（纯新增键）。
+- **风险**：低。前端为主；后端仅 dashboard 投影扩展；既有 DOM 结构字符串契约（验证脚本依赖）未动。
+- **测试**：`node --check app.js` 通过；`python -m unittest discover -s tests` → **832 OK (skipped=2)**（含 ui.render 渲染壳测试与 dashboard 断言，纯新增键不破坏既有断言）；`yaml.safe_load(compose)` 通过；scan_secrets 见下一批记录。
+- **审查**：待独立审查 Agent 复核（下一波）。
+- **回滚**：git revert 本批；仪表盘新增键无消费者依赖，回滚无副作用。
+- **交接**：nodes 页的搜索/协议/探测点筛选与排序目前仍为客户端单页实现（数据一次性在手），§9.2 的服务端分页接 /api/v1/nodes 记为后续增强项；探测点页的拨号明细/错误分布聚合视图待 /api/v1/rounds/{id} observations 的 UI 化。

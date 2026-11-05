@@ -506,3 +506,49 @@ td.num, .num { font-variant-numeric: tabular-nums; }
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: .001ms !important; transition-duration: .001ms !important; }
 }
+
+/* ---------------- P6：视图路由 + 发布中心 ----------------
+ * 导航条 sticky 在 header 之下；`.view` 之间互斥显示（app.js 的 hash 路由）。
+ * 发布中心的 kv 卡与确认框是新增结构，验证脚本依赖的既有结构字符串
+ * （class="card"、table#nodes、src-table、input[data-x]）一律未动。 */
+.main-nav {
+  display: flex; gap: 2px; padding: 0 12px;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 6; overflow-x: auto;
+}
+.main-nav a {
+  padding: 9px 14px; color: var(--fg); text-decoration: none;
+  border-bottom: 2px solid transparent; white-space: nowrap; font-size: 13px;
+}
+.main-nav a.active { border-bottom-color: var(--accent); font-weight: 650; }
+.main-nav a:hover { background: var(--accent-soft); }
+
+.kvgrid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px; margin: 10px 14px;
+}
+.kv { border: 1px solid var(--line); border-radius: var(--r-sm); padding: 8px 10px; background: var(--panel-2); }
+.kv .k { font-size: 12px; color: var(--fg-soft); }
+.kv .v { margin-top: 2px; font-size: 14px; word-break: break-all; }
+
+table.samples { width: 100%; border-collapse: collapse; margin: 0 14px 8px; }
+table.samples th, table.samples td {
+  text-align: left; padding: 4px 10px; border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+#substore-preview-box h3 { margin: 10px 14px 4px; font-size: 13px; }
+
+.confirm-box {
+  border: 2px solid var(--warn); border-radius: var(--r);
+  padding: 12px 0 12px; margin: 10px 14px; background: var(--panel);
+}
+.confirm-box h3 { margin: 0 14px 6px; font-size: 14px; color: var(--warn); }
+.confirm-box .row { margin: 10px 14px 0; }
+
+.tiny-btn { padding: 2px 8px; font-size: 12px; }
+
+@media (max-width: 720px) {
+  .main-nav { padding: 0 8px; }
+  .main-nav a { padding: 8px 10px; }
+  .kvgrid { grid-template-columns: 1fr 1fr; }
+}
