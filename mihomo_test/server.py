@@ -14,11 +14,12 @@ from . import config as cfgmod
 from . import db
 from . import engine
 from . import gist_store
+from . import manual_publish
 from . import notifier
 from . import probe_dispatch
 from . import substore_bridge
 from . import ui
-from .store import Client, StoreError
+from .store import Client, NotFound, StoreError
 
 # Serialises rounds. A Lock rather than an Event: `Event.is_set()` followed by
 # `set()` is two steps, and two concurrent POST /api/run could both pass the
@@ -342,13 +343,20 @@ V1_NODE_STATUSES = ("alive", "pending", "dead", "unknown", "excluded")
 V1_ERROR_STATUS = {
     "BAD_PAYLOAD": 400,
     "UNSUPPORTED_MEDIA_TYPE": 415,
+    "BAD_CONTENT": 400,
     "ROUND_MISMATCH": 400,
     "UNKNOWN_PROBE": 404,
     "ROUND_STALE": 409,
     "DIGEST_MISMATCH": 409,
     "RESULT_LATE": 409,
-    "NOT_IMPLEMENTED": 501,
-    "PUSH_CONFIRM_REQUIRED": 501,
+    "NO_CANONICAL_ARTIFACT": 409,
+    "GIST_DISABLED": 409,
+    "PUSH_CONFIRM_REQUIRED": 409,
+    "CONFIRM_TOKEN_EXPIRED": 409,
+    "CONFIRM_TOKEN_MISMATCH": 409,
+    "CONFIRM_TOKEN_REUSED": 409,
+    "SUBSTORE_TARGET_MISSING": 409,
+    "SUBSTORE_ERROR": 502,
 }
 
 
@@ -492,6 +500,12 @@ def canonical_meta_digest():
     if not isinstance(meta, dict):
         return ""
     return str(meta.get("digest") or "")
+
+
+def _substore_audit(audit_id, target, digest, status, summary=None):
+    """One publish_audit row for a manual Sub-Store action (指导 §13.5)."""
+    db.record_publish_audit(audit_id, "substore", target, None, digest,
+                            "admin", status, summary)
 
 
 def _gist_publication_state():
@@ -967,9 +981,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._v1_result(cfg, match.group(1), match.group(2))
         if path == "/api/v1/gist/publish":
             return self._v1_gist_publish(cfg, path)
-        if path in ("/api/v1/substore/preview", "/api/v1/substore/confirm-token",
-                    "/api/v1/substore/push"):
-            return self._v1_substore_placeholder(cfg, path, path.rsplit("/", 1)[-1])
+        if path == "/api/v1/substore/preview":
+            return self._v1_substore_preview(cfg, path)
+        if path == "/api/v1/substore/confirm-token":
+            return self._v1_substore_confirm(cfg, path)
+        if path == "/api/v1/substore/push":
+            return self._v1_substore_push(cfg, path)
         return self._send(404, {"error": "not found", "path": path})
 
     def _v1_deny_probe(self, code):
@@ -1128,24 +1145,141 @@ class Handler(BaseHTTPRequestHandler):
                                 "changed": result.get("changed") or [],
                                 "audit_id": audit_id})
 
-    def _v1_substore_placeholder(self, cfg, path, action):
-        """P5 占位：人工推送三件套（预览/确认 token/推送）全部待落地。
+    def _v1_substore_preview(self, cfg, path):
+        """P5：canonical 与 Sub-Store 目标对象的差异预览（只读，指导 §9.4）。
 
-        现在就是 501 而不是静默成功，是因为「自动推送」正是本轮要删除的
-        行为（指导 §0）：一个假装成功的占位比一个响亮的未实现更危险。
+        目标对象不存在不是错误——预览如实显示"全部为新增"，推送腿才会以
+        SUBSTORE_TARGET_MISSING 拒绝（update-only，绝不新建）。
         """
         if not self._v1_admin(cfg, path):
             return None
         self._v1_json_body()
         audit_id = uuid.uuid4().hex
-        db.record_publish_audit(
-            audit_id, "substore",
-            str((cfg.get("substore") or {}).get("target_name") or ""),
-            None, "", "admin", "not_implemented",
-            {"phase": "P5", "action": action})
-        db.log("info", f"Sub-Store {action} 占位 audit={audit_id}（P5 落地）")
-        return self._send(501, {"error": "PUSH_CONFIRM_REQUIRED",
-                                "message": "P5 落地", "audit_id": audit_id})
+        target = manual_publish.target_name(cfg)
+        artifact = canonical_artifact()
+        if artifact is None:
+            _substore_audit(audit_id, target, "", "no_artifact",
+                            {"action": "preview"})
+            db.log("warn", f"Sub-Store 预览拒绝 audit={audit_id}: "
+                           f"NO_CANONICAL_ARTIFACT")
+            status, payload = _v1_error("NO_CANONICAL_ARTIFACT",
+                                        "尚无 canonical 导出，先完成一轮测活",
+                                        audit_id=audit_id)
+            return self._send(status, payload)
+        content, meta = artifact
+        try:
+            canonical = manual_publish.parse_proxies(content.decode("utf-8"))
+        except manual_publish.PublishError as exc:
+            _substore_audit(audit_id, target, "", f"rejected_{exc.code}",
+                            {"action": "preview"})
+            status, payload = _v1_error(exc.code, exc.message, audit_id=audit_id)
+            return self._send(status, payload)
+        client = store_client(cfg)
+        missing = False
+        try:
+            current = client.fetch_sub_proxies(target)
+        except NotFound:
+            current, missing = [], True
+        except StoreError as exc:
+            _substore_audit(audit_id, target, "", "substore_error",
+                            {"action": "preview"})
+            db.log("warn", f"Sub-Store 预览失败 audit={audit_id}: {exc}")
+            status, payload = _v1_error("SUBSTORE_ERROR",
+                                        f"Sub-Store 读取失败: {exc}",
+                                        audit_id=audit_id)
+            return self._send(status, payload)
+        preview = manual_publish.diff_preview(current, canonical)
+        _substore_audit(audit_id, target, str(meta.get("digest") or ""),
+                        "preview",
+                        {"action": "preview", "missing_target": missing,
+                         "added": preview["added"],
+                         "removed": preview["removed"],
+                         "renamed": preview["renamed"]})
+        return self._send(200, {
+            "ok": True, "target": target, "digest": meta.get("digest"),
+            "node_count": meta.get("count"), "missing_target": missing,
+            "preview": preview, "audit_id": audit_id})
+
+    def _v1_substore_confirm(self, cfg, path):
+        """P5：签发 60s 一次性 confirm token，绑定 target+digest+节点数。"""
+        if not self._v1_admin(cfg, path):
+            return None
+        self._v1_json_body()
+        audit_id = uuid.uuid4().hex
+        target = manual_publish.target_name(cfg)
+        artifact = canonical_artifact()
+        if artifact is None:
+            _substore_audit(audit_id, target, "", "no_artifact",
+                            {"action": "confirm-token"})
+            status, payload = _v1_error("NO_CANONICAL_ARTIFACT",
+                                        "尚无 canonical 导出，先完成一轮测活",
+                                        audit_id=audit_id)
+            return self._send(status, payload)
+        content, meta = artifact
+        digest = str(meta.get("digest") or "")
+        count = int(meta.get("count") or 0)
+        issued = manual_publish.issue_confirm_token(target, digest, count)
+        _substore_audit(audit_id, target, digest, "confirm_issued",
+                        {"action": "confirm-token", "node_count": count})
+        db.log("info", f"Sub-Store 确认 token 签发 audit={audit_id} "
+                       f"target={target} nodes={count}")
+        return self._send(200, {
+            "ok": True, "confirm_token": issued["token"],
+            "expires_in": issued["expires_in"], "target": target,
+            "digest": digest, "node_count": count, "audit_id": audit_id})
+
+    def _v1_substore_push(self, cfg, path):
+        """P5：消费 confirm token 后 update-only 推送（指导 §9.4/§13.5）。"""
+        if not self._v1_admin(cfg, path):
+            return None
+        body = self._v1_json_body()
+        audit_id = uuid.uuid4().hex
+        return self._substore_push_core(cfg, body, audit_id)
+
+    def _substore_push_core(self, cfg, body, audit_id):
+        """确认→消费→推送 的共享主体（v1 端点与 /api/push 同一条路）。"""
+        target = manual_publish.target_name(cfg)
+        artifact = canonical_artifact()
+        if artifact is None:
+            _substore_audit(audit_id, target, "", "no_artifact",
+                            {"action": "push"})
+            db.log("warn", f"Sub-Store 推送拒绝 audit={audit_id}: "
+                           f"NO_CANONICAL_ARTIFACT")
+            status, payload = _v1_error("NO_CANONICAL_ARTIFACT",
+                                        "尚无 canonical 导出，先完成一轮测活",
+                                        audit_id=audit_id)
+            return self._send(status, payload)
+        content, meta = artifact
+        digest = str(meta.get("digest") or "")
+        count = int(meta.get("count") or 0)
+        try:
+            manual_publish.consume_confirm_token(body.get("confirm_token"),
+                                                 target, digest, count)
+        except manual_publish.PublishError as exc:
+            _substore_audit(audit_id, target, digest, f"rejected_{exc.code}",
+                            {"action": "push"})
+            db.log("warn", f"Sub-Store 推送拒绝 audit={audit_id}: {exc.code}")
+            status, payload = _v1_error(exc.code, exc.message, audit_id=audit_id)
+            return self._send(status, payload)
+        try:
+            text = content.decode("utf-8")
+            manual_publish.parse_proxies(text)
+            result = manual_publish.push_canonical(store_client(cfg), cfg,
+                                                   text, count)
+        except manual_publish.PublishError as exc:
+            _substore_audit(audit_id, target, digest, "publish_failed",
+                            {"action": "push", "error_code": exc.code})
+            db.log("warn", f"Sub-Store 推送失败 audit={audit_id} "
+                           f"code={exc.code}")
+            status, payload = _v1_error(exc.code, exc.message, audit_id=audit_id)
+            return self._send(status, payload)
+        _substore_audit(audit_id, target, digest, "pushed",
+                        {"action": "push", "count": count,
+                         "action_taken": result["action"]})
+        return self._send(200, {
+            "ok": True, "status": "pushed", "target": target,
+            "count": count, "digest": digest,
+            "substore_action": result["action"], "audit_id": audit_id})
 
     def do_POST(self):
         cfg = _State.cfg
@@ -1196,23 +1330,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(409, {"error": "a round is already running"})
                 return self._send(200, {"started": True})
             if path == "/api/push":
-                if not cfg["publish"].get("enabled", True):
-                    # Exports are written only while publishing is on, so the
-                    # files this push would read are the snapshot from whenever
-                    # it was last enabled. Upserting them would hand Sub-Store
-                    # subscriptions that serve nodes no round maintains any
-                    # more -- and `push_exports` reports success for that,
-                    # which reads as a working integration built on stale data.
-                    return self._send(400, {"error":
-                        "publish.enabled 为 false，导出已停用，没有可推送的内容"
-                        "（推送只会写入停用前留下的旧文件）。先开启发布再推送。"})
-                client = store_client(cfg)
-                # Enabled sources only: a disabled one is not published, so
-                # pushing it -- or reporting it as "no export yet" -- is wrong
-                # on both counts. See `engine.publish_keys`.
-                result = engine.push_exports(cfg, client, engine.publish_keys(cfg))
-                return self._send(200, {"message": engine.push_summary(result),
-                                        "detail": result})
+                # P5 之后一键推送必须二次确认：与 /api/v1/substore/push 共用
+                # 同一条 confirm-token 路径（指导 §0.6——不允许绕过人工确认的
+                # 推送动作存在）。响应形状与 v1 端点一致。body 已在 do_POST
+                # 读取，不能重复读流。
+                audit_id = uuid.uuid4().hex
+                return self._substore_push_core(cfg, body, audit_id)
             if path == "/api/alert-test":
                 return self._send(200, {"message": "；".join(notifier.test_channels(cfg))})
             if path == "/api/link":

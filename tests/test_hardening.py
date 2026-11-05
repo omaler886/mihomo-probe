@@ -576,18 +576,23 @@ class HttpSurfaceTest(unittest.TestCase):
             self.assertEqual(code, 200, payload)
             self.assertEqual([k["mode"] for k in started], ["chain"])
 
-    def test_push_is_refused_while_publishing_is_disabled(self):
-        """A push reads whatever file is on disk; with publish off that is a
-        stale snapshot no round maintains, and upserting it hands Sub-Store
-        subscriptions that serve nodes nothing keeps current -- reported as
-        success, which reads as a working integration built on stale data."""
-        (engine.EXPORT_DIR / "air.yaml").write_text("proxies: []\n", encoding="utf-8")
+    def test_push_never_runs_without_the_confirm_token(self):
+        """P5：/api/push 收编进 confirm-token 人工推送（指导 §0.6/§13.5）。
+
+        旧的 publish.enabled=400 门已删除——陈旧快照问题由 canonical 产物 +
+        一次性 token 双门替代：磁盘上有产物也必须先预览签发 60s token 才能
+        推送；没有人工确认，任何内容都到不了 Sub-Store。"""
+        exports = cfgmod.DATA / "exports"
+        exports.mkdir(parents=True, exist_ok=True)
+        (exports / "mihomo-alive.yaml").write_text("proxies: []\n", encoding="utf-8")
+        (exports / "mihomo-alive.meta.json").write_text(
+            json.dumps({"count": 0, "digest": "d1"}), encoding="utf-8")
         code, _ = self.srv.post(f"/api/config?token={self.ADMIN}",
                                 {"publish": {"enabled": False}})
         self.assertEqual(code, 200)
         code, payload = self.srv.post(f"/api/push?token={self.ADMIN}", {})
-        self.assertEqual(code, 400, payload)
-        self.assertIn("publish.enabled", payload["error"])
+        self.assertEqual(code, 409, payload)
+        self.assertEqual(payload["error"], "PUSH_CONFIRM_REQUIRED")
 
     def test_a_measurement_only_sources_save_skips_the_substore_sync(self):
         """Flipping 直连/链式 cannot change what `link_substore` would write.

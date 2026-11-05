@@ -121,3 +121,21 @@
 - **审查**：待独立审查 Agent 复核（下一波）。
 - **回滚**：git revert 本批；删除 `data/exports/mihomo-alive.*` 即可（Gist 侧内容由远端保留，无本地状态需回滚）。
 - **交接**：dashboard 的 substore 块仍 null、/api/v1/substore/* 仍 501 占位 → P5；Rust 侧 canonical/Gist/聚合模型缺口记入 `workstreams/21_RUST_PARITY.md`（G-1..G-5）。
+
+## P5-1 — 人工 Sub-Store 推送三步 + confirm-token 防重放 + 删除自动回灌链（2026-11-06）
+
+- **执行者**：实现 Agent（P5）
+- **文件**：新增 `mihomo_test/manual_publish.py`（约 200 行）、`tests/test_manual_publish.py`（约 190 行，17 用例）；修改 `mihomo_test/server.py`（三端点落地 + `/api/push` 收编 + 错误码表）、`mihomo_test/engine.py`（删轮末自动 push）、`tests/test_probe_dispatch.py`（占位测试替换为 4 个端点用例）、`tests/test_logic.py`（PushEndpointTest 重写为新契约）、`tests/test_hardening.py`（/api/push 400 门用例改为 409 token 门）。
+- **变更**：
+  1. **manual_publish.py**：`diff_preview`（指纹身份；改名不成对呈现；样例只含 name/type，§13.7 凭据不进预览/日志）；`issue_confirm_token`/`consume_confirm_token`（60s 一次性，绑定 target+digest+节点数；同 target 重签立即作废旧 token；已用/过期/绑定不符/未知分别返回 `CONFIRM_TOKEN_REUSED`/`CONFIRM_TOKEN_EXPIRED`/`CONFIRM_TOKEN_MISMATCH`/`PUSH_CONFIRM_REQUIRED`，进程内注册表 + 锁，防重放）；`push_canonical`（store.update_only，目标缺失 → `SUBSTORE_TARGET_MISSING` 拒绝新建）；`parse_proxies`（非法 YAML → `BAD_CONTENT`）。
+  2. **三端点**：`POST /api/v1/substore/preview`（只读 diff；目标不存在如实标注 missing_target，非错误）；`confirm-token`（签发并审计 confirm_issued，token 值不入审计摘要）；`push`（消费 token → update-only → 审计 pushed/rejected_*/publish_failed）。错误码表新增 `NO_CANONICAL_ARTIFACT`/`GIST_DISABLED`/`PUSH_CONFIRM_REQUIRED`/`CONFIRM_TOKEN_*`/`SUBSTORE_TARGET_MISSING`(409)、`SUBSTORE_ERROR`(502)、`BAD_CONTENT`(400)，移除 `NOT_IMPLEMENTED`。
+  3. **/api/push 收编**：删除旧「一键推送 per-source 导出」契约（publish.enabled 400 门一并移除），与 v1 push 共用 `_substore_push_core`（无 token 一律 409）。
+  4. **删除自动回灌（指导 §0.1/§0.6）**：`_publish_sources` 的 `push_exports` 轮末调用点删除——Gist 发布、scheduler 轮末与 Sub-Store 写再无耦合；`push_exports` 本体保留为 CLI/旧门面（双开关门禁不变）。
+  5. **§17.8 裁决（token 绑定维度）**：指导 §9.4 写「绑定 target+revision+digest」；canonical meta 不携带 Gist revision，故绑定实现为 **target+digest+节点数**（digest 即内容身份，节点数防「同 digest 不同规模」的构造混淆）；若后续 meta 增加 revision 可无缝加绑。
+- **原因**：指导 §15 Phase 5（§4.6/§9.4/§10/§13.5）。
+- **影响**：Sub-Store 唯一写路径 = 人工预览+二次确认+60s token；自动推送路径已删并有测试钉住不可达；`24h 零写`保证从「双开关默认关」升级为「结构上无自动写」。
+- **风险**：中。/api/push 契约变更（旧客户端将得到 409 而非 400/200，属预期破坏性变更）；web/app.js 的「一键推送」按钮在 P6 重构前对新契约显示失败提示，属诚实降级。
+- **测试**：`tests.test_manual_publish` 17 OK；`test_probe_dispatch`/`test_logic`/`test_hardening` 相关用例更新后全绿；全量 `python -m unittest discover -s tests` → **832 OK (skipped=2)**（815 + P5 净增 17）；`tools/scan_secrets.py --include-untracked` clean；`cargo test --locked --workspace` 28 个测试目标全 ok、0 failed（Rust 树本批零改动，例行复跑）。
+- **审查**：待独立审查 Agent 复核（下一波）。
+- **回滚**：git revert 本批。注意：回滚后轮末自动回灌恢复依赖 `push_to_substore`+`allow_legacy_substore_write` 双开关（默认关），无静默写风险。
+- **交接**：Web 发布中心（Gist 区+Sub-Store 区 UI、二次确认弹窗）→ P6；`workstreams/21_RUST_PARITY.md` G-4 随本批从「无」变「Python 已落地、Rust 待移植」。

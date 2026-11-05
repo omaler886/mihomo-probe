@@ -11,6 +11,7 @@ import time
 import contextlib
 import unittest
 import unittest.mock
+import urllib.error
 import urllib.request
 from pathlib import Path
 import tempfile
@@ -21,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mihomo_test import config as cfgmod
 from mihomo_test import core as coremod
-from mihomo_test import db, engine, notifier, policy, server
+from mihomo_test import db, engine, manual_publish, notifier, policy, server
 from mihomo_test.store import Client, NotFound, StoreError
 
 try:
@@ -5482,78 +5483,73 @@ class PruneLocalSubsTest(unittest.TestCase):
 
 
 class PushEndpointTest(unittest.TestCase):
-    """The defect was at the call site, so the endpoint itself is exercised.
+    """/api/push 自 P5 起收编进 confirm-token 人工推送（指导 §0.6/§9.4）。
 
-    `engine.push_exports` was always correct; what fed it was not. A unit test
-    on `publish_keys` alone would have stayed green through the whole bug, so
-    this drives the real handler over a socket.
+    旧的「一键推送 per-source 导出」契约已删除：无确认、无审计、可绕过人工
+    意愿的推送正是 §0.6 要清除的行为。现在 /api/push 与 /api/v1/substore/push
+    是同一条路——无有效 token 409，token 有效才 update-only 写 canonical 目标。
+    per-source 推送只存在于 CLI 与旧门面 push_exports（用例见 PushExports*）。
     """
 
     def setUp(self):
+        manual_publish.reset_tokens()
+        self.addCleanup(manual_publish.reset_tokens)
         self.tmp = Path(tempfile.mkdtemp())
-        self._old_dir = engine.EXPORT_DIR
-        engine.EXPORT_DIR = self.tmp
+        (self.tmp / "exports").mkdir()
+        self._old_data = cfgmod.DATA
+        cfgmod.DATA = self.tmp
         self._old_cfg = server._State.cfg
-        # The legacy write path is update-only, so the fake needs the
-        # canonical subs to exist before the handler runs (workstreams/18).
-        self.store = _FakePushStore(present=["probe-air-local"])
-        for key, count in (("air", 5), ("eps1", 9)):
-            (self.tmp / f"{key}.yaml").write_text("proxies: []\n", encoding="utf-8")
-            (self.tmp / f"{key}.meta.json").write_text(
-                json.dumps({"count": count}), encoding="utf-8")
+        # update-only：目标对象必须预先存在（与生产语义一致）。
+        self.store = _FakePushStore(present=["mihomo-probe-alive"])
+        (self.tmp / "exports" / "mihomo-alive.yaml").write_text(
+            "proxies: []\n", encoding="utf-8")
+        (self.tmp / "exports" / "mihomo-alive.meta.json").write_text(
+            json.dumps({"count": 2, "digest": "d1"}), encoding="utf-8")
 
     def tearDown(self):
-        engine.EXPORT_DIR = self._old_dir
+        cfgmod.DATA = self._old_data
         server._State.cfg = self._old_cfg
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def post_push(self, cfg):
-        # `cfg["substore"]["backend"]` is still evaluated as the argument, so
-        # the stub has to be a real key even though Client itself is patched.
-        cfg.setdefault("substore", {"backend": "http://stub"})
-        with unittest.mock.patch.object(server, "Client", lambda *a, **k: self.store):
+    def _serve(self, cfg, path="/api/push", data=b"{}"):
+        with unittest.mock.patch.object(server, "Client",
+                                        lambda *a, **k: self.store):
             httpd = server.serve(cfg, "127.0.0.1", 0)
             thread = threading.Thread(target=httpd.serve_forever, daemon=True)
             thread.start()
             try:
                 port = httpd.server_address[1]
                 request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/api/push", data=b"{}",
+                    f"http://127.0.0.1:{port}{path}", data=data,
                     headers={"Content-Type": "application/json",
                              "X-Auth-Token": "tok"})
-                with urllib.request.urlopen(request, timeout=15) as response:
-                    return json.loads(response.read().decode("utf-8"))
+                try:
+                    with urllib.request.urlopen(request, timeout=15) as response:
+                        return (response.status,
+                                json.loads(response.read().decode("utf-8")))
+                except urllib.error.HTTPError as exc:
+                    return exc.code, json.loads(exc.read().decode("utf-8"))
             finally:
                 httpd.shutdown()
                 httpd.server_close()
 
-    def test_endpoint_pushes_enabled_sources_and_skips_disabled_ones(self):
-        cfg = {
-            "auth": {"token": "tok"},
-            "publish": {"prefix": "probe",
-                        "push_to_substore": True,
-                        "allow_legacy_substore_write": True},
-            "sources": [{"key": "air", "enabled": True},
-                        {"key": "eps1", "enabled": False}],
-        }
-        payload = self.post_push(cfg)
-        self.assertEqual(self.store.names(), ["probe-air-local"])
-        self.assertEqual(payload["message"], "已推送 1 个订阅")
-        self.assertEqual([r["key"] for r in payload["detail"]], ["air"])
-        self.assertNotIn("还没有输出文件", json.dumps(payload, ensure_ascii=False))
+    def test_push_without_confirm_token_is_rejected(self):
+        code, payload = self._serve({"auth": {"token": "tok"}})
+        self.assertEqual(code, 409)
+        self.assertEqual(payload["error"], "PUSH_CONFIRM_REQUIRED")
 
-    def test_endpoint_returns_a_summary_plus_records_not_one_long_sentence(self):
-        cfg = {
-            "auth": {"token": "tok"},
-            "publish": {"prefix": "probe",
-                        "push_to_substore": True,
-                        "allow_legacy_substore_write": True},
-            "sources": [{"key": "air", "enabled": True}],
-        }
-        payload = self.post_push(cfg)
-        self.assertEqual(payload["message"], "已推送 1 个订阅")
-        self.assertEqual(payload["detail"][0]["text"], "probe-air-local: updated (5 节点)")
-        self.assertTrue(payload["detail"][0]["ok"])
+    def test_push_with_confirm_token_updates_only_the_canonical_target(self):
+        cfg = {"auth": {"token": "tok"}}
+        code, issued = self._serve(cfg, "/api/v1/substore/confirm-token")
+        self.assertEqual(code, 200)
+        self.assertEqual(issued["node_count"], 2)
+        code, payload = self._serve(
+            cfg, "/api/v1/substore/push",
+            json.dumps({"confirm_token": issued["confirm_token"]}).encode())
+        self.assertEqual(code, 200)
+        self.assertEqual(payload["status"], "pushed")
+        self.assertEqual(payload["target"], "mihomo-probe-alive")
+        self.assertEqual(self.store.names(), ["mihomo-probe-alive"])
 
 
 

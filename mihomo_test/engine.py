@@ -2664,8 +2664,9 @@ def _publish_sources(cfg, store, sources, alive_by_source, proxy_by_name, countr
                       chain_fronts=chain_fronts, alive_forms=(alive_forms or {}).get(key))
     canonical = _write_canonical_export(cfg, sources, alive_by_source, proxy_by_name,
                                         countries, chain_fronts, alive_forms, log)
-    if cfg["publish"].get("push_to_substore"):
-        push_exports(cfg, store, [s["key"] for s in sources if s["key"] in keys], log)
+    # 自动回灌 Sub-Store 已删除（指导 §0.1，P5）：轮末 push 与 Gist 发布联动
+    # 一并移除，Sub-Store 的唯一写路径是 manual_publish 的人工三步
+    # （预览 → confirm-token → push，全落 publish_audit）。
     return True, canonical
 
 

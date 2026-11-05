@@ -28,8 +28,10 @@ from mihomo_test import config as cfgmod
 from mihomo_test import core as coremod
 from mihomo_test import db
 from mihomo_test import gist_store
+from mihomo_test import manual_publish
 from mihomo_test import probe_dispatch
 from mihomo_test import server
+from mihomo_test.store import NotFound
 
 try:
     import _isolation
@@ -946,22 +948,141 @@ class ServerV1Test(unittest.TestCase):
         summary = json.loads(rows[0]["summary_json"])
         self.assertEqual(summary["error_code"], "GIST_HTTP_500")
 
-    def test_substore_placeholders_write_audit(self):
+    def test_substore_push_requires_confirmation_and_audits(self):
+        # 无 artifact：三个口都 409 NO_CANONICAL_ARTIFACT（拒绝也留痕）
         for action in ("preview", "confirm-token", "push"):
             with self.subTest(action=action):
                 code, body = self.srv.post(f"/api/v1/substore/{action}", {},
                                            self.ADMIN_HEADER)
-                self.assertEqual(code, 501)
-                parsed = json.loads(body)
-                self.assertEqual(parsed["error"], "PUSH_CONFIRM_REQUIRED")
-                self.assertTrue(parsed["audit_id"])
+                self.assertEqual(code, 409)
+                self.assertEqual(json.loads(body)["error"],
+                                 "NO_CANONICAL_ARTIFACT")
+                self.assertTrue(json.loads(body)["audit_id"])
         code, _ = self.srv.post("/api/v1/substore/push", {}, None)
         self.assertEqual(code, 401)
-        rows = db.list_publish_audit(10)
-        self.assertEqual(len(rows), 3)
+        # 有 artifact 但无有效 token → 409 PUSH_CONFIRM_REQUIRED（不再 501）
+        (cfgmod.DATA / "exports").mkdir(parents=True, exist_ok=True)
+        (cfgmod.DATA / "exports" / "mihomo-alive.yaml").write_bytes(
+            b"proxies: []\n")
+        (cfgmod.DATA / "exports" / "mihomo-alive.meta.json").write_text(
+            json.dumps({"count": 1, "digest": "d1"}), encoding="utf-8")
+        code, body = self.srv.post("/api/v1/substore/push",
+                                   {"confirm_token": "nope"},
+                                   self.ADMIN_HEADER)
+        self.assertEqual(code, 409)
+        self.assertEqual(json.loads(body)["error"], "PUSH_CONFIRM_REQUIRED")
+        code, body = self.srv.post("/api/v1/substore/push", {},
+                                   self.ADMIN_HEADER)
+        self.assertEqual(code, 409)
+        self.assertEqual(json.loads(body)["error"], "PUSH_CONFIRM_REQUIRED")
+        rows = db.list_publish_audit(20)
         self.assertEqual({row["kind"] for row in rows}, {"substore"})
         self.assertEqual({row["target"] for row in rows},
                          {"mihomo-probe-alive"})
+        # created_at 秒级分辨率下同秒行序由 uuid 决定，断言集合而非首行
+        statuses = {row["status"] for row in rows}
+        self.assertIn("rejected_PUSH_CONFIRM_REQUIRED", statuses)
+
+    def test_substore_manual_push_full_flow(self):
+        manual_publish.reset_tokens()
+        self.addCleanup(manual_publish.reset_tokens)
+        exports = cfgmod.DATA / "exports"
+        exports.mkdir(parents=True, exist_ok=True)
+        (exports / "mihomo-alive.yaml").write_bytes(
+            b"proxies:\n  - {name: a, type: vless, server: s, port: 1,"
+            b" uuid: u}\n")
+        (exports / "mihomo-alive.meta.json").write_text(
+            json.dumps({"count": 1, "digest": "d1"}), encoding="utf-8")
+
+        class _StubStore:
+            def __init__(self):
+                self.calls = []
+
+            def fetch_sub_proxies(self, name):
+                raise NotFound("no such sub")
+
+            def update_only(self, kind, name, payload):
+                self.calls.append((kind, name, payload))
+                return "updated"
+
+        stub = _StubStore()
+        with mock.patch.object(server, "store_client", lambda cfg: stub):
+            # 1) 预览：全为新增
+            code, body = self.srv.post("/api/v1/substore/preview", {},
+                                       self.ADMIN_HEADER)
+            self.assertEqual(code, 200)
+            parsed = json.loads(body)
+            self.assertTrue(parsed["missing_target"])
+            self.assertEqual(parsed["preview"]["added"], 1)
+            self.assertEqual(parsed["preview"]["samples"]["added"],
+                             [{"name": "a", "type": "vless"}])
+            # 2) 签发一次性确认 token
+            code, body = self.srv.post("/api/v1/substore/confirm-token", {},
+                                       self.ADMIN_HEADER)
+            self.assertEqual(code, 200)
+            token = json.loads(body)["confirm_token"]
+            self.assertTrue(token)
+            # 3) 推送：token 消费后 update-only 命中绑定对象
+            code, body = self.srv.post("/api/v1/substore/push",
+                                       {"confirm_token": token},
+                                       self.ADMIN_HEADER)
+            self.assertEqual(code, 200)
+            parsed = json.loads(body)
+            self.assertEqual(parsed["status"], "pushed")
+            self.assertEqual(parsed["substore_action"], "updated")
+            self.assertEqual(stub.calls,
+                             [("sub", "mihomo-probe-alive",
+                               mock.ANY)])
+            self.assertEqual(stub.calls[0][2]["content"],
+                             "proxies:\n  - {name: a, type: vless, server: s,"
+                             " port: 1, uuid: u}\n")
+        # 4) 同一 token 重放 → 409 CONFIRM_TOKEN_REUSED（防重放），审计留痕
+        code, body = self.srv.post("/api/v1/substore/push",
+                                   {"confirm_token": token},
+                                   self.ADMIN_HEADER)
+        self.assertEqual(code, 409)
+        self.assertEqual(json.loads(body)["error"], "CONFIRM_TOKEN_REUSED")
+        statuses = [row["status"] for row in db.list_publish_audit(20)]
+        self.assertIn("preview", statuses)
+        self.assertIn("confirm_issued", statuses)
+        self.assertIn("pushed", statuses)
+        self.assertIn("rejected_CONFIRM_TOKEN_REUSED", statuses)
+
+    def test_substore_push_refuses_changed_content(self):
+        # 签发后 canonical 变化（digest/节点数变）→ CONFIRM_TOKEN_MISMATCH
+        manual_publish.reset_tokens()
+        self.addCleanup(manual_publish.reset_tokens)
+        exports = cfgmod.DATA / "exports"
+        exports.mkdir(parents=True, exist_ok=True)
+        (exports / "mihomo-alive.yaml").write_bytes(b"proxies: []\n")
+        (exports / "mihomo-alive.meta.json").write_text(
+            json.dumps({"count": 0, "digest": "d1"}), encoding="utf-8")
+        with mock.patch.object(server, "store_client",
+                               lambda cfg: type("S", (), {
+                                   "fetch_sub_proxies": lambda self, n: [],
+                                   "update_only": lambda self, k, n, p: "updated"})()):
+            code, body = self.srv.post("/api/v1/substore/confirm-token", {},
+                                       self.ADMIN_HEADER)
+            token = json.loads(body)["confirm_token"]
+            # 内容变化：digest 变了
+            (exports / "mihomo-alive.meta.json").write_text(
+                json.dumps({"count": 2, "digest": "d2"}), encoding="utf-8")
+            code, body = self.srv.post("/api/v1/substore/push",
+                                       {"confirm_token": token},
+                                       self.ADMIN_HEADER)
+        self.assertEqual(code, 409)
+        self.assertEqual(json.loads(body)["error"], "CONFIRM_TOKEN_MISMATCH")
+
+    def test_api_push_requires_confirm_token_too(self):
+        # 旧的一键推送收编进同一条 confirm-token 路（§0.6：无绕过人工确认的推送）
+        exports = cfgmod.DATA / "exports"
+        exports.mkdir(parents=True, exist_ok=True)
+        (exports / "mihomo-alive.yaml").write_bytes(b"proxies: []\n")
+        (exports / "mihomo-alive.meta.json").write_text(
+            json.dumps({"count": 0, "digest": "d1"}), encoding="utf-8")
+        code, body = self.srv.post("/api/push", {}, self.ADMIN_HEADER)
+        self.assertEqual(code, 409)
+        self.assertEqual(json.loads(body)["error"], "PUSH_CONFIRM_REQUIRED")
 
 
 class _StubController:
