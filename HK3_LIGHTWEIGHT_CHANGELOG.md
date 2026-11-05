@@ -102,3 +102,22 @@
 - **测试**：本模块 53 OK；全量 **772 OK (skipped=2)**（770 + 2 个 digest 对齐用例）；scan_secrets clean；socket stderr 噪音 0（修了 addCleanup LIFO 与超时桩点两处根因）。
 - **回滚**：git revert 本批；data/probe_deadlines.json 可删，不影响账本。
 - **交接**：dashboard 的 gist/substore 时间戳与 gist/publish、substore 三口为 501/null 占位，P4/P5 填。
+
+## P4-1 — canonical 订阅产物 + Gist 固定四文件 + /api/v1/gist/publish（2026-11-06）
+
+- **执行者**：实现 Agent（P4a：canonical_export/gist_store/engine 接线工作区半成品；P4b：本批收口——meta 透传、§8 幂等门禁、API 端点、dashboard 接线、测试）
+- **文件**：新增 `mihomo_test/canonical_export.py`（274 行）、`mihomo_test/gist_store.py`（392 行）、`tests/test_canonical_export.py`（217 行）、`tests/test_gist_store.py`（387 行）；修改 `mihomo_test/engine.py`（canonical 接线 + `_publish_gist`）、`mihomo_test/server.py`（端点 + dashboard gist 块 + 磁盘产物读取）、`tests/test_probe_dispatch.py`（占位测试替换为 3 个端点用例）。
+- **变更**：
+  1. **canonical_export.build**（§4.4）：多来源 (proxies, groups) → 一份去重（连接参数指纹）、重命名（模板 {country} | {display_name}，冲突 #2/#3，只动 name 字段）、固定排序（country→protocol→normalized name→fingerprint）的 YAML；YAML 正文无每轮易变字段（内容不变 ⇒ sha 不变）；`source_aliases` 记多源同指纹。
+  2. **engine 接线**：`_write_canonical_export` 只聚合 `export_keys` 内来源（muted 源不得从 canonical 后门出去）；产物写 `data/exports/mihomo-alive.yaml` + `.meta.json`（原子 tmp+replace）；`cleanup_exports` 保护 canonical 不被按源清理误删；`_apply_and_publish` 在发布成功后调 `_publish_gist`（fire-and-forget：失败只追加 note「本轮完成，发布失败」+ audit，绝不影响账本结算）。
+  3. **gist_store.publish**（§4.5）：固定四文件（canonical/status/history/README）；GET 读远端 → **以 canonical 文件 sha 为幂等门禁** → 未变化零 PATCH 零 revision，变化则 PATCH 只含变化文件；首次空 Gist 一次 PATCH 建齐；429/5xx 有界退避、401/403/404/422 终态；token 仅从 `gist.token_env` 环境变量（回退 GITHUB_TOKEN_FILE）读；`mask()` 覆盖 PAT/Bearer/查询参数/十六进制/UUID；transport 注入测试不触网；history 滚动截断 100 轮。
+  4. **§17.8 裁决（revision 语义）**：指导 §8「内容 digest 未变化时不提交新 revision」钉在 **canonical 文件**上——status/history/README 是随行文件，只在 canonical 变化的同一 PATCH 里更新；否则带 updated_at 的 status 会让每轮都产生新 revision，幂等门禁名存实亡。最新轮状态由 /api/v1/dashboard 实时给出。
+  5. **meta 透传（P4b 修正）**：`_write_canonical_export` 返回 `(content, meta)` 成对直达发布器（此前传 meta=None 会丢 digest，status/README 与幂等门禁全瞎）；engine 在 status payload 显式写 digest。
+  6. **POST /api/v1/gist/publish（P4b，501→落地）**：admin 鉴权 + JSON 门禁；从磁盘读 canonical 产物发布（不重渲染，§8 去重保证）；无产物 409 `NO_CANONICAL_ARTIFACT`、gist 关闭 409 `GIST_DISABLED`、配置错误 409、上游失败 502 `GIST_PUBLISH_FAILED`（error_code 透传）；每次调用（含拒绝）落 publish_audit；dashboard `gist` 块改由 publish_audit 供给（last_published_at/revision/consistent_with_stable_round），只统计 published/no_change。
+- **原因**：指导 §15 Phase 4（§4.4/§4.5/§8/§10）。
+- **影响**：订阅出口收敛为唯一 canonical 产物；Gist 一个 revision = 一次真实节点集变化；Sub-Store 仍零自动写（P5 前维持）。
+- **风险**：中。engine 发布区改动；P1 契约 35 用例 + 全量回归锁死。
+- **测试**：`tests.test_gist_store`+`test_probe_dispatch`+`test_canonical_export` 96 OK；全量 `python -m unittest discover -s tests` → **815 OK (skipped=2)**（809 基线 + P4 净增 6）；`cargo test --locked --workspace` 0 failed（未触 Rust，例行复跑）；`cargo fmt --all -- --check` 通过；`cargo clippy --locked --workspace --all-targets -- -D warnings` 通过；`tools/scan_secrets.py --include-untracked` clean。
+- **审查**：待独立审查 Agent 复核（下一波）。
+- **回滚**：git revert 本批；删除 `data/exports/mihomo-alive.*` 即可（Gist 侧内容由远端保留，无本地状态需回滚）。
+- **交接**：dashboard 的 substore 块仍 null、/api/v1/substore/* 仍 501 占位 → P5；Rust 侧 canonical/Gist/聚合模型缺口记入 `workstreams/21_RUST_PARITY.md`（G-1..G-5）。

@@ -27,6 +27,7 @@ import mihomo_test.__main__ as agent_mod
 from mihomo_test import config as cfgmod
 from mihomo_test import core as coremod
 from mihomo_test import db
+from mihomo_test import gist_store
 from mihomo_test import probe_dispatch
 from mihomo_test import server
 
@@ -868,18 +869,82 @@ class ServerV1Test(unittest.TestCase):
 
     # -- 发布占位（P4/P5）------------------------------------------------
 
-    def test_gist_publish_placeholder_writes_audit(self):
+    def test_gist_publish_rejects_without_artifact_and_keeps_auth(self):
+        # 未有 canonical 产物 → 409 + 审计（拒绝也留痕）；匿名与探针 token 都进不来。
         code, body = self.srv.post("/api/v1/gist/publish", {}, self.ADMIN_HEADER)
-        self.assertEqual(code, 501)
-        parsed = json.loads(body)
-        self.assertEqual(parsed["error"], "NOT_IMPLEMENTED")
-        self.assertTrue(parsed["audit_id"])
+        self.assertEqual(code, 409)
+        self.assertEqual(json.loads(body)["error"], "NO_CANONICAL_ARTIFACT")
+        self.assertTrue(json.loads(body)["audit_id"])
         code, _ = self.srv.post("/api/v1/gist/publish", {}, None)
+        self.assertEqual(code, 401)
+        code, _ = self.srv.post("/api/v1/gist/publish", {}, self.PROBE_HEADER)
         self.assertEqual(code, 401)
         rows = db.list_publish_audit(10)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["kind"], "gist")
-        self.assertEqual(rows[0]["status"], "not_implemented")
+        self.assertEqual(rows[0]["status"], "no_artifact")
+
+    def test_gist_publish_success_flow_and_dashboard(self):
+        exports = cfgmod.DATA / "exports"
+        exports.mkdir(parents=True, exist_ok=True)
+        (exports / "mihomo-alive.yaml").write_bytes(b"proxies: []\n")
+        (exports / "mihomo-alive.meta.json").write_text(
+            json.dumps({"count": 0, "digest": "d1", "content_sha256": "s1"}),
+            encoding="utf-8")
+        captured = {}
+
+        def fake_publish(cfg, content, meta, log=None, status_payload=None,
+                         history_text=None, **kw):
+            captured["content"], captured["meta"] = content, meta
+            captured["status_payload"] = status_payload
+            return {"status": "no_change", "digest": "d1",
+                    "content_sha256": "s1", "revision": "r9"}
+
+        with mock.patch.object(gist_store, "publish", fake_publish):
+            code, body = self.srv.post("/api/v1/gist/publish", {},
+                                       self.ADMIN_HEADER)
+        self.assertEqual(code, 200)
+        parsed = json.loads(body)
+        self.assertEqual(parsed["status"], "no_change")
+        self.assertEqual(parsed["revision"], "r9")
+        self.assertEqual(parsed["digest"], "d1")
+        # 磁盘上的 canonical 产物原样进发布器：不重渲染、不重建（§8 去重保证）
+        self.assertEqual(captured["content"], b"proxies: []\n")
+        self.assertEqual(captured["meta"]["digest"], "d1")
+        self.assertEqual(captured["status_payload"]["digest"], "d1")
+        rows = db.list_publish_audit(10)
+        self.assertEqual(rows[0]["status"], "no_change")
+        self.assertEqual(rows[0]["revision"], "r9")
+        self.assertEqual(rows[0]["digest"], "d1")
+        # dashboard 的 gist 块来自 publish_audit，不再是恒 null
+        code, body = self.srv.get("/api/v1/dashboard", self.ADMIN_HEADER)
+        self.assertEqual(code, 200)
+        gist_block = json.loads(body)["gist"]
+        self.assertEqual(gist_block["revision"], "r9")
+        self.assertTrue(gist_block["consistent_with_stable_round"])
+
+    def test_gist_publish_upstream_failure_is_audited_and_502(self):
+        exports = cfgmod.DATA / "exports"
+        exports.mkdir(parents=True, exist_ok=True)
+        (exports / "mihomo-alive.yaml").write_bytes(b"proxies: []\n")
+        (exports / "mihomo-alive.meta.json").write_text(
+            json.dumps({"count": 0, "digest": "d1"}), encoding="utf-8")
+
+        def fake_publish(cfg, *args, **kw):
+            return {"status": "publish_failed", "error_code": "GIST_HTTP_500",
+                    "message": "GitHub 返回 500"}
+
+        with mock.patch.object(gist_store, "publish", fake_publish):
+            code, body = self.srv.post("/api/v1/gist/publish", {},
+                                       self.ADMIN_HEADER)
+        self.assertEqual(code, 502)
+        parsed = json.loads(body)
+        self.assertEqual(parsed["error"], "GIST_PUBLISH_FAILED")
+        self.assertEqual(parsed["error_code"], "GIST_HTTP_500")
+        rows = db.list_publish_audit(10)
+        self.assertEqual(rows[0]["status"], "publish_failed")
+        summary = json.loads(rows[0]["summary_json"])
+        self.assertEqual(summary["error_code"], "GIST_HTTP_500")
 
     def test_substore_placeholders_write_audit(self):
         for action in ("preview", "confirm-token", "push"):

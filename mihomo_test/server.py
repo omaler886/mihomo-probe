@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import config as cfgmod
 from . import db
 from . import engine
+from . import gist_store
 from . import notifier
 from . import probe_dispatch
 from . import substore_bridge
@@ -453,11 +454,75 @@ def v1_probes(cfg):
     return out
 
 
-def v1_dashboard(cfg):
-    """总览（指导 §9.1）：当前轮、节点五态、探测点在线数、发布占位。
+def _canonical_paths():
+    """磁盘上 canonical 产物与其 meta 的位置（与 engine.EXPORT_DIR 同源）。"""
+    base = cfgmod.DATA / "exports"
+    return (base / f"{engine.CANONICAL_KEY}.yaml",
+            base / f"{engine.CANONICAL_KEY}.meta.json")
 
-    Gist / Sub-Store 的最后发布时间在本 Phase 返回 null：发布面在 P4/P5 落地，
-    这里先给前端一个稳定的形状，而不是让控制台多等两个 Phase 才能渲染。
+
+def canonical_artifact():
+    """`(content_bytes, meta_dict)` of the canonical export, or None.
+
+    The artifact from the last stable round is the ONLY thing the manual
+    publish endpoint may send (指导 §8 去重保证): no re-render, no rebuild per
+    request -- the file on disk IS the subscription body every consumer gets.
+    """
+    yaml_path, meta_path = _canonical_paths()
+    try:
+        content = yaml_path.read_bytes()
+    except OSError:
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    return content, meta
+
+
+def canonical_meta_digest():
+    """Digest recorded beside the artifact; '' when there is none yet."""
+    _yaml_path, meta_path = _canonical_paths()
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(meta, dict):
+        return ""
+    return str(meta.get("digest") or "")
+
+
+def _gist_publication_state():
+    """Dashboard 的 gist 块：最近一次真实发布的时间 / revision / 一致性。
+
+    Only `published` / `no_change` rows count as a publication timeline entry:
+    rejected or failed attempts are audit events, not a publish time.
+    """
+    state = {"last_published_at": None, "revision": None,
+             "consistent_with_stable_round": None}
+    try:
+        rows = db.list_publish_audit(50)
+    except Exception:  # noqa: BLE001 - table may predate v3
+        return state
+    latest = next((r for r in rows if r["kind"] == "gist"
+                   and r["status"] in ("published", "no_change")), None)
+    if latest is None:
+        return state
+    digest = canonical_meta_digest()
+    state["last_published_at"] = latest["created_at"]
+    state["revision"] = latest["revision"]
+    state["consistent_with_stable_round"] = bool(
+        digest and str(latest["digest"] or "") == digest)
+    return state
+
+
+def v1_dashboard(cfg):
+    """总览（指导 §9.1）：当前轮、节点五态、探测点在线数、发布状态。
+
+    The gist block is live since P4 (fed by publish_audit); substore stays
+    null-shaped until P5 lands, so the console can render both from day one.
     """
     last = db.last_round() or {}
     stats = db.stats()
@@ -494,9 +559,8 @@ def v1_dashboard(cfg):
         "probes": {"total": len(probes), "enabled": len(enabled),
                    "online": len(online)},
         "busy": BUSY.locked(),
-        # P4/P5 占位（brief 任务 C）：发布中心的两个时间戳先返回 null。
-        "gist": {"last_published_at": None, "revision": None,
-                 "consistent_with_stable_round": None},
+        # P4 已落地 gist（数据源 publish_audit）；substore 仍等 P5。
+        "gist": _gist_publication_state(),
         "substore": {"last_pushed_at": None, "last_result": None,
                      "target": (cfg.get("substore") or {}).get("target_name")},
     }
@@ -992,19 +1056,77 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(status, payload)
 
     def _v1_gist_publish(self, cfg, path):
-        """P4 占位：接口形状先立住，发布动作等 canonical export 落地。"""
+        """P4：手动触发一次 canonical 产物发布到固定四文件 Gist（指导 §8/§10）。
+
+        与轮内自动发布共用 gist_store 的幂等规则（canonical 未变化 → 零
+        PATCH）。token 只从 `gist.token_env` 环境变量读（gist_store 内部），
+        响应与日志只出现脱敏后的错误码与 digest；每次调用都落一条
+        publish_audit，包括被拒绝的。
+        """
         if not self._v1_admin(cfg, path):
             return None
         self._v1_json_body()
         audit_id = uuid.uuid4().hex
+        gist = cfg.get("gist") or {}
+        gist_id = str(gist.get("gist_id") or "").strip()
+
+        def _audit(status, summary=None):
+            db.record_publish_audit(audit_id, "gist", gist_id or "gist",
+                                    None, "", "admin", status, summary)
+
+        if not gist.get("enabled", True):
+            _audit("rejected_disabled", {"phase": "P4"})
+            db.log("warn", f"Gist 发布拒绝 audit={audit_id}: GIST_DISABLED")
+            return self._send(409, {"error": "GIST_DISABLED",
+                                    "message": "gist.enabled 为 false",
+                                    "audit_id": audit_id})
+        artifact = canonical_artifact()
+        if artifact is None:
+            _audit("no_artifact", {"phase": "P4"})
+            db.log("warn", f"Gist 发布拒绝 audit={audit_id}: NO_CANONICAL_ARTIFACT")
+            return self._send(409, {"error": "NO_CANONICAL_ARTIFACT",
+                                    "message": "尚无 canonical 导出，先完成一轮测活",
+                                    "audit_id": audit_id})
+        content, meta = artifact
+        last = dict(db.last_round() or {})
+        status_payload = {
+            "round_id": last.get("id"),
+            "total": last.get("total") or 0,
+            "alive": last.get("ok") or 0,
+            "suspect": bool(last.get("suspect")),
+            "digest": str(meta.get("digest") or ""),
+            "updated_at": db.now(),
+        }
+        try:
+            history = gist_store.build_history(db)
+        except Exception:  # noqa: BLE001 - history is best-effort
+            history = ""
+        result = gist_store.publish(
+            cfg, content, meta,
+            log=lambda level, message: db.log(
+                level, f"[gist] {gist_store.mask(message)}"),
+            status_payload=status_payload, history_text=history)
+        status_word = str(result.get("status") or "publish_failed")
         db.record_publish_audit(
-            audit_id, "gist",
-            str((cfg.get("gist") or {}).get("gist_id") or "gist"),
-            None, "", "admin", "not_implemented",
-            {"phase": "P4", "endpoint": "gist/publish"})
-        db.log("info", f"Gist 发布占位 audit={audit_id}（P4 落地）")
-        return self._send(501, {"error": "NOT_IMPLEMENTED",
-                                "message": "P4 落地", "audit_id": audit_id})
+            audit_id, "gist", gist_id or "gist", result.get("revision"),
+            str(result.get("digest") or ""), "admin", status_word,
+            {"error_code": result.get("error_code"),
+             "changed": result.get("changed")})
+        if status_word == "publish_failed":
+            error_code = str(result.get("error_code") or "")
+            http = 409 if error_code == "GIST_CONFIG_ERROR" else 502
+            db.log("warn", f"Gist 发布失败 audit={audit_id} code={error_code}")
+            return self._send(http, {"error": "GIST_PUBLISH_FAILED",
+                                     "error_code": error_code,
+                                     "message": str(result.get("message") or ""),
+                                     "audit_id": audit_id})
+        db.log("info", f"Gist 手动发布 audit={audit_id} status={status_word} "
+                       f"digest={result.get('digest')}")
+        return self._send(200, {"ok": True, "status": status_word,
+                                "digest": result.get("digest"),
+                                "revision": result.get("revision"),
+                                "changed": result.get("changed") or [],
+                                "audit_id": audit_id})
 
     def _v1_substore_placeholder(self, cfg, path, action):
         """P5 占位：人工推送三件套（预览/确认 token/推送）全部待落地。

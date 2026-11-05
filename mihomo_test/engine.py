@@ -92,6 +92,11 @@ def _checkpoint(deadline, phase, round_id=None):
         raise RoundTimeout(f"round exceeded its budget at phase {phase}")
 
 EXPORT_DIR = cfgmod.DATA / "exports"
+# The canonical artifact's file stem (plan §4.4): `data/exports/mihomo-alive.yaml`
+# is the ONE subscription output every consumer reads (指导 §8). cfg["gist"]
+# ["canonical_file"] may rename the Gist-side file, but the on-disk export name
+# is part of the stable URL consumers subscribe to.
+CANONICAL_KEY = "mihomo-alive"
 # Everything we may have prepended on an earlier round, so re-tagging is
 # idempotent: any number of leading `[XX]` tags, in any order, with or without
 # a flag emoji between them.
@@ -2645,7 +2650,7 @@ def _publish_sources(cfg, store, sources, alive_by_source, proxy_by_name, countr
     disk is the previous stable round, and the guardrail exists to keep it.
     """
     if not cfg["publish"].get("enabled", True):
-        return False
+        return False, None
     if chain_fronts is None:
         chain_fronts = _read_front_state(log)
     else:
@@ -2668,21 +2673,29 @@ def _write_canonical_export(cfg, sources, alive_by_source, proxy_by_name, countr
                             chain_fronts, alive_forms, log):
     """Deduplicate + rename + sort the round's live nodes into one canonical file.
 
-    Returns the canonical bytes, or None when this round published no node
-    (the previous file stands -- the guardrail's whole point). Metadata goes to
-    `mihomo-alive.meta.json` alongside it.
+    Returns `(content, meta)`, or None when this round published no node
+    (the previous file stands -- the guardrail's whole point). Metadata also
+    goes to `mihomo-alive.meta.json` alongside the artifact; the pair is what
+    the Gist publisher needs (the digest drives the §8 no-revision gate and
+    the status file, so it must not be re-derived or lost on the way).
     """
     from . import canonical_export
     live = {key: names for key, names in (alive_by_source or {}).items() if names}
     if not live:
         return None
+    # The canonical artifact is the ONE subscribable list, so it follows the
+    # same publication gate as the per-source files: a muted source
+    # (`export: false`) is tested and shown but must not reach clients
+    # (`export_keys`, see there). Without this filter a muted source's nodes
+    # would be published through the back door of the canonical file.
+    publishable = set(export_keys(cfg))
     by_display = {str(proxy.get("name") or ""): proxy
                   for proxy in proxy_by_name.values()}
     sources_in = []
     for source in sources:
         key = source["key"]
         names = live.get(key)
-        if not names:
+        if not names or key not in publishable:
             continue
         proxies, groups = _export_proxies(names, proxy_by_name, countries, cfg, key,
                                           chain_fronts=chain_fronts,
@@ -2703,6 +2716,11 @@ def _write_canonical_export(cfg, sources, alive_by_source, proxy_by_name, countr
             meta_map.setdefault(fingerprint, meta_map[name])
         sources_in.append({"key": key, "proxies": proxies, "groups": groups,
                            "meta": meta_map})
+    if not sources_in:
+        # Nothing publishable this round (everything muted, or no live nodes):
+        # the previous stable canonical file stands -- writing an empty one
+        # would empty the one list every client subscribes to.
+        return None
     try:
         content, meta = canonical_export.build(sources_in, cfg)
     except Exception as exc:  # noqa: BLE001 - a canonical failure must not take
@@ -2710,23 +2728,20 @@ def _write_canonical_export(cfg, sources, alive_by_source, proxy_by_name, countr
         log("warn", f"canonical export 生成失败: {type(exc).__name__}: {exc}")
         return None
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    path = EXPORT_DIR / CANONICAL_NAME
+    path = EXPORT_DIR / f"{CANONICAL_KEY}.yaml"
     tmp = path.with_suffix(".yaml.tmp")
     tmp.write_bytes(content)
     tmp.replace(path)
-    (EXPORT_DIR / "mihomo-alive.meta.json").write_text(
+    (EXPORT_DIR / f"{CANONICAL_KEY}.meta.json").write_text(
         json.dumps({"count": meta["count"], "digest": meta["digest"],
                     "content_sha256": meta["content_sha256"],
                     "source_aliases": meta["source_aliases"],
                     "renames": meta["renames"]},
                    ensure_ascii=False),
         encoding="utf-8")
-    log("info", f"canonical export 已生成 {CANONICAL_NAME}: {meta['count']} 节点, "
+    log("info", f"canonical export 已生成 {CANONICAL_KEY}.yaml: {meta['count']} 节点, "
                 f"digest={meta['digest']}")
-    return content
-
-
-CANONICAL_NAME = "mihomo-alive.yaml"
+    return content, meta
 
 
 def _gist_probe_status(round_id, total, alive, suspect, note):
@@ -2743,6 +2758,15 @@ def _gist_probe_status(round_id, total, alive, suspect, note):
     return {"round_id": round_id, "total": total, "alive": alive,
             "suspect": bool(suspect), "note": note, "probes": probes,
             "updated_at": db.now()}
+
+
+def _gist_log(log):
+    """Route gist_store logs through the round's log, mask applied."""
+    from . import gist_store
+
+    def _relay(level, message):
+        log(level, f"[gist] {gist_store.mask(message)}")
+    return _relay
 
 
 def _round_observations(cfg, round_id, by_name, proxies, results, countries,
@@ -2916,14 +2940,59 @@ def _apply_and_publish(cfg, round_id, store, by_name, proxies, results, countrie
     if not suspect:
         live_fronts = [f["orig_proxy"] for f in (fronts or [])
                        if (results.get(f["proxy"]["name"]) or {}).get("reason") is None]
-        if not _publish_sources(cfg, store, sources, alive_by_source,
-                                proxy_by_name, countries, log,
-                                chain_fronts=live_fronts, alive_forms=alive_forms):
+        wrote, canonical = _publish_sources(cfg, store, sources, alive_by_source,
+                                            proxy_by_name, countries, log,
+                                            chain_fronts=live_fronts,
+                                            alive_forms=alive_forms)
+        if not wrote:
             note = note or "publish disabled"
+        else:
+            note = _publish_gist(cfg, round_id, canonical, total, alive, suspect,
+                                 note, log)
 
     return {"total": total, "alive": alive, "dropped": dropped, "restored": restored,
             "new_alive": new_alive, "suspect": suspect, "note": note,
             "countries": countries}
+
+
+def _publish_gist(cfg, round_id, canonical, total, alive, suspect, note, log):
+    """Push the stable canonical artifact to the fixed four-file Gist.
+
+    Phase 4 (指导 §8): publishing is idempotent (a digest that did not change
+    commits no revision) and it is deliberately fire-and-forget for the ledger
+    (指导 §13.5, §14): a Gist API failure appends a note and an event and never
+    touches a node's status -- the UI shows 「本轮完成，发布失败」 and the next
+    round retries. Returns the (possibly extended) note.
+    """
+    gist = cfg.get("gist") or {}
+    if not gist.get("enabled") or not str(gist.get("gist_id") or "").strip():
+        return note
+    if not canonical:
+        return note
+    content, meta = canonical
+    from . import gist_store
+    try:
+        history = gist_store.build_history(db)
+    except Exception:  # noqa: BLE001 - history is best-effort
+        history = ""
+    status = _gist_probe_status(round_id, total, alive, suspect, note)
+    # digest 显式随行：status 文件与幂等门禁都用它，不依赖发布器兜底。
+    status["digest"] = str(meta.get("digest") or "")
+    try:
+        result = gist_store.publish(cfg, content, meta, log=_gist_log(log),
+                                    status_payload=status, history_text=history)
+    except Exception as exc:  # noqa: BLE001 - never propagate to the ledger
+        log("warn", f"Gist 发布异常: {type(exc).__name__}: {gist_store.mask(exc)}")
+        db.log("warn", f"Gist 发布异常 audit={round_id}: {gist_store.mask(exc)}")
+        return f"{note or '本轮完成'}，发布失败".strip("，")
+    if result.get("status") == "publish_failed":
+        log("warn", f"Gist 发布失败: {result.get('error_code')}")
+        db.log("warn", f"Gist 发布失败 audit={round_id} "
+                       f"code={result.get('error_code')}")
+        return f"{note or '本轮完成'}，发布失败".strip("，")
+    log("info", f"Gist {result.get('status')} revision={result.get('revision')} "
+                f"digest={result.get('digest')}")
+    return note
 
 
 def verify_cfg_excludes(cfg):
@@ -3398,6 +3467,11 @@ def cleanup_exports(cfg):
         return removed
     for path in existing:
         key = path.name[:-5]
+        if key in (CANONICAL_KEY,):
+            # The canonical artifact is not a source's file: it is the ONE
+            # subscription output every consumer reads (指导 §8). Removing it
+            # would leave Gist/Sub-Store pointing at a 404 until the next round.
+            continue
         if key not in keys:
             try:
                 path.unlink()
