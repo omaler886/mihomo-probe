@@ -1835,7 +1835,12 @@ class MigrationTest(unittest.TestCase):
             dbmod.DB_PATH = ledger
             dbmod._conn = None
             dbmod.connect()
-            backups = list(workdir.glob("state.db.bak-*"))
+            # HK3 v3 的追加式迁移也会先给这个库留一份快照
+            # （`state.db.bak-v3-<stamp>`，指导 §12）：那是同一份迁移前数据的
+            # 第二个副本，允许存在。本用例盯的是 rebuild 自己的备份，所以只数
+            # 旧格式（无 v3 标记）的那一个。
+            backups = [p for p in workdir.glob("state.db.bak-*")
+                       if ".bak-v3-" not in p.name]
             self.assertEqual(len(backups), 1, "no pre-migration backup was taken")
             # the copy must hold the pre-migration data, not the rebuilt schema
             saved = sqlite3.connect(backups[0])
@@ -1874,7 +1879,12 @@ class MigrationTest(unittest.TestCase):
             dbmod._conn = None
             dbmod.connect()
             self.assertEqual([n["name"] for n in dbmod.list_nodes()], ["keepme"])
-            self.assertEqual(list(workdir.glob("state.db.bak-*")), [])
+            # `.bak-v3-<stamp>` 是 HK3 v3 追加迁移的快照（指导 §12），可以存在；
+            # 不能存在的是破坏性 rebuild 自己的 `.bak-<stamp>`——指纹键库本就该
+            # 原地升级，不 drop 任何表。
+            self.assertEqual(
+                [p for p in workdir.glob("state.db.bak-*")
+                 if ".bak-v3-" not in p.name], [])
         finally:
             if dbmod._conn is not None:
                 dbmod._conn.close()

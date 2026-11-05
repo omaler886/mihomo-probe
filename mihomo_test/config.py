@@ -9,7 +9,9 @@ import json
 import os
 import re
 import secrets
+import shutil
 import threading
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -33,6 +35,13 @@ _lock = threading.RLock()
 _UNSAFE_KEY = re.compile(r'[/\\:*?"<>|\x00-\x1f]')
 KEY_MAX = 48
 SOURCE_KINDS = ("collection", "sub")
+
+# HK3 schema v3（指导 §3）。probes[].id 同时是 API 路径段和数据库主键，所以
+# 限制为小写 slug；token 只允许用环境变量名引用，明文写进 config.json 会被
+# /api/status 带出去、并复制进每一份文件备份。
+PROBE_ID_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{1,31}$')
+ENV_NAME_RE = re.compile(r'^[A-Z][A-Z0-9_]*$')
+PROBE_PLAINTEXT_TOKEN_KEYS = ("token", "secret", "api_key", "password")
 
 
 def safe_key(value, fallback="src"):
@@ -195,6 +204,9 @@ def front_text(block):
 
 
 DEFAULTS = {
+    # HK3 轻量化 schema 版本（指导 §3）。v2 及更早的 config.json 没有这个键，
+    # load() 据此触发一次性迁移 migrate_config_v2_to_v3。
+    "schema_version": 3,
     "substore": {
         # Sub-Store's backend URL can carry a secret path (this deployment's
         # does). It is deliberately NOT the default here: the default must stay
@@ -202,6 +214,13 @@ DEFAULTS = {
         # that need one set SUBSTORE_BACKEND in .env -- and once config.json
         # exists its stored value wins over this anyway.
         "backend": os.environ.get("SUBSTORE_BACKEND", "http://127.0.0.1:3000"),
+        # 唯一 canonical 订阅对象名：Sub-Store 侧只更新这一个预绑定对象，不再
+        # 按来源/探测点/轮次分叉出重复订阅（指导 §0/§8 去重保证）。
+        "target_name": "mihomo-probe-alive",
+        # 人工推送硬门禁（指导 §3）：Sub-Store 只允许用户在 Web 预览并二次确认
+        # 后推送，scheduler / 轮次 hook / Gist publish 不得间接调用。取值不是
+        # true 一律拒绝启动，见 validate_config_v3。
+        "manual_push_only": True,
     },
     "core": {
         # Deliberately not 19090/19094: the legacy /srv/mihomo-health stack
@@ -317,6 +336,46 @@ DEFAULTS = {
         # 信息从账本退位；首轮存活数可能下跌触发护栏，属预期。需先开启链式。
         "test_plain_nodes": False,
     },
+    # 多探测点统一测活参数（指导 §3）。engine 在 v3 仍读既有 policy/test 键，
+    # 这里是由它们派生出的单一事实来源，v4 再收口（plan §4.1）。
+    "probe_policy": {
+        "interval_minutes": 30,
+        "timeout_ms": 5000,
+        "concurrency": 20,
+        "dead_after_consecutive_failures": 3,
+        "round_guard_ratio": 0.5,
+        "round_guard_min_alive": 3,
+    },
+    # 探测点注册表。空数组 = 本地单探测点兼容模式（隐含的 "local" 探测点），
+    # 节点结论与改造前一致（指导 §4.3、§16 灰度第 1 步）。
+    "probes": [],
+    # 多探测点结果聚合默认值（指导 §4.3）：任一探测点成功即活；全部失败且
+    # 达到最小完成探测点数才判败；不足则 inconclusive，不推进 consec_fail。
+    "aggregation": {
+        "strategy": "any_alive",
+        "minimum_completed_probes": 1,
+        "late_result_seconds": 90,
+    },
+    # 节点重命名（指导 §6）：发生在聚合与死亡收敛之后、生成 canonical export
+    # 之前；账本身份始终用连接参数指纹，改名只影响显示名。
+    "rename": {
+        "enabled": True,
+        "template": "{country} | {display_name}",
+        "collision_suffix": " #{n}",
+        "preserve_original_name": True,
+    },
+    # Gist 发布中间层（指导 §8）：一个 Gist 只维护固定文件，禁止按探测点 /
+    # 轮次 / 来源无限新建。token 仅从 token_env 指定的环境变量读取，日志全
+    # 脱敏。
+    "gist": {
+        "enabled": True,
+        "gist_id": "",
+        "token_env": "GITHUB_GIST_TOKEN",
+        "visibility": "secret",
+        "canonical_file": "mihomo-alive.yaml",
+        "status_file": "probe-status.json",
+        "history_file": "probe-history.jsonl",
+    },
     "policy": {
         "drop_after_consecutive_fails": 3,
         "suspect_floor_ratio": 0.5,
@@ -418,6 +477,18 @@ SECRET_MASK = "***"
 # Keys discarded by the most recent load(), for the round to report.
 _last_dropped = []
 
+# What the one-shot v2 -> v3 migration did on the most recent load(), for the
+# round to report (指导 §5 wants the operator told that chain came back
+# closed). Consume-once, same reasoning as take_dropped_keys.
+_last_migration = []
+
+
+def take_migration_report():
+    """Return and clear the migration notes from the last load()."""
+    out = list(_last_migration)
+    del _last_migration[:]
+    return out
+
 
 def take_dropped_keys():
     """Return and clear the keys the last load() discarded.
@@ -487,6 +558,217 @@ def _ensure_tokens(cfg):
     return changed
 
 
+def validate_config_v3(cfg):
+    """The one schema gate for HK3 v3: startup, save and pre-test (指导 §3).
+
+    Raises ValueError with an actionable message on the first violation, so a
+    refused boot/file says what to change. Returns cfg with `chain.enabled`
+    forced to a real bool, so callers can chain `validate_config_v3(load())`.
+
+    The config layer only *validates*: it never touches node streaks. The
+    death threshold is copied across so the engine keeps converging at exactly
+    the value the operator already had.
+    """
+    if not isinstance(cfg, dict):
+        raise ValueError("配置必须是 JSON 对象")
+
+    # substore.manual_push_only：人工推送硬门禁。缺失同样拒绝——一个没有表态
+    # 的配置文件不能在升级后被解释成"允许自动推送"。
+    substore = cfg.get("substore")
+    if not isinstance(substore, dict) or substore.get("manual_push_only") is not True:
+        raise ValueError(
+            "substore.manual_push_only 必须为 true：Sub-Store 只允许在 Web 界面"
+            "预览并二次确认后人工推送（指导 §3）。请把该键改回 true，或删除它"
+            "以取默认值。")
+
+    # probes：本地单探测点兼容模式是空列表，本身合法。
+    probes = cfg.get("probes", [])
+    if not isinstance(probes, list):
+        raise ValueError("probes 必须是数组（空数组 = 本地单探测点兼容模式）")
+    seen = set()
+    for index, entry in enumerate(probes):
+        if not isinstance(entry, dict):
+            raise ValueError(f"probes[{index}] 必须是对象")
+        probe_id = entry.get("id")
+        if not isinstance(probe_id, str) or not PROBE_ID_RE.match(probe_id):
+            raise ValueError(
+                f"probes[{index}].id 非法: {probe_id!r}"
+                "（需匹配 ^[a-z0-9][a-z0-9_-]{1,31}$）")
+        if probe_id in seen:
+            raise ValueError(
+                f"probes[].id 重复: {probe_id}（同一探测点只能注册一次）")
+        seen.add(probe_id)
+        for bad in PROBE_PLAINTEXT_TOKEN_KEYS:
+            if bad in entry:
+                raise ValueError(
+                    f"probes[{index}] 不允许包含明文 {bad}：token 只能通过"
+                    " token_env 引用环境变量（指导 §3）")
+        token_env = entry.get("token_env")
+        if token_env and (not isinstance(token_env, str)
+                          or not ENV_NAME_RE.match(token_env)):
+            raise ValueError(
+                f"probes[{index}].token_env 必须是环境变量名"
+                f"（^[A-Z][A-Z0-9_]*$）: {token_env!r}")
+
+    # 同一条规则管 Gist token：配置里只放环境变量名。
+    gist = cfg.get("gist")
+    if isinstance(gist, dict):
+        token_env = gist.get("token_env")
+        if token_env and (not isinstance(token_env, str)
+                          or not ENV_NAME_RE.match(token_env)):
+            raise ValueError(
+                f"gist.token_env 必须是环境变量名（^[A-Z][A-Z0-9_]*$）:"
+                f" {token_env!r}")
+
+    # dead_after_consecutive_failures：缺失时从既有 policy 阈值派生，绝不在此
+    # 重置任何节点的 streak（配置层只校验不清账，指导 §3/§7.8）。
+    policy_block = cfg.get("policy") if isinstance(cfg.get("policy"), dict) else {}
+    probe_policy = cfg.get("probe_policy")
+    if not isinstance(probe_policy, dict):
+        probe_policy = {}
+        cfg["probe_policy"] = probe_policy
+    if probe_policy.get("dead_after_consecutive_failures") is None:
+        legacy = policy_block.get("drop_after_consecutive_fails")
+        if isinstance(legacy, int) and not isinstance(legacy, bool) and legacy >= 1:
+            probe_policy["dead_after_consecutive_failures"] = legacy
+        else:
+            probe_policy["dead_after_consecutive_failures"] = \
+                DEFAULTS["probe_policy"]["dead_after_consecutive_failures"]
+    threshold = probe_policy["dead_after_consecutive_failures"]
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 1:
+        raise ValueError("probe_policy.dead_after_consecutive_failures 必须为正整数")
+
+    # chain.enabled 缺失强制 false（指导 §3/§5）：与 normalize_chain 的 `is
+    # True` 语义一致，只有显式 true 才算开启。
+    chain = cfg.get("chain")
+    if not isinstance(chain, dict):
+        chain = {}
+        cfg["chain"] = chain
+    chain["enabled"] = chain.get("enabled") is True
+    return cfg
+
+
+def _v3_template():
+    """The v3-only slice of DEFAULTS: the base a v2 config is migrated onto."""
+    return {
+        "schema_version": 3,
+        "probe_policy": copy.deepcopy(DEFAULTS["probe_policy"]),
+        "probes": copy.deepcopy(DEFAULTS["probes"]),
+        "aggregation": copy.deepcopy(DEFAULTS["aggregation"]),
+        "rename": copy.deepcopy(DEFAULTS["rename"]),
+        "gist": copy.deepcopy(DEFAULTS["gist"]),
+        "substore": {
+            "target_name": DEFAULTS["substore"]["target_name"],
+            "manual_push_only": DEFAULTS["substore"]["manual_push_only"],
+        },
+    }
+
+
+def migrate_config_v2_to_v3(cfg):
+    """One-shot v2 -> v3 migration (指导 §3/§15 Phase 2).
+
+    Returns (new_cfg, report). Pure: backup and persistence are the caller's
+    job (load() does both). An explicitly written value always wins over a
+    derived default; only missing keys are filled, so re-running it on an
+    already-migrated config is a no-op. Node streaks are untouched -- the
+    death threshold is copied from the policy value the engine already uses.
+    """
+    old = copy.deepcopy(cfg) if isinstance(cfg, dict) else {}
+    report = []
+    new = _deep_merge(_v3_template(), old)
+    new["schema_version"] = 3
+    if old.get("schema_version") != 3:
+        report.append(f"schema_version: {old.get('schema_version', '缺失')} -> 3")
+
+    # probe_policy 从既有 test/policy/schedule 值派生；已显式写过的
+    # probe_policy 键优先（半 v3 配置不被回退）。
+    test_cfg = old.get("test") if isinstance(old.get("test"), dict) else {}
+    policy_cfg = old.get("policy") if isinstance(old.get("policy"), dict) else {}
+    schedule_cfg = old.get("schedule") if isinstance(old.get("schedule"), dict) else {}
+    old_pp = old.get("probe_policy") if isinstance(old.get("probe_policy"), dict) else {}
+    probe_policy = dict(DEFAULTS["probe_policy"])
+    derived = {
+        "interval_minutes": schedule_cfg.get("interval_minutes"),
+        "timeout_ms": test_cfg.get("timeout_ms"),
+        "concurrency": test_cfg.get("concurrency"),
+        "dead_after_consecutive_failures": policy_cfg.get("drop_after_consecutive_fails"),
+        "round_guard_ratio": policy_cfg.get("suspect_floor_ratio"),
+        "round_guard_min_alive": policy_cfg.get("suspect_floor_absolute"),
+    }
+    legacy_paths = {
+        "interval_minutes": "schedule.interval_minutes",
+        "timeout_ms": "test.timeout_ms",
+        "concurrency": "test.concurrency",
+        "dead_after_consecutive_failures": "policy.drop_after_consecutive_fails",
+        "round_guard_ratio": "policy.suspect_floor_ratio",
+        "round_guard_min_alive": "policy.suspect_floor_absolute",
+    }
+    for key, value in derived.items():
+        if key in old_pp or value is None:
+            continue
+        probe_policy[key] = value
+        report.append(f"probe_policy.{key} <- {legacy_paths[key]}（{value}）")
+    probe_policy.update(old_pp)
+    new["probe_policy"] = probe_policy
+
+    # chain.enabled 缺失 -> false（指导 §5）：升级旧配置即使曾配过前置，也先
+    # 迁移为关闭，并在报告里提示用户手动开启。已经是 false 的配置再跑一遍
+    # 迁移不产生新报告——迁移必须可重复执行且安静。
+    chain = new.get("chain")
+    if not isinstance(chain, dict):
+        chain = {}
+        new["chain"] = chain
+    if chain.get("enabled") is not True:
+        if "enabled" not in chain:
+            report.append("chain.enabled 缺失，已置 false：如需链式测活请在面板"
+                          "手动开启（指导 §5）")
+            chain["enabled"] = False
+        elif chain["enabled"] is not False:
+            report.append(f"chain.enabled 取值 {chain['enabled']!r} 不是 true，"
+                          "已归一为 false")
+            chain["enabled"] = False
+
+    # substore 补 target_name / manual_push_only。
+    substore = new.get("substore")
+    if not isinstance(substore, dict):
+        substore = {}
+        new["substore"] = substore
+    if "target_name" not in substore:
+        substore["target_name"] = DEFAULTS["substore"]["target_name"]
+        report.append(f"substore.target_name 缺失，已补 {substore['target_name']!r}")
+    if substore.get("manual_push_only") is not True:
+        substore["manual_push_only"] = True
+        report.append("substore.manual_push_only 缺失或非 true，已置 true"
+                      "（指导 §3 人工推送硬门禁）")
+
+    for key in ("probes", "aggregation", "rename", "gist"):
+        if key not in old:
+            report.append(f"{key} 段缺失，已补 v3 默认值")
+    return new, report
+
+
+def _backup_config_v3_once():
+    """Snapshot config.json as config.json.bak-v3-<UTC> before the first v3
+    migration. Returns the backup path, or None when there is nothing to do.
+
+    Once only: an existing .bak-v3-* means an earlier run already kept the
+    pre-migration copy, and copying again would overwrite that snapshot with
+    the already-migrated file. Best effort -- a backup we cannot take must not
+    block startup.
+    """
+    try:
+        if not CONFIG_PATH.exists():
+            return None
+        if list(CONFIG_PATH.parent.glob(CONFIG_PATH.name + ".bak-v3-*")):
+            return None
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+        backup = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.bak-v3-{stamp}")
+        shutil.copy2(CONFIG_PATH, backup)
+        return backup
+    except OSError:
+        return None
+
+
 def load():
     """Read config.json merged over defaults; write it back when absent."""
     DATA.mkdir(parents=True, exist_ok=True)
@@ -496,6 +778,7 @@ def load():
             cfg["sources"] = normalize_sources(cfg["sources"])
             cfg["chain"] = normalize_chain(cfg.get("chain"))
             _ensure_tokens(cfg)
+            validate_config_v3(cfg)
             _write(cfg)
             return cfg
         try:
@@ -504,6 +787,17 @@ def load():
             stored = {}
         stored, dropped = prune_dead(stored)
         _last_dropped[:] = dropped
+        # One-shot v2 -> v3 migration (指导 §3): schema_version absent or below
+        # 3 means the file predates the unique-config model. Back the file up
+        # first (once), then migrate. Node streaks are not touched here -- the
+        # death threshold is carried across so convergence continues unchanged.
+        migrated = False
+        version = stored.get("schema_version")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 3:
+            _backup_config_v3_once()
+            stored, migration_report = migrate_config_v2_to_v3(stored)
+            _last_migration[:] = migration_report
+            migrated = True
         cfg = _deep_merge(DEFAULTS, stored)
         # Defensive: a hand-edited or older file may hold keys that would be
         # unsafe as file names.
@@ -516,10 +810,16 @@ def load():
         env_legacy = os.environ.get("ALLOW_LEGACY_SUBSTORE_WRITE", "").strip().lower()
         if env_legacy:
             cfg["publish"]["allow_legacy_substore_write"] = env_legacy in ("1", "true", "yes", "on")
-        # Persist when the file was pruned *or* when a token had to be minted:
-        # a token that only lives in this process would change on every
-        # restart, breaking every URL that was handed out.
-        if dropped or _ensure_tokens(cfg):
+        tokens_minted = _ensure_tokens(cfg)
+        # The one schema gate, run last so it sees the fully merged config
+        # (指导 §3): a failure here refuses startup rather than booting on a
+        # config the rules forbid.
+        validate_config_v3(cfg)
+        # Persist when the file was pruned, when a token had to be minted, or
+        # when a migration ran: a token that only lives in this process would
+        # change on every restart, and a migrated file left un-migrated on disk
+        # would re-migrate (and re-report) on every boot.
+        if migrated or dropped or tokens_minted:
             # Persist the pruned form so the dead keys stop being rewritten by
             # every later save; the file converges on the schema.
             try:
@@ -728,6 +1028,10 @@ def update(patch):
             reject_self_reference(cfg["sources"], cfg.get("publish", {}).get("prefix"))
         if "chain" in (patch or {}):
             cfg["chain"] = normalize_chain(cfg.get("chain"))
+        # The same schema gate the startup path runs (指导 §3): a patch that
+        # would store a forbidden config is refused here instead of being
+        # written and only failing on the next boot.
+        validate_config_v3(cfg)
         return save(cfg)
 
 

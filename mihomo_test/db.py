@@ -109,6 +109,43 @@ CREATE TABLE IF NOT EXISTS events (
 );
 """
 
+# HK3 schema v3 追加表（指导 §12，SQL 逐字采用）。追加式：旧版可以忽略这三张
+# 表，回滚不需要 down migration；既有 nodes/rounds/results 一律不重建、不清空
+# （指导 §7.8：升级不得清空 nodes、consec_fail、最后成功时间或历史轮次）。
+V3_SCHEMA = """
+CREATE TABLE IF NOT EXISTS probes (
+  probe_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_seen_at TEXT,
+  version TEXT,
+  state TEXT NOT NULL DEFAULT 'unknown'
+);
+CREATE TABLE IF NOT EXISTS probe_observations (
+  round_id TEXT NOT NULL,
+  probe_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  alive INTEGER,
+  delay_ms INTEGER,
+  reason TEXT,
+  egress_country TEXT,
+  received_at TEXT NOT NULL,
+  payload_digest TEXT NOT NULL,
+  PRIMARY KEY (round_id, probe_id, fingerprint)
+);
+CREATE TABLE IF NOT EXISTS publish_audit (
+  audit_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  target TEXT NOT NULL,
+  revision TEXT,
+  digest TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  status TEXT NOT NULL,
+  summary_json TEXT,
+  created_at TEXT NOT NULL
+);
+"""
+
 
 def now():
     """Timestamp for every stored column: UTC, always.
@@ -180,10 +217,47 @@ def _backup(path):
         pass
 
 
+def _add_v3_tables(conn, tables):
+    """Create the HK3 v3 tables idempotently; back the ledger up first (指导 §12).
+
+    The snapshot is taken once, the first time this build adds the v3 tables
+    to a file that already exists on disk. The rule is deliberately
+    file-level rather than schema-level: a brand-new database is one page (the
+    WAL header write alone makes the file non-empty), so "has tables" would
+    skip the very upgrade case this exists for, while a 4KB copy of an empty
+    ledger costs nothing and keeps the rule auditable in one line. An existing
+    `.bak-v3-*` means an earlier run already kept the pre-v3 snapshot. Best
+    effort -- a backup we cannot take must not block startup, same rule as
+    `_backup`.
+    """
+    if all(name in tables for name in
+           ("probes", "probe_observations", "publish_audit")):
+        return
+    try:
+        if (DB_PATH.exists() and DB_PATH.stat().st_size > 0
+                and not list(DB_PATH.parent.glob(DB_PATH.name + ".bak-v3-*"))):
+            # Fold the WAL back into the main file first, so the copy is a
+            # complete ledger rather than a main file missing recent commits.
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+            stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+            shutil.copy2(DB_PATH,
+                         DB_PATH.with_name(f"{DB_PATH.name}.bak-v3-{stamp}"))
+    except OSError:
+        pass
+    conn.executescript(V3_SCHEMA)
+    conn.commit()
+
+
 def _migrate(conn):
     """In-place column additions, then the one drop-everything migration."""
     tables = {row[0] for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
+    # HK3 v3 追加表在任何 early return 之前建：新库同样需要这三张表，且
+    # CREATE TABLE IF NOT EXISTS + 上面的存在性检查保证幂等。
+    _add_v3_tables(conn, tables)
     if "nodes" not in tables:
         return
     _add_round_mode(conn, tables)
@@ -729,3 +803,118 @@ def _median_delay(round_id, category):
         (round_id, category, count // 2),
     )
     return (row or {}).get("delay_ms")
+
+
+# --------------------------------------------------------------- HK3 v3 表面
+# probes / probe_observations / publish_audit 的最小访问函数（指导 §12）。
+# nodes 仍是聚合后的唯一状态账本，这些表只做多探测点观察与发布审计，不参与
+# 死亡计数推进。
+
+
+def upsert_probe(probe_id, name, enabled=True, last_seen_at=None,
+                 version=None, state=None):
+    """Register or refresh a probe row.
+
+    `version` / `state` / `last_seen_at` default to None = "leave unchanged"
+    on an existing row, so re-syncing the config cannot reset a probe's
+    online state or blank its reported version. A brand-new row is stamped
+    with now() and 'unknown' unless told otherwise. UPDATE-first rather than
+    INSERT .. ON CONFLICT: the "only touch what was passed" rule is the whole
+    point, and a COALESCE over the excluded row cannot express it.
+    """
+    sets, params = ["name=?", "enabled=?"], [name, 1 if enabled else 0]
+    if last_seen_at is not None:
+        sets.append("last_seen_at=?")
+        params.append(last_seen_at)
+    if version is not None:
+        sets.append("version=?")
+        params.append(version)
+    if state is not None:
+        sets.append("state=?")
+        params.append(state)
+    params.append(probe_id)
+    if execute(f"UPDATE probes SET {', '.join(sets)} WHERE probe_id=?",
+               tuple(params)).rowcount:
+        return
+    execute(
+        "INSERT INTO probes(probe_id, name, enabled, last_seen_at, version, state)"
+        " VALUES(?,?,?,?,?,COALESCE(?, 'unknown'))",
+        (probe_id, name, 1 if enabled else 0, last_seen_at or now(),
+         version, state),
+    )
+
+
+def touch_probe_seen(probe_id, version=None, state=None):
+    """Heartbeat: stamp last_seen_at, optionally recording version/state.
+
+    Returns the number of rows updated: 0 means the probe is not registered,
+    which callers treat as "unknown probe" -- audit only, never a node
+    failure (指导 §4.2).
+    """
+    sets, params = ["last_seen_at=?"], [now()]
+    if version is not None:
+        sets.append("version=?")
+        params.append(version)
+    if state is not None:
+        sets.append("state=?")
+        params.append(state)
+    params.append(probe_id)
+    return execute(
+        f"UPDATE probes SET {', '.join(sets)} WHERE probe_id=?", tuple(params),
+    ).rowcount
+
+
+def record_observation(round_id, probe_id, fingerprint, alive, delay_ms=None,
+                       reason=None, egress_country=None, payload_digest=""):
+    """Idempotently store one probe's verdict for one node this round.
+
+    PK (round_id, probe_id, fingerprint) plus INSERT OR REPLACE: a re-reported
+    result overwrites instead of duplicating (指导 §2：重复上报必须幂等覆盖
+    或拒绝)。
+    """
+    execute(
+        "INSERT OR REPLACE INTO probe_observations"
+        "(round_id, probe_id, fingerprint, alive, delay_ms, reason,"
+        " egress_country, received_at, payload_digest)"
+        " VALUES(?,?,?,?,?,?,?,?,?)",
+        (round_id, probe_id, fingerprint,
+         None if alive is None else (1 if alive else 0),
+         delay_ms, reason, egress_country, now(), payload_digest or ""),
+    )
+
+
+def get_observations(round_id):
+    """Every probe's observation for one round, probe then fingerprint order."""
+    return query(
+        "SELECT round_id, probe_id, fingerprint, alive, delay_ms, reason,"
+        " egress_country, received_at, payload_digest FROM probe_observations"
+        " WHERE round_id=? ORDER BY probe_id, fingerprint",
+        (round_id,),
+    )
+
+
+def record_publish_audit(audit_id, kind, target, revision, digest, actor,
+                         status, summary_json=None):
+    """Append one publish audit row (指导 §12 publish_audit 表).
+
+    `summary_json` accepts a dict/list (serialized here) or a ready string.
+    """
+    if summary_json is not None and not isinstance(summary_json, str):
+        summary_json = json.dumps(summary_json, ensure_ascii=False)
+    execute(
+        "INSERT OR REPLACE INTO publish_audit"
+        "(audit_id, kind, target, revision, digest, actor, status,"
+        " summary_json, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        (audit_id, kind, target, revision, digest, actor, status,
+         summary_json, now()),
+    )
+
+
+def list_publish_audit(limit=50):
+    """Newest-first publish audit rows for the 发布中心."""
+    return query(
+        "SELECT audit_id, kind, target, revision, digest, actor, status,"
+        " summary_json, created_at FROM publish_audit"
+        " ORDER BY created_at DESC, audit_id DESC LIMIT ?",
+        (int(limit),),
+    )
