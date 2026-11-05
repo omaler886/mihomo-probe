@@ -198,3 +198,78 @@ chain-alive-*.md
 | S-10 chain-alive-r365.md | **已整改（不入库）** | `.gitignore` 新增 `chain-alive-*.md` |
 | S-13 默认面板域名硬编码（P3） | **本批有意不动** | vps 现网依赖 `config.py` 默认值生成联动 URL，改默认即行为回归；已固化为公开发行版前置项（MIGRATION_GUIDE §4） |
 | S-09/S-12/S-14~S-19（P2/P3） | **未整改，未放大** | 本批（B3）零触碰相关代码；新端点经 reviewer 核对零泄露面 |
+
+---
+
+## 五、Gist-only 重构新增面复审（B6 附带审查，2026-11-04）
+
+> 范围：重构批次 B1/B2核心/B4/B5核心/B2接线（至基线 `13c2889`）引入的新安全面。
+> 方法：逐面读实现 + 指名测试复核（全部在 `cargo test --workspace` 685/0 内实跑通过）。
+> 评级：high / medium / low；状态：mitigated（有测试或代码结构钉住）/ accepted
+>（记录权衡）/ open（需后续动作）。
+
+### 5.1 Gist token 生命周期（B2）
+
+| 项 | 结论 |
+|---|---|
+| 来源 | 仅 `publish.gist.token_file` 文件；构造期读取，`GistSection` 无 token 字段，config.json/SQLite/日志/API 均无 token 列或字段（artifacts 表只存 gist_id/gist_file/stable_url——结构事实，`crates/probe-storage/src/sources.rs`） |
+| 文件权限 | Unix 0600 强校验（`crates/probe-publish/src/gist.rs::check_token_mode`，group/other 可读即构造失败终态）；Windows 分支不做 mode 校验（`#[cfg(unix)]` 外空实现）——accepted：部署目标是 Linux 容器 |
+| 泄漏面 | 错误文本经 `redact` 全量脱敏（`redaction_removes_the_token_everywhere`）；401 响应与请求体全扫描（`unauthorized_is_never_retried_and_never_leaks_the_token::assert_no_token_leak`）；`gist test/init` 输出 masked（cli 测试钉住）；API `/api/v1/publishers/gist/test` 只回 `configured/ok/error_code`，无 token 回显 |
+| 轮换 | 换文件内容即可，source_id/artifact/Gist id 不动（`MIGRATION_GIST_ONLY.md` §C） |
+| 状态 | **mitigated** |
+
+### 5.2 `POST /api/v1/publishers/gist/test`（B2 接线）
+
+- 在守卫组内：无 admin token → 401（`publishers.rs::gist_test_requires_the_admin_token`）；
+  未配置部署回 `configured=false`（掩码面，不探测、不报错细节）。
+- 该端点只做构造 + healthcheck，**永不 publish**（publishers.rs 模块注释 + 实现）。
+- 状态：**mitigated**。
+
+### 5.3 迁移端点与 CLI（B5核心；API 接线并行批次）
+
+- `MigrationStore` trait 结构上**无 delete 方法**——「迁移/回滚不删对象」是类型系统
+  事实而非约定（`crates/probe-source/src/migrate.rs`，测试 `assert_no_delete` +
+  stub 断言请求日志零 DELETE）。
+- CLI `migrate apply` **默认 dry-run**：`--execute` 不给就零写入（main.rs 注释
+  "the flag is opt-in"，tests/migrate_commands.rs 钉住）；scan 永只读；apply 唯一
+  写动作是 update-only retarget + 隔离改名，后者对真实后端保守禁用
+  （`rename_supported` 默认 false）。
+- 报告/日志 URL 查询串脱敏（`redact_url_strips_query_and_fragment`；原文仅内存
+  保留供精确回滚）。
+- 隔离窗 24h（可 `--quarantine-hours` 记录），apply 报告是回滚唯一依据（幂等）。
+- 状态：**mitigated**（API 面接线合入后需复跑本节结论——当前基线 API 为 404 降级）。
+
+### 5.4 `/gui` 会话 + CSRF（B4）
+
+- 双提交：`GET /api/v1/session`（admin token）→ CSRF token 进 JSON + 同值进
+  `HttpOnly; SameSite=Strict` cookie；写请求须带 `X-CSRF-Token`
+  （`crates/probe-api/src/gui.rs:123-132`）。四种拒绝形态有测试
+  （无 token/无 CSRF/错 CSRF/错 cookie）。
+- 已知弱点（代码注释已记录）：
+  1. **CSRF token 由 splitmix64 生成**（无 rand 依赖的权衡）。splitmix64 非密码学
+     随机源；token 空间 2^64 且种子来自进程内惰性状态。同源会话窗口 8h/上限 256，
+     配合 admin token 双因子，实际攻击面是「可预测 token」而非「可枚举」——
+     **accepted（建议后续换 OS 随机源）**。
+  2. Cookie `Path=/`（非 /api/v1 限域）——低影响（cookie 仅用于比对，不是凭据），
+     accepted。
+- 写操作审计：`POST /api/v1/gui/runs` 全程 `record_event(level=security)`
+  （gui_tests 断言审计行）。偏差：未用 `activate_and_audit` 事务（私有 API），
+  单点换接记录在案。
+- 状态：**mitigated（含 2 条 accepted 备注）**。
+
+### 5.5 迁移 apply 默认 dry-run、不删除保证、隔离改名禁用
+
+见 5.3；补充：`link_substore.py` 降级前（HEAD 基线）仍保留旧 create/`--remove`
+面——**运行手册已把它列为阶段 A 第一项要停的定时任务**
+（`MIGRATION_GIST_ONLY.md`），降级合入前这是唯一的遗留写入口 →
+**open（依赖 B5 接线批次合入）**。
+
+### 5.6 发现汇总
+
+| 编号 | 面发现 | 严重度 | 状态 |
+|---|---|---|---|
+| SEC-R1 | splitmix64 CSRF token 非密码学随机 | low | accepted（建议换 OS 随机源，与 B4 批次记录一致） |
+| SEC-R2 | token 文件 0600 校验仅 Unix；Windows 静默通过 | low | accepted（部署形态为 Linux 容器） |
+| SEC-R3 | B6-1：稳定订阅端点缓存头被 `no-store` 覆盖 | low（性能，非安全） | open（见 workstreams/19_ACCEPTANCE_MAP.md §7） |
+| SEC-R4 | `link_substore.py` 旧写面在降级合入前仍存在（默认配置不会调用；风险在定时任务/误用） | medium（时间窗） | open → B5 接线批次关闭；期间由阶段 A 止血（停定时任务）覆盖 |
+| SEC-R5 | `/artifacts/{id}/subscription` 以 publish token 读取全量节点列表 | 设计内（该凭据本就是只读导出作用域，与 `/api/export/<key>.yaml` 同级） | accepted |

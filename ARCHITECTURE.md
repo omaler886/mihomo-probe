@@ -471,3 +471,113 @@ Sub-Store 侧回滚（N-04 指南承载）：删订阅 process 里的 Script Ope
    （N-01 = `ProbeNodesEndpointTest` 16 例；`test_hardening.py` 未触碰）。（B4 修订，REVIEW R-02/R-05：
    原写「N-01 用例落 test_hardening.py、该文件进入白名单」与实际实现不符——tests Agent 独立决定集中落位，
    本节已按实际实现更正。）
+
+---
+
+## 10. artifact 层与发布（Gist-only 重构，B1/B2/B5/B2接线）
+
+> 2026-11-04 增补（对应《指导》§2/§3、workstreams/18 批次 B1/B2/B5/B2接线，
+> 批次史见 `CHANGELOG_REFACTOR.md`，目标态全文见 `ARCHITECTURE_GIST_ONLY.md`）。
+> 本节只**追加**，不改动上文 §1–§9 的 Sub-Store bridge 描述——Script Operator
+> 消费 `/api/probe/nodes` 的只读契约不受重构影响。
+
+### 10.1 三张新表与稳定身份
+
+* `migrations/0010_source_artifact.sql`：`sources`（随机 v4 UUID 主键 `source_id`、
+  `key` 唯一自然键、display_name/input_type/input_ref/enabled）与 `artifacts`
+  （`source_id` UNIQUE、`gist_file` UNIQUE、`last_content_sha256`、
+  `last_success_run_id`、`last_published_at`）。启动回填 `INSERT OR IGNORE`
+  既有 `export_snapshots.key` 与 `nodes.source`，幂等。
+* `migrations/0011_source_runs.sql`：`source_runs` 每源运行槽；部分唯一索引
+  `ux_source_runs_one_open`（每源最多一个 claimed/active）与
+  `ux_source_runs_idempotency`（一个 Idempotency-Key 一个槽）。单飞语义：
+  `claim_source_run`（幂等键 > 活动槽 > 最小间隔 > 新 claim），崩溃槽由
+  `reap_orphan_source_runs` 收尸（round 仍 open 的槽受保护，先关轮后收）。
+* `migrations/0012_source_run_publish.sql`：`source_runs.publish_status/error_code`，
+  词表冻结 `published|no_change|publish_failed|gist_config_error`。
+* 账本 API：`crates/probe-storage/src/sources.rs`（sync/ensure/mark/list）、
+  `runs.rs`（claim/attach/close/reap/record）；引擎侧
+  `crates/probe-engine/src/sources.rs`（`sync_ledger_sources` 在 serve 与
+  round 前同步，key 不变则 source_id 不变）。
+
+### 10.2 发布器与引擎远程腿
+
+* `crates/probe-publish`（67317b0）：`Publisher` trait；`GistPublisher`——token
+  只从 0600 文件读、sha 相同零请求、per-gist 写锁、PATCH 仅触目标文件 +
+  `manifest.json`（合并保留外部条目，永无 `content:null`）、401/403/404 终态、
+  429 Retry-After 有界、5xx 退避 1s/2s/4s、409/422 锁内重读合并一次、错误文本
+  token 脱敏；`LocalPublisher`（原子写）+ `CompositePublisher`（local 权威）。
+* 引擎接线 `crates/probe-engine/src/publish_remote.rs`（29cf9cd）：
+  `publish_round_remote`——`publish.provider=local`（默认）零行为变化；
+  每个本地 `Published` 源走远程腿：`NoChange`→`no_change` 且不写 artifact
+  （digest 只在真发布后推进）；`Published`→`mark_artifact_published`；
+  `Failed`→`publish_failed+error_code`，本地快照/文件/digest 原地；
+  构造失败→`gist_config_error`，轮次不受影响。CLI `probe-cli gist test|init`
+  （init 幂等，`POST /gists` 每源生命周期一次）；API
+  `POST /api/v1/publishers/gist/test`。
+
+### 10.3 稳定订阅端点与 API v1
+
+* `GET /artifacts/{source_id}/subscription`（`crates/probe-api/src/sources.rs`，
+  挂在守卫组外、自带 publish/admin token 校验）：服务账本 active 快照逐字节，
+  `ETag="<sha256>"`、`If-None-Match`→304；按永久 source_id 寻址，改名不分叉。
+  已知缺陷 B6-1：缓存头被 `security_headers` 覆盖为 `no-store`
+  （`workstreams/19_ACCEPTANCE_MAP.md` §7，ignored 测试钉住期望行为）。
+* `GET /api/v1/sources`、`/api/v1/sources/{id}`、
+  `POST /api/v1/sources/{id}/runs`（Idempotency-Key 头/体、最小间隔 coalesce）、
+  `GET /api/v1/sources/{id}/runs`、`GET /api/v1/runs/{id}`。
+* 独立 GUI `/gui`（b50a306）：`GET /api/v1/session` CSRF 双提交 +
+  `POST /api/v1/gui/runs` 审计。
+
+### 10.4 Sub-Store 旧写路径的现状
+
+`push_round_exports` 双门禁（`publish.push_to_substore` **且**
+`allow_legacy_substore_write`，两默认 false），打开也只能 update-only 既有
+canonical 对象（`crates/probe-source/src/fetch.rs::update_sub` 缺失即报错）。
+Sub-Store 重复对象的一次性迁移：`crates/probe-source/src/migrate.rs`（4f27413，
+scan/apply/rollback、dry-run 默认、`MigrationStore` 无 delete 方法=结构级禁删、
+隔离改名保守禁用），CLI/API 接线为并行批次。
+
+## 11. HK3 轻量化层（P0–P7，多探测点 + 唯一 canonical + 人工推送）
+
+在 §10 的 Gist-only 架构之上，HK3 改造（workstreams/20，台账
+`HK3_LIGHTWEIGHT_CHANGELOG.md`）新增了以下结构契约：
+
+### 11.1 双角色同一代码库
+
+- **Controller**：现有 server/engine——每轮 collect → 下发 `probe_dispatch`
+  Job（HMAC-SHA256 + 5 分钟时间窗 + 每探测点独立 token）→ 收观察 → 聚合。
+- **Probe Agent**：`python -m mihomo_test agent`（compose profile
+  `probe-agent`）——只开 /healthz 与 /jobs，回传 ProbeResult，不连 Sub-Store、
+  不写 Gist、不读业务配置；内核按轮一次性创建（容器 mihomo-agent，
+  配置目录 core-agent/）。
+- `probes=[]` 为单探测点兼容模式：`local_observation` 直落，结论与改造前
+  逐字段一致（test_aggregation 灰度用例钉住）。
+
+### 11.2 聚合层（engine/aggregation.py）
+
+纯函数 `aggregate_round`：任一探测点活即活 → 全败且完成数 ≥
+`aggregation.minimum_completed_probes` 才判败 → 不足为 inconclusive（不推
+streak）；探测点离线/未知/digest 不符/超时未回传 = 观测缺失。聚合完成才对
+每节点每轮调一次 `policy.apply`——死亡计数与探测点数量解耦（指导 §4.3）。
+
+### 11.3 唯一 canonical 产物（engine/canonical_export.py + gist_store.py）
+
+- `data/exports/mihomo-alive.yaml`（+ meta.json）是唯一可订阅产物：多来源
+  去重（连接参数指纹）、重命名只动 name、country→protocol→名→指纹 固定排序。
+- Gist 固定四文件；幂等门禁钉在 **canonical 文件 sha** 上：内容不变零 PATCH
+  零 revision，status/history/README 是随行文件（§17.8 裁决，防 updated_at
+  每轮制造 revision）。
+- muted 源（export:false）不得经 canonical 后门发布。
+
+### 11.4 人工 Sub-Store 推送（manual_publish.py）
+
+自动回灌已删除（§0.1）。唯一写路径：preview（指纹身份 diff，样例只含
+name/type）→ confirm-token（60s 一次性，绑定 target+digest+节点数；重放/
+过期/绑定不符各自独立错误码）→ update-only push（目标缺失=SUBSTORE_
+TARGET_MISSING，绝不新建）。全程 publish_audit。
+
+### 11.5 发布中心数据流（P6）
+
+dashboard 的 gist/substore 块均由 publish_audit + 磁盘 canonical meta 供给；
+backend 只回 origin（完整地址可能含密钥路径，§13.6）。

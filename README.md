@@ -1,8 +1,10 @@
 # mihomo-probe — 节点测活中心
 
 在 VPS 上用**真实 mihomo 内核**周期性测试代理节点：能应答探针不算数，要真实出站、
-出口验证、跨轮次收敛，最后把「确实还活着」的节点回灌 Sub-Store，并提供一个带
-Cloudflare Tunnel 公网入口的 Web 面板。
+出口验证、跨轮次收敛，最后把「确实还活着」的节点收敛成**每个订阅一份的稳定产物**
+（本地权威副本 + GitHub Gist 固定文件镜像），消费方通过一个不变的订阅 URL 拉取；
+Sub-Store 只作为只读上游与该 URL 的消费者，并提供一个带 Cloudflare Tunnel 公网入口
+的 Web 面板。
 
 它回答三个问题，而且每个问题都用实测而不是推断来回答：
 
@@ -50,8 +52,11 @@ Cloudflare Tunnel 公网入口的 Web 面板。
   未打标签的前置副本、全节点链式模式让普通节点也按过链实测）；
 - **ipmap 落地探测**：经每个节点真实请求 IP 回显端点，v4/v6 分族实测落地出口，
   与写明的 `server` 比对识别中转，映射可回填 Sub-Store 节点名；
-- **Sub-Store 双向打通**：测活结果作为导出端点被 Sub-Store 拉取（推荐），或测活后
-  upsert 回写；另有 Script Operator 脚本让**任意**订阅按测活账本过滤死节点/标注国别；
+- **稳定产物与 Gist 托管（新）**：每个逻辑订阅一个永久 `source_id` + 一份产物；
+  本地 YAML 是权威副本，GitHub Gist 固定文件是发布镜像（首建一次，之后只 PATCH，
+  内容不变零请求），消费方走不变的 `/artifacts/<source_id>/subscription`；
+  常规的 Sub-Store 回写已默认关闭（双开关门禁的 legacy 逃生口）。另有 Script
+  Operator 脚本让**任意**订阅按测活账本过滤死节点/标注国别；
 - **告警与看门狗**：Telegram / Webhook 双通道、每类告警独立冷却期、轮次总预算超时
   中止并释放调度锁；
 - **前后端分离**：前端是纯静态文件，同源部署或推 CDN 均可，产物构建时强制校验
@@ -87,7 +92,7 @@ Cloudflare Tunnel 公网入口的 Web 面板。
                      └────────────┬────────────────────────────┘
                                   │ ④ 拉取 / 浏览器访问
                                   ▼
-                    Sub-Store 远程订阅  +  Web 面板
+                    稳定订阅 URL（Gist 镜像 / 导出端点）  +  Web 面板
 ```
 
 三个容器，一个 `docker compose up -d` 全起来：
@@ -113,7 +118,9 @@ Cloudflare Tunnel 公网入口的 Web 面板。
    内核 HTTP 入站请求 `cloudflare.com/cdn-cgi/trace`，读回**真实出口 IP 和国家**，
    剔除 CN 出口。车道独立性有专门测试：交换两条车道的选中节点，报回的出口 IP 跟着交换。
 5. **收敛**：按连续失败计数决定升级/降级，写入 SQLite。
-6. **发布**：写 `data/exports/<key>.yaml`，并（可选）把结果 upsert 进 Sub-Store。
+6. **发布**：内容寻址写 `data/exports/`（同内容复用快照），每个来源一份稳定产物；
+   配置了 Gist 时经发布器 PATCH 到固定文件，sha 相同零请求；逐轮 Sub-Store upsert
+   已默认关闭（见「与 Sub-Store 联动」）。
 
 延迟测试是并发的（默认 20）。出口验证用 8 条并行车道——实测把 251 节点 / 189 活的
 整轮从 288 秒压到约 90 秒。
@@ -363,9 +370,23 @@ python3 -m mihomo_test ipmap \
 
 ## 与 Sub-Store 联动
 
-两种方式，**推荐第一种**。
+**Gist 托管（新，推荐）** —— 测活结果不再写回 Sub-Store。每个逻辑订阅一个永久
+`source_id` 和一份产物，发布面收敛为 GitHub Gist 固定文件：
 
-### 方式一：Sub-Store 反向拉取（默认，推荐）
+- 本地 `data/exports/` 是权威副本，Gist 是对外镜像；首建一次（`probe-cli gist init`，
+  幂等），之后每轮只 `PATCH` 同一个 Gist 的同一个文件，内容 sha 不变则零请求；
+- 消费方使用**不变的订阅 URL**：`GET /artifacts/<source_id>/subscription`
+  （publish token 作用域、ETag/304、最后成功快照逐字节——发布失败它不会变空）；
+- Sub-Store 的角色只剩两个：只读上游（拉取订阅喂测活）和稳定 URL 的消费者；
+- 逐轮 upsert Sub-Store 已默认关闭，只有 `publish.push_to_substore` **且**
+  `ALLOW_LEGACY_SUBSTORE_WRITE` 双开关同时打开才允许**更新**预绑定的 canonical
+  对象（迁移期逃生口，永不新建）；一次性迁移/清理用
+  `probe-cli migrate scan|apply|rollback`（默认 dry-run）。
+
+详见 `ARCHITECTURE_GIST_ONLY.md`（目标架构）与 `MIGRATION_GIST_ONLY.md`
+（阶段 A–E 运维手册与回滚）。
+
+### 方式一：Sub-Store 反向拉取（兼容，可用）
 
 Sub-Store 把一个远程订阅指向本服务的导出端点：
 
@@ -373,7 +394,8 @@ Sub-Store 把一个远程订阅指向本服务的导出端点：
 https://<面板域名>/api/export/<key>.yaml?token=<publish.token>
 ```
 
-用 `link_substore.py` 一键建好：
+用 `link_substore.py` 一键建好（一次性动作；该脚本正在降级为
+`scan/migrate/rollback` 只读+迁移工具，日常不再需要反复执行）：
 
 ```bash
 sudo python3 /srv/mihomo-test/link_substore.py            # 创建/刷新
@@ -389,18 +411,14 @@ sudo python3 /srv/mihomo-test/link_substore.py --remove   # 撤销
 改名了（Sub-Store 对不存在的资源返回的是 **HTTP 500 而不是 404**），两者都静默空转、
 还退出 0。
 
-### 方式二：测活后写入 Sub-Store（可选）
+### 方式二：测活后写入 Sub-Store（legacy，默认关闭）
 
-在面板「设置」里打开「测活后写入 Sub-Store」，或：
-
-```bash
-sudo python3 -m mihomo_test push
-```
-
-它会 upsert 一条本地订阅 `probe-<key>-local`（名字带 `-local` 后缀，不会覆盖方式一的
-远程订阅）。每次写入都是 upsert（不存在就创建），并且把 Sub-Store 的
-「500 + `SUBSCRIPTION_NOT_FOUND`」和「500 + 未捕获 TypeError」都识别为「不存在」，
-不会把改名当成失败。
+> 这是重构前的旧行为，现在默认关闭且需要**两把钥匙**才生效：
+> `publish.push_to_substore=true` **且** 环境变量 `ALLOW_LEGACY_SUBSTORE_WRITE`
+> 为真。即便如此它也只能**更新**已经存在的 `probe-<key>-local` canonical 对象
+> ——目标不存在会明确报错，**绝不新建**；按轮次/时间戳生成新订阅在这条路径上
+> 已不可能。这是给迁移期「客户端还没切到稳定 URL」的部署留的逃生口，正常
+> 部署应当用上面的 Gist 托管 + 方式一。
 
 导出文件只在发布开启（`publish.enabled`，默认开）时由每一轮写出；发布一关，面板上的
 「推送 Sub-Store」和 `POST /api/push` 会直接拒绝并说明原因，而不是把停用前留在磁盘上的
@@ -717,6 +735,26 @@ docker logs --tail 50 cloudflared-probe                        # Tunnel 日志
 
 ---
 
+## HK3 轻量化（多探测点 + 唯一订阅产物 + 人工推送）
+
+在 Gist-only 架构之上的最新一轮改造（workstreams/20 计划，P0–P7 批次，
+台账见 `HK3_LIGHTWEIGHT_CHANGELOG.md`）：
+
+- **多探测点，一份事实**：config v3 的 `probes[]` 把同一套代码分成 Controller
+  （现有 server）与 Probe Agent（`python -m mihomo_test agent`，compose
+  `--profile probe-agent`）两种角色；每轮 Controller 下发 Job、探测点回传观察，
+  聚合层（any_alive）收敛后才跑一次原有状态机——节点不因探测点增多而加速死亡；
+  `probes=[]` 时为单探测点兼容模式，结论与改造前逐字段一致。
+- **唯一订阅产物**：所有出口（Gist、Sub-Store 人工推送、订阅 API）只读
+  `data/exports/mihomo-alive.yaml` 一份 canonical 产物——去重（连接参数指纹）、
+  重命名（只动 name）、固定排序；内容不变则 Gist 零 PATCH 零 revision。
+- **人工推送 Sub-Store**：自动回灌已删除。写 Sub-Store 的唯一路径是
+  Web「发布中心」：预览差异 → 60 秒一次性确认 token（绑定目标+digest+节点数，
+  防重放）→ update-only 推送（目标不存在拒绝，绝不新建），全程 publish_audit。
+- **Web 控制台**：总览 / 节点 / 探测点 / 发布中心 / 设置 五视图（纯静态、无构建）。
+- **灰度与回滚**：按 `workstreams/22_ROLLOUT_ROLLBACK.md` G1→G5 执行；
+  config 与 SQLite 迁移均自动留 `.bak-v3-*` 快照。
+
 ## 项目文档
 
 | 文档 | 内容 |
@@ -730,6 +768,10 @@ docker logs --tail 50 cloudflared-probe                        # Tunnel 日志
 | [REVIEW.md](REVIEW.md) | 移植批次的独立审查报告 |
 | [TEST_REPORT.md](TEST_REPORT.md) | 测试门禁记录与批次测试证据 |
 | [PLAN.md](PLAN.md) / [CHANGELOG_MIGRATION.md](CHANGELOG_MIGRATION.md) | 移植计划与批次台账（B1~B4） |
+| [HK3_LIGHTWEIGHT_CHANGELOG.md](HK3_LIGHTWEIGHT_CHANGELOG.md) | HK3 改造批次台账（P0~P7，每批含测试/风险/回滚） |
+| [workstreams/22_ROLLOUT_ROLLBACK.md](workstreams/22_ROLLOUT_ROLLBACK.md) | 灰度步骤（G1–G5）与按批回滚手册 |
+| [workstreams/23_FINAL_REPORT.md](workstreams/23_FINAL_REPORT.md) | HK3 最终报告：§18 验收清单逐条证据 + 终跑门禁数字 |
+| [workstreams/19_ACCEPTANCE_MAP.md](workstreams/19_ACCEPTANCE_MAP.md) | 指导 §11 三层门禁在本仓库的逐条落地映射（B6） |
 
 ## 许可证与免责
 

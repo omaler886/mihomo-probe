@@ -158,3 +158,20 @@
 - **审查**：待独立审查 Agent 复核（下一波）。
 - **回滚**：git revert 本批；仪表盘新增键无消费者依赖，回滚无副作用。
 - **交接**：nodes 页的搜索/协议/探测点筛选与排序目前仍为客户端单页实现（数据一次性在手），§9.2 的服务端分页接 /api/v1/nodes 记为后续增强项；探测点页的拨号明细/错误分布聚合视图待 /api/v1/rounds/{id} observations 的 UI 化。
+
+## P7-1 — 清理交付：最终报告 + 灰度/回滚手册 + 文档收口 + B6/B7 产物入库（2026-11-06）
+
+- **执行者**：主 Agent（P7）
+- **文件**：新增 `workstreams/22_ROLLOUT_ROLLBACK.md`（灰度 G1–G5 + 按批回滚表 + NOT_RUN 边界）、`workstreams/23_FINAL_REPORT.md`（§18 十二条验收逐条证据 + 终跑数字）；修改 `README.md`（HK3 章节 + 文档表补三行）、`ARCHITECTURE.md`（新增 §11 HK3 层：双角色/聚合/canonical/人工推送/发布中心数据流）、`TEST_REPORT.md`（§12 终跑门禁 + 批次增量 + NOT_RUN）；`workstreams/21_RUST_PARITY.md`（G-4 行更新为 Python 已落地）；`HK3_LIGHTWEIGHT_CHANGELOG.md`（本条）。**收尾入库** B6/B7 未提交产物（crates/probe-{api,engine,storage}/tests/、tests/test_substore_write_zero.py、workstreams/19_ACCEPTANCE_MAP.md、ARCHITECTURE_GIST_ONLY.md、MIGRATION_GIST_ONLY.md 及四份 M 文档的 B7 批改动）——指导 §17.3 每批单独提交，前序批次按「不抢先提交」裁决留至本收尾批。
+- **变更**：
+  1. **灰度/回滚**：指导 §16 逐条落成 G1（兼容模式 3 轮）→ G2（结论/digest 对比）→ G3（第二探测点 ≥6 轮仅观察）→ G4（开 Gist 查 revision 无扩散）→ G5（开放人工推送）；回滚按批给出 git revert 哈希、数据后果（追加式表旧版忽略、双 .bak-v3 快照、远端 Gist 停最后稳定版）与前置（停 scheduler 防双版本推 streak）。
+  2. **最终报告**：§18 验收 12 条中 11 PASS + 1 PARTIAL（集成/UI 真机环节 NOT_RUN，替代证据与人工清单在 22 号文档）；终跑数字如实登记。
+  3. **文档收口**：README/ARCHITECTURE 补 HK3 层契约；TEST_REPORT §12 录 832 OK / cargo 28 目标 / clippy / fmt / node --check / scan_secrets clean 的 P7 实跑终态。
+- **原因**：指导 §15 Phase 7 + §17.3/§17.4。
+- **影响**：纯文档 + 前序批次产物入库，零代码行为变化。
+- **风险**：无。
+- **测试**：全量门禁终跑（同 TEST_REPORT §12.1）；本批无代码改动，数字即为回归证据。
+- **审查**：文档与代码一致性由 23 号报告逐条引用文件/测试名支撑，可独立复核。
+- **回滚**：git revert 本批；B6/B7 产物入库不携带任何行为。
+- **交接**：HK3 工程闭环。后续 = Rust 平价（21 号 G-1→G-4 移植，另立批次）。
+

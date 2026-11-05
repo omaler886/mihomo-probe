@@ -200,3 +200,97 @@ OK (skipped=2)
 ### 10.5 缺陷清单
 
 **无。** 52 个用例首跑即全绿，未发现实现与 ARCHITECTURE §3/§4 的任何偏差；全量回归 531 用例 OK (skipped=2)，退出码 0。
+
+---
+
+## 11. 2026-11-04 Gist-only 重构验收（B6）
+
+> 验收对象：重构批次 B1（一源一产物/单飞/稳定端点/双门禁）、B2 核心+接线
+>（probe-publish Gist 发布器 + engine 远程腿）、B4（/gui + CSRF）、B5 核心
+>（Sub-Store 迁移 scan/apply/rollback），基线提交 `13c2889`。逐条门禁映射、
+> 证据（file::test）与缺口说明见 **`workstreams/19_ACCEPTANCE_MAP.md`**（本节是其
+> 数字摘要）；目标架构见 `ARCHITECTURE_GIST_ONLY.md`，运维手册见
+> `MIGRATION_GIST_ONLY.md`。
+
+### 11.1 门禁运行结果（2026-11-04 实跑）
+
+| 门禁 | 结果 |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
+| `cargo test --locked --workspace` | **685 passed / 0 failed / 2 ignored**（28 个测试目标；基线 29cf9cd 为 664/0，增量 = B6 新增 11 例 + 并行 B5 接线批次用例） |
+| `python -m unittest discover -s tests` | **605 tests OK (skipped=2)**（基线 598，+7 = B6 新增 3 + 并行批次 4；两个 skip 与基线相同：无 live 部署、flock 仅 POSIX） |
+| `python -I tools/scan_secrets.py` | secret scan: clean (tracked files) |
+| `python -m compileall -q mihomo_test tests` | exit 0 |
+| `node --check substore_bridge/probe_filter.script.js` | exit 0 |
+
+### 11.2 B6 新增测试（全部新文件，未改任何既有测试/源码）
+
+| 文件 | 数量 | 钉住的行为 |
+|---|---|---|
+| `crates/probe-engine/tests/publish_scenarios.rs` | 3 | §11.2 场景 2/4/6 的组合级版本：同输入 10 轮重跑=1 次目的地写入+9×no_change；护栏两种形态拦截且快照/文件/digest 原地；目的地不可用=publish_failed+error_code、本地快照前进、digest 停在远端已收内容、下一轮按 digest 重试 |
+| `crates/probe-storage/tests/artifact_invariants.rs` | 2 | 发布与 run claim/close 交织 10 轮仍 1 artifact、每轮 1 行；崩溃槽先受保护（round 未关不收尸）后收尸，artifact 不分裂 |
+| `crates/probe-api/tests/subscription_endpoint.rs` | 6（1 ignored） | 稳定订阅端点 HTTP 面：凭据边界、逐字节服务 active 快照、ETag/304、未知/恶意 id 404、无快照 404 不出空体；缓存头一腿发现缺陷 B6-1（见 11.4） |
+| `tests/test_substore_write_zero.py` | 3 | F-001 整轮零写：`_run_round` 全程记录 store 所有方法调用，默认配置与「push 标志开/legacy 关」两种形态都零写、本地导出仍落地；变异探针验证（双门禁全开时记录器立即抓到 `update_only`） |
+
+新增用例共 **14 例**（Rust 11 + Python 3）。设计原则：不重复 B1/B2 既有覆盖
+（100 次发布一 artifact、改名不分裂、digest 只进不退、401/429/5xx 语义等均已在
+树内被指名测试钉住，见 19_ACCEPTANCE_MAP 各表「测试/证据」列）；B6 只补组合、
+交织与 HTTP 面。
+
+### 11.3 NOT_RUN 登记（如实标记，禁止伪造）
+
+| 项 | 原因 |
+|---|---|
+| `docker compose config` | 本机无 docker 命令（exit 127） |
+| 无人值守持续运行 ≥ 8 小时 / 24h Sub-Store 对象数观测 | 无 soak 环境；证据为结构禁令+全轮零写测试，非时间窗观测 |
+| 真实 GitHub / 真实 Sub-Store 的全部 E2E（§11.2 场景 1/3 全链路、场景 5 真实双进程） | 生产资源，属 `MIGRATION_GIST_ONLY.md` 的「需要用户在场」步骤；代码级以 stub/假发布器覆盖 |
+| §11.3-9 的 API 层迁移审计 | 迁移 API 端点在基线 `13c2889` 为 404 降级（gui_tests 钉住），接线批次进行中 |
+| SQLite locked / 磁盘满 / 只读目录故障注入 | 无故障注入框架 |
+
+### 11.4 B6 发现的缺陷
+
+| 编号 | 内容 | 状态 |
+|---|---|---|
+| B6-1 | `GET /artifacts/{source_id}/subscription` 的 `Cache-Control: public, max-age=300, stale-if-error=86400` 被 `security_headers` 中间件覆盖为 `no-store`（`build_router` 层序：订阅缓存中间件在全局安全头内侧，外层后写）。功能/正确性不受影响（ETag/304/正文均正确），损失的是客户端缓存。`subscription_endpoint.rs::the_cache_policy_survives_the_security_headers` 以 `#[ignore]` 钉住期望行为，修复后取消 ignore | **open**（修复属 probe-api 所有者；B6 不改 src） |
+| B6-2 | §7.2 字面语义「相同节点不同显示名只测一次」未实现：同指纹不同显示名各拨一次，仅在账本折叠为一行、发布折叠为一份。既有行为决策，非回归 | accepted（记录偏差） |
+
+## 12. 2026-11-06 HK3 轻量化验收（P4–P7）
+
+> 批次：P4 `a58aa74`、P5 `f9ec735`、P6 `1210999`、P7 本批。每批增量明细见
+> `HK3_LIGHTWEIGHT_CHANGELOG.md` 对应条目；本节只录 P7 终跑数字与 NOT_RUN。
+
+### 12.1 P7 终跑门禁（2026-11-06 实跑）
+
+| 门禁 | 结果 |
+|---|---|
+| `python -m unittest discover -s tests` | **832 OK / 0 failed / 2 skipped**（605 基线 → +35 P1 → +21 P2 → +109 P3 → +6 P4 → +17 P5 → 净增至 832；2 skipped 为既有预期跳过） |
+| `cargo test --locked --workspace` | 28 个测试目标全 ok / 0 failed（P4 起 Rust 树零改动，每波例行复跑） |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` | 通过 |
+| `cargo fmt --all -- --check` | 通过 |
+| `node --check mihomo_test/web/app.js` | 通过（P6 前端语法门禁） |
+| `python tools/scan_secrets.py --include-untracked` | clean |
+| `yaml.safe_load(docker-compose.yml)` | 通过（容器级 NOT_RUN，无 docker） |
+
+### 12.2 HK3 批次测试增量（真实用例数）
+
+| 批次 | 新增测试 | 钉住的行为 |
+|---|---|---|
+| P1 | test_death_logic_contract.py 35 | §7 八条死亡收敛语义（身份=指纹/单次成功恢复/阈值判死/单轮 pending/基础设施错误不计 streak/整轮护栏/无来源不批量/迁移不清账） |
+| P2 | test_config_v3.py 22（含 Wave1 白名单 1） | config v3 校验（manual_push_only 强制、probes[] 键白名单、token 只许环境变量名）、2→3 幂等迁移、双 .bak-v3 备份 |
+| P3 | test_aggregation.py 57 + test_probe_dispatch.py 53（+2 digest 对齐） | 聚合三规则、观测缺失不计完成数、Job 签发/验签/防重放、agent 生命周期、/api/v1 鉴权矩阵与稳定错误码、front_dead 不推 streak |
+| P4 | test_canonical_export.py 21 + test_gist_store.py 20（+engine 接线 3） | canonical 去重/重命名/排序稳定性、Gist 四文件/幂等门禁钉 canonical sha/退避重试/token 脱敏、发布失败不影响账本 |
+| P5 | test_manual_publish.py 17 + 端点 4（重写 PushEndpointTest 2） | token 生命周期五态（消费/重放/过期/绑定不符/重签作废）、diff 预览（改名不成对、样例无凭据）、update-only 拒绝新建、自动回灌不可达 |
+| P6 | node --check + 渲染壳/dashboard 断言既有 | 五视图路由、发布中心流程（前端）；后端 dashboard 投影纯新增键 |
+
+### 12.3 NOT_RUN 登记（HK3 增量）
+
+| 项 | 原因 |
+|---|---|
+| compose 容器级集成（Controller + 2 agent + 内核，指导 §14 集成清单） | 开发机无 docker（exit 127）；agent 代码路径由 test_probe_dispatch 覆盖 |
+| Playwright UI 验收（§14 UI 清单） | 无 UI 测试环境；覆盖 = node --check + 渲染壳测试 + 端点级测试；人工核对清单在 workstreams/22_ROLLOUT_ROLLBACK.md G1 |
+| agent ↔ Controller 真机联调 | 需第二台可达探测点主机 |
+| 真实 GitHub / 真实 Sub-Store E2E | stub/transport 注入覆盖 HTTP 语义；真机步骤属 MIGRATION_GIST_ONLY.md |
+
+结论：HK3 P0–P7 代码与文档交付完成，§18 十二条验收 11 PASS + 1 PARTIAL
+（缺集成/UI 真机环节），可按 workstreams/22 灰度上生产；数字逐批可追溯。
