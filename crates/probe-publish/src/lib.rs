@@ -31,6 +31,7 @@
 //! `probe-api::publishers`.
 
 pub mod composite;
+pub mod files;
 pub mod gist;
 pub mod local;
 pub mod types;
@@ -38,6 +39,7 @@ pub mod types;
 use std::future::Future;
 
 pub use composite::CompositePublisher;
+pub use files::{FilesOutcome, FilesPublisher};
 pub use gist::{
     GistPublisher, DEFAULT_BACKOFF_BASE, DEFAULT_MAX_RETRY_AFTER, GITHUB_API_BASE, MANIFEST_FILE,
 };

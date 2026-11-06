@@ -29,6 +29,7 @@ use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION, RETRY_AFTER, USER_AGENT}
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{json, Map, Value};
 
+use crate::files::{FilesOutcome, FilesPublisher};
 use crate::types::{
     sha256_hex, validate_gist_file, ArtifactRef, PublishError, PublishErrorCode, PublishOutcome,
 };
@@ -688,6 +689,72 @@ fn manifest_entry_matches(existing: Option<&str>, entry: &ManifestEntry) -> bool
                 && record.get("status").and_then(Value::as_str) == Some(STATUS_ACTIVE)
         })
         .unwrap_or(false)
+}
+
+/// 固定文件集发布（[`FilesPublisher`]）：一次 GET + 至多一次 PATCH。
+///
+/// 幂等门禁钉在 gate 文件（canonical）的远端内容 sha 上——gate 未变 →
+/// [`FilesOutcome::NoChange`]，随行文件一个字节都不发；gate 变了 → 一次
+/// PATCH 只携带变化的文件（永不含 `content:null`，那是 GitHub 的删除语义）。
+/// 与逐 artifact 的 `Publisher::publish` 共用 per-gist 写锁（F-033）与
+/// 重试/退避/终态映射；错误信息的脱敏在 `send_once` 内完成。
+///
+/// The remote content may be `null` when GitHub truncated the file (>1MB);
+/// then no comparison is possible and the file counts as changed.
+impl FilesPublisher for GistPublisher {
+    async fn publish_files(
+        &self,
+        gist_id: &str,
+        files: &[(String, String)],
+        gate_file: &str,
+    ) -> Result<FilesOutcome, PublishError> {
+        if files.is_empty() {
+            return Err(PublishError::terminal(
+                PublishErrorCode::Config,
+                "no files to publish",
+            ));
+        }
+        let Some((_, gate_content)) = files.iter().find(|(name, _)| name == gate_file) else {
+            return Err(PublishError::terminal(
+                PublishErrorCode::Config,
+                "gate file missing from the file set",
+            ));
+        };
+        let gate_sha = sha256_hex(gate_content.as_bytes());
+        let lock = lock_for(gist_id);
+        let _write_lock = lock.lock().await;
+        let current = self.get_gist(gist_id).await?;
+        let remote = current.get("files").and_then(Value::as_object);
+        let changed: Vec<(String, String)> = files
+            .iter()
+            .filter(|(name, content)| {
+                let remote_sha = remote
+                    .and_then(|map| map.get(name.as_str()))
+                    .and_then(|file| file.get("content"))
+                    .and_then(Value::as_str)
+                    .map(|c| sha256_hex(c.as_bytes()));
+                remote_sha.as_deref() != Some(sha256_hex(content.as_bytes()).as_str())
+            })
+            .cloned()
+            .collect();
+        if !changed.iter().any(|(name, _)| name == gate_file) {
+            return Ok(FilesOutcome::NoChange);
+        }
+        let mut body = Map::new();
+        for (name, content) in &changed {
+            body.insert(name.clone(), json!({"content": content}));
+        }
+        self.send_with_retries(
+            Method::PATCH,
+            &self.gist_url(gist_id),
+            Some(json!({"files": body})),
+        )
+        .await?;
+        Ok(FilesOutcome::Published {
+            changed: changed.into_iter().map(|(name, _)| name).collect(),
+            revision: Some(gate_sha[..12].to_string()),
+        })
+    }
 }
 
 #[cfg(test)]

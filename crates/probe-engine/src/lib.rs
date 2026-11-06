@@ -10,6 +10,7 @@
 //! happen and *what* a round records.
 
 pub mod canonical;
+pub mod canonical_publish;
 pub mod collect;
 pub mod limits;
 pub mod measure;

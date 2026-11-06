@@ -188,4 +188,18 @@
 - **回滚**：git revert 本批（纯新增模块，无数据交互）。
 - **交接**：G-2 = 四文件 Gist 布局对接 probe-publish（round 产出 → canonical → 存储/发布引擎级接线 + 场景测试）；G-3 聚合、G-4 人工推送随后。
 
+## G2-R1 — Rust 移植 G-2：canonical 四文件发布链路（2026-11-06）
+
+- **执行者**：实现 Agent（G-2，workstreams/25）
+- **文件**：新增 `crates/probe-publish/src/files.rs`（`FilesPublisher` trait + `FilesOutcome`）、`crates/probe-engine/src/canonical_publish.rs`（四文件装配 + 账本口径映射 + `digest_advances` 判定）、`crates/probe-engine/tests/canonical_publish_scenarios.rs`（6 条场景）、`workstreams/25_RUST_G2_PUBLISH.md`；修改 `crates/probe-publish/src/gist.rs`（`impl FilesPublisher for GistPublisher`，移至 tests 模块前）、`crates/probe-publish/src/lib.rs`（导出）、`crates/probe-engine/src/lib.rs`（注册）、`workstreams/21_RUST_PARITY.md`（G-2 标记已落地）。Python 侧零改动。
+- **变更**：`GistPublisher::publish_files(gist_id, files, gate_file)`——一次 GET 逐文件 sha 对比，gate（canonical）未变零 PATCH 零 revision，变了单次 PATCH 只携带变化文件（永不含 content:null）；共用 per-gist 写锁/重试/终态/脱敏。引擎侧 `CanonicalFiles::from_round`（None=空轮/护栏 → 不构造不请求）+ `publish_canonical`（status 复用账本口径 published/no_change/publish_failed，始终携带 attempted digest，`digest_advances` 供调用方执行"只进不退"）。
+- **原因**：21 号平价缺口 G-2（指导 §8 / §11.1-2/6、§11.2-2/4）。
+- **影响**：Rust 侧获得 canonical 四文件发布语义层；round 流程内接线与 G-3 聚合同批（alive 集合输入正是聚合结论）；Python 行为零变化。
+- **风险**：低。probe-publish 新增 trait + GistPublisher 新方法（未动既有 publish_pass 路径）；30 个测试目标不回退。
+- **测试**：`cargo test --locked --workspace` → **730 passed / 0 failed**（含新增 6 场景：10 轮重跑 1 次 PATCH、随行文件同 PATCH/零 PATCH 分界、护栏零请求、失败保留上内容+attempted digest、401 终态非可重试、首建四文件单 PATCH）；clippy -D warnings / fmt 通过。
+- **审查**：待独立审查 Agent 复核（下一波）。
+- **回滚**：git revert 本批（新增模块为主，probe-publish 仅追加方法与导出）。
+- **交接**：G-3 = 多探测点聚合接入 round 流程（aggregation Rust 化 + canonical 调用接线一并落地）；随后 G-4。
+
+
 
