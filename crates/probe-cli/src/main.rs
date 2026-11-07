@@ -664,6 +664,97 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
             }
         }
     }
+    // Workstreams/27: the canonical four-file publish (G-2 integration).
+    // Same fire-and-forget contract as the remote leg above: the report is
+    // printed, the round's outcome is never touched, and a failure leaves the
+    // previous four files standing. The local parity materialization
+    // (export_root/mihomo-alive.yaml + meta) happens even without a remote
+    // channel, but only when the guard allowed a publication this round.
+    {
+        // spawn_blocking 的闭包是 'static：请求所需的轮次状态先克隆成
+        // owned 值，请求本身在闭包内借它们构造（与上方远程腿同型）。
+        let canonical_publish_cfg = cfg.publish.clone();
+        let canonical_sources = cfg.sources.clone();
+        let canonical_collected = collected.clone();
+        let canonical_verdicts = outcome.verdicts.clone();
+        let canonical_guard = outcome.guard;
+        let canonical_measured = !outcome.cancelled && outcome.results_written > 0;
+        let canonical_round_id = outcome.round_id;
+        let canonical_counts = outcome.counts;
+        let canonical_suspect = outcome.suspect;
+        let resolved = match probe_engine::canonical_round::CanonicalPublisher::resolve(
+            &cfg.publish,
+        ) {
+            None => None,
+            Some(Ok(pair)) => Some(pair),
+            Some(Err(error)) => {
+                eprintln!(
+                    "canonical publish: remote publisher not configured ({error}); local parity only"
+                );
+                None
+            }
+        };
+        let canonical_storage = Arc::clone(&storage);
+        let canonical_export_root = export_root.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    eprintln!("canonical publish: cannot start a runtime: {err}");
+                    return None;
+                }
+            };
+            let guard = canonical_storage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (publisher, target) = resolved?;
+            let request = probe_engine::canonical_round::CanonicalRoundRequest {
+                publish: &canonical_publish_cfg,
+                sources: &canonical_sources,
+                collected: &canonical_collected,
+                verdicts: &canonical_verdicts,
+                guard: canonical_guard,
+                measured: canonical_measured,
+                round_id: canonical_round_id,
+                counts: canonical_counts,
+                suspect: canonical_suspect,
+            };
+            Some(
+                runtime.block_on(probe_engine::canonical_round::publish_round_canonical(
+                    Some(&publisher),
+                    &target,
+                    &guard,
+                    &canonical_export_root,
+                    &request,
+                )),
+            )
+        })
+        .await
+        .ok()
+        .flatten();
+        match report {
+            Some(report) if report.status == probe_storage::runs::PUBLISH_FAILED => {
+                eprintln!(
+                    "canonical publish: failed ({}): {}",
+                    report.error_code.as_deref().unwrap_or("-"),
+                    report.message
+                );
+            }
+            Some(report) if report.status == probe_storage::runs::PUBLISH_PUBLISHED => {
+                println!(
+                    "canonical publish: published (revision {})",
+                    report.revision.as_deref().unwrap_or("-")
+                );
+            }
+            Some(report) if report.status == probe_storage::runs::PUBLISH_NO_CHANGE => {
+                println!("canonical publish: no change");
+            }
+            _ => {}
+        }
+    }
     if let Some(reason) = published.skipped {
         println!("publish: skipped ({reason:?})");
     }

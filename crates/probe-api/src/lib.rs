@@ -902,6 +902,16 @@ async fn publish_after_round(
     outcome: probe_engine::RoundOutcome,
 ) {
     let export_root = state.publish.export_root(&state.root);
+    // Canonical 发布需要的轮次状态先克隆：下面的 spawn_blocking 会把
+    // collected/outcome move 进第一个闭包（workstreams/27）。
+    let canonical_publish = state.publish.clone();
+    let canonical_sources = state.sources.clone();
+    let canonical_collected = collected.clone();
+    let canonical_verdicts = outcome.verdicts.clone();
+    let canonical_guard = outcome.guard;
+    let canonical_measured = !outcome.cancelled && outcome.results_written > 0;
+    let canonical_suspect = outcome.suspect;
+    let canonical_counts = outcome.counts;
     // `publish_round` never creates the root: an existing exclusive directory
     // is its contract. A fresh deployment has no `exports/` yet, so create it
     // here (owner-only on Unix, which its root check requires) rather than
@@ -1091,6 +1101,101 @@ async fn publish_after_round(
             Ok(None) => {}
             Err(err) => {
                 tracing::warn!(round_id = round_id, %err, "remote publish task failed")
+            }
+        }
+    }
+    // Workstreams/27: the canonical four-file publish (G-2 integration). Same
+    // fire-and-forget contract as the remote leg above: reported, never
+    // touching the round's outcome; a failure leaves the previous four files
+    // standing. The local parity materialization happens even without a
+    // remote channel, but only when the guard allowed a publication.
+    {
+        let resolved =
+            match probe_engine::canonical_round::CanonicalPublisher::resolve(&state.publish) {
+                None => None,
+                Some(Ok(pair)) => Some(pair),
+                Some(Err(error)) => {
+                    tracing::warn!(
+                        round_id = round_id,
+                        %error,
+                        "canonical remote publisher not configured; local parity only"
+                    );
+                    None
+                }
+            };
+        let publish = canonical_publish;
+        let sources = canonical_sources;
+        let collected = canonical_collected;
+        let verdicts = canonical_verdicts;
+        let guard = canonical_guard;
+        let measured = canonical_measured;
+        let suspect = canonical_suspect;
+        let counts = canonical_counts;
+        let export_root = state.publish.export_root(&state.root);
+        let storage = state.storage.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    tracing::warn!(%err, "cannot start the canonical publish runtime");
+                    return None;
+                }
+            };
+            let guard_lock = match storage.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let (publisher, target) = resolved?;
+            let request = probe_engine::canonical_round::CanonicalRoundRequest {
+                publish: &publish,
+                sources: &sources,
+                collected: &collected,
+                verdicts: &verdicts,
+                guard,
+                measured,
+                round_id,
+                counts,
+                suspect,
+            };
+            Some(
+                runtime.block_on(probe_engine::canonical_round::publish_round_canonical(
+                    Some(&publisher),
+                    &target,
+                    &guard_lock,
+                    &export_root,
+                    &request,
+                )),
+            )
+        })
+        .await;
+        match joined {
+            Ok(Some(report)) => match report.status {
+                probe_storage::runs::PUBLISH_PUBLISHED => {
+                    tracing::info!(
+                        round_id = round_id,
+                        revision = report.revision.as_deref().unwrap_or("-"),
+                        "canonical publish succeeded"
+                    );
+                }
+                probe_storage::runs::PUBLISH_NO_CHANGE => {
+                    tracing::info!(round_id = round_id, "canonical publish: no change");
+                }
+                probe_storage::runs::PUBLISH_FAILED => {
+                    tracing::warn!(
+                        round_id = round_id,
+                        code = report.error_code.as_deref().unwrap_or("-"),
+                        detail = %report.message,
+                        "canonical publish failed; the previous four files stand"
+                    );
+                }
+                _ => {}
+            },
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(round_id = round_id, %err, "canonical publish task failed")
             }
         }
     }

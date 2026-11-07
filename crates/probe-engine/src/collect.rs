@@ -51,7 +51,7 @@ pub const FRONT_SOURCE_KEY: &str = "__front__";
 pub const FRONT_NAME_PREFIX: &str = "__FRONT";
 
 /// What one collection pass produced.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Collected {
     /// Kernel-ready proxies, in `prepare` order (unique names).
     pub proxies: Vec<Value>,

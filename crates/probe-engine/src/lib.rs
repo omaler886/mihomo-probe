@@ -11,6 +11,7 @@
 
 pub mod canonical;
 pub mod canonical_publish;
+pub mod canonical_round;
 pub mod collect;
 pub mod limits;
 pub mod measure;
