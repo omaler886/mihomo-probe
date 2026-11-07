@@ -26,6 +26,7 @@ use probe_storage::Storage;
 mod config_check;
 mod exports;
 pub mod gui;
+pub mod manual_push;
 mod metrics;
 /// Public so `probe-cli migrate` reuses the exact stable-URL convention the
 /// API applies; the routes themselves stay crate-private.
@@ -94,6 +95,8 @@ pub struct AppState {
     pub min_run_interval_seconds: i64,
     /// The probe registry snapshot (G-3): who may heartbeat and post results.
     pub probes: Vec<probe_config::ProbeSpec>,
+    /// The manual-push target (G-4): the ONE pre-bound Sub-Store sub.
+    pub substore_target_name: String,
 }
 
 impl AppState {
@@ -161,6 +164,7 @@ impl AppState {
             min_run_interval_seconds: serve.min_run_interval_seconds,
             substore_allow_delete: serve.substore_allow_delete,
             probes: serve.probes,
+            substore_target_name: serve.substore_target_name,
         }
     }
     /// Record the config file this process was started from, so the config
@@ -324,6 +328,9 @@ pub struct ServeConfig {
     /// heartbeat and post results. Their tokens come from `token_env` env
     /// vars, read ONLY inside the probe endpoints.
     pub probes: Vec<probe_config::ProbeSpec>,
+    /// The manual-push target (G-4): the ONE pre-bound Sub-Store sub the
+    /// three-step flow may update, never create (`substore.target_name`).
+    pub substore_target_name: String,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -1414,6 +1421,7 @@ pub fn build_router(state: SharedState) -> Router {
         .merge(metrics::routes())
         .merge(config_check::routes())
         .merge(publishers::admin_routes())
+        .merge(manual_push::admin_routes())
         .merge(migrations::admin_routes())
         .merge(sources::admin_routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), guard));
@@ -1886,6 +1894,7 @@ mod tests {
                 min_run_interval_seconds: 0,
                 substore_allow_delete: false,
                 probes: Vec::new(),
+                substore_target_name: probe_config::DEFAULT_SUBSTORE_TARGET_NAME.into(),
             },
         )
     }

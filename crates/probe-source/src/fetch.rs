@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use crate::subscription::parse_proxies;
 
-type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Error text is bounded before it reaches a log or a ledger: an unbounded
 /// response body can carry a URL with credentials in it.

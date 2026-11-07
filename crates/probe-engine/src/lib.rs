@@ -15,6 +15,7 @@ pub mod canonical_publish;
 pub mod canonical_round;
 pub mod collect;
 pub mod limits;
+pub mod manual_publish;
 pub mod measure;
 pub mod network;
 pub mod preflight;

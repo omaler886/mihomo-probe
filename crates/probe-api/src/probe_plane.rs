@@ -334,6 +334,7 @@ mod tests {
                 backend: "http://127.0.0.1:1".into(),
                 root: root.to_path_buf(),
                 substore: None,
+                substore_target_name: probe_config::DEFAULT_SUBSTORE_TARGET_NAME.into(),
                 chain: cfg.chain.clone(),
                 publish_prefix: cfg.publish_prefix.clone(),
                 publish: cfg.publish.clone(),

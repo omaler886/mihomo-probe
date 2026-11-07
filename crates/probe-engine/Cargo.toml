@@ -20,6 +20,8 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+serde_norway = { workspace = true }
+getrandom = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

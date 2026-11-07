@@ -34,7 +34,7 @@ pub use cleanup::{
     CleanupCaps, CleanupPlan, CleanupRollbackReport, CleanupRules, CleanupStore, CleanupTarget,
     CleanupUncertain, DEFAULT_IPMAP_PREFIX, IPMAP_DISPLAY, MANUAL_FRONT_SUFFIX,
 };
-pub use fetch::{content_digest, Fetcher, SubAdmin, SubEntry, SubStoreClient};
+pub use fetch::{content_digest, BoxFuture, Fetcher, SubAdmin, SubEntry, SubStoreClient};
 pub use identity::{
     dedup_fingerprint, fingerprint_proxy, variant_fingerprint, CREDENTIAL_FIELDS, DROP_FIELDS,
     REQUIRED,

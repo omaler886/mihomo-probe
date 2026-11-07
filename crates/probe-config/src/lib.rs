@@ -848,9 +848,16 @@ pub struct SubStoreSection {
     /// explicit `=0` disarms a stored `true` during an incident — the same
     /// table `allow_legacy_substore_write` follows.
     pub allow_delete: bool,
+    /// The manual-push target object (G-4): the one pre-bound Sub-Store sub
+    /// the three-step push may UPDATE, never create. Python
+    /// `substore.target_name`, default "mihomo-probe-alive".
+    pub target_name: String,
 }
 
 pub const DEFAULT_SUBSTORE_LISTEN: &str = "127.0.0.1:8299";
+
+/// The default manual-push target.
+pub const DEFAULT_SUBSTORE_TARGET_NAME: &str = "mihomo-probe-alive";
 
 impl Default for SubStoreSection {
     fn default() -> Self {
@@ -858,6 +865,7 @@ impl Default for SubStoreSection {
             embedded: false,
             listen: DEFAULT_SUBSTORE_LISTEN.into(),
             backend_path: None,
+            target_name: DEFAULT_SUBSTORE_TARGET_NAME.into(),
             gh_proxy: None,
             auto_update: false,
             push_service: None,
@@ -903,6 +911,7 @@ impl SubStoreSection {
                     .unwrap_or(defaults.allow_delete),
                 std::env::var("ALLOW_SUBSTORE_DELETE").ok().as_deref(),
             ),
+            target_name: get_str("target_name").unwrap_or(defaults.target_name),
         }
     }
 }
