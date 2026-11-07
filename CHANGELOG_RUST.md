@@ -7,6 +7,22 @@ Rust 全量重构的变更台账。每批含影响范围与回滚方法；总控
 
 ---
 
+## HK3-Rust-31 — G-3 收口（dispatch + agent 模式）+ G-7..G-10 平价缺口（2026-11-08）
+
+- 影响：probe-engine `agent`（JobWire/verify_job/build_jobs/dispatch_job/
+  post_result/JobRunner+KernelRunner/execute_job）、probe-cli `agent` 子命令
+  （POST /jobs + healthz + busy 门禁）与 round 接线（签名派发 + digest 登记）、
+  probe-config `six_section_digest`（`probe_config_digest` 字段）、
+  probe-engine probe-cli 的 axum 提升/新增。
+- 平价缺口：G-7（Idempotency HTTP 重放）、G-8（100 节点发布）、G-9（三败
+  跨轮 pending→dead × 发布腿）、G-10（双连接并发触发）全部 covered；
+  G-6 维持 accepted 偏差（B6-2）；G-11 soak 维持 NOT_RUN。
+- 回滚：agent 子命令/round 派发独立摘除即可；migration 无新增。
+- 门禁：cargo test 34 目标 **798 passed / 0 failed**（785 + 13）；clippy/fmt
+  全绿。证据见 workstreams/31。
+
+---
+
 ## HK3-Rust-26..30 — WebDAV 通道 + canonical round 接线 + G-3 探测点面 + G-4 人工推送 + GUI 收口（2026-11-08）
 
 本会话五批（workstreams/26..30），关闭 21 号平价表的 G-1/G-2 接线、G-3 核心

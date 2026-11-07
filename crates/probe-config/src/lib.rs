@@ -391,6 +391,44 @@ fn is_unsafe_key_char(ch: char) -> bool {
     matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || (ch as u32) < 0x20
 }
 
+/// 六段配置 digest（G-3 dispatch；`probe_dispatch.config_digest` 的 Rust 侧
+/// 计算，放 probe-config 因为它持有 load 时的原始 JSON）：probes /
+/// aggregation / chain / test / policy / verify 六个 section 的 canonical
+/// JSON（sorted keys，与 Python `json.dumps(..., sort_keys=True,
+/// separators=(",", ":"))` 同字节）sha256，`"sha256:"` 前缀。两种实现对
+/// 不同键集做哈希会互拒结果——键集照抄 Python，不发明新的。
+pub fn six_section_digest(cfg: &Value) -> String {
+    let mut sections = std::collections::BTreeMap::new();
+    for key in ["probes", "aggregation", "chain", "test", "policy", "verify"] {
+        if let Some(block) = cfg.get(key) {
+            if !block.is_null() {
+                sections.insert(key.to_string(), sort_canonical(block));
+            }
+        }
+    }
+    let blob = serde_json::to_string(&sections).unwrap_or_default();
+    use sha2::Digest;
+    format!("sha256:{}", hex(&sha2::Sha256::digest(blob.as_bytes())))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn sort_canonical(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<String, Value> = map
+                .iter()
+                .map(|(key, value)| (key.clone(), sort_canonical(value)))
+                .collect();
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sort_canonical).collect()),
+        other => other.clone(),
+    }
+}
+
 /// The subset of the deployment config the Rust slice reads.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -428,6 +466,11 @@ pub struct Config {
     pub probes: Vec<ProbeSpec>,
     /// The `aggregation` section (G-3): how observations fold into verdicts.
     pub aggregation: AggregationSection,
+    /// G-3 dispatch digest: the six-section config digest computed at load
+    /// time from the raw JSON (`six_section_digest`). Dispatch writes it onto
+    /// the round row; the result endpoint compares the agent's echo against
+    /// it. Empty only when the config never loaded (impossible via `load`).
+    pub probe_config_digest: String,
 }
 
 /// One registered probe point (HK3 §3). The token itself NEVER lives here —
@@ -707,6 +750,7 @@ impl Config {
                 aggregation: AggregationSection::from_value(
                     cfg.get("aggregation").unwrap_or(&Value::Null),
                 ),
+                probe_config_digest: six_section_digest(&cfg),
             },
             json_valid,
         ))

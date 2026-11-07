@@ -24,7 +24,7 @@
 |---|---|---|---|
 | G-1 | canonical 唯一订阅产物（`data/exports/mihomo-alive.yaml` + meta） | P4 已落地（canonical_export.py + engine 接线） | **已落地（G1-R1，workstreams/24；round 接线 + 本地 parity 落盘 = workstreams/27）** |
 | G-2 | Gist 固定四文件 + canonical 幂等门禁（digest 未变零 PATCH） | P4 已落地（gist_store.py） | **已落地（G2-R1，workstreams/25；round 流程接线 = workstreams/27，CLI/API + WebDAV 通道 = workstreams/26）** |
-| G-3 | 多探测点聚合（probes[]/aggregation/any_alive + probe agent CLI） | P3 已落地 | **核心面已落地（workstreams/28）**：聚合纯函数 + probes[]/aggregation config + migration 0013 + HMAC 签名/五类校验 + agent API 端点（heartbeat/result，与 Python agent 同协议）；dispatch 发送与 Rust agent 模式待接线 |
+| G-3 | 多探测点聚合（probes[]/aggregation/any_alive + probe agent CLI） | P3 已落地 | **已落地（workstreams/28 + 31）**：聚合纯函数 + probes[]/aggregation config + migration 0013 + HMAC 签名/五类校验 + agent API 端点；dispatch 签名发送（round 接线）+ Rust `probe-cli agent` 模式（/jobs 接收器 + busy 门禁 + KernelRunner + 回传）。诚实边界：轮末聚合消费远程观测、deadline 登记待接线（31 号 §5） |
 | G-4 | 人工 Sub-Store 推送三件套（preview/confirm-token/push） | **P5 已落地**（manual_publish.py 三步 + 防重放 + 删自动回灌；P6 发布中心 UI） | **已落地（workstreams/29）**：核心（token 注册表/diff/update-only push）+ API 三端点 + publish_audit；GUI 按钮接线属 30 批 |
 | G-5 | 死亡逻辑 HK3 语义（front_dead 不推 streak） | P3 已修复并契约锁死 | 本就符合（round.rs:1198-1214，20_PLAN 裁决 2） |
 
@@ -32,11 +32,11 @@
 
 | # | 条目 | 状态 | 证据 |
 |---|---|---|---|
-| G-6 | 相同节点不同显示名只拨号一次 | partial：账本/发布折叠已实现，「一次拨号」未实现 | 19_ACCEPTANCE_MAP §11.1-4 |
-| G-7 | Idempotency-Key HTTP 级重放 | partial：claim 语义已钉，无端点级重放测试 | §11.1-8 |
-| G-8 | 100 节点规模发布场景 | partial：测试用 1-2 节点 | §11.2-1 |
-| G-9 | pending→dead 三轮跨轮集成 | partial：两段各自 covered，未串 | §11.2-3 |
-| G-10 | 双进程/双端口并发触发 | partial：DB 互斥 + 单进程测试传递 | §11.2-5 |
+| G-6 | 相同节点不同显示名只拨号一次 | accepted 偏差（19_ACCEPTANCE_MAP §7 B6-2）：账本/发布折叠已实现，「一次拨号」是既有行为决策，不改 | §11.1-4 |
+| G-7 | Idempotency-Key HTTP 级重放 | **covered（workstreams/31）**：`parity_gaps.rs` HTTP 级重放同 run_id | §11.1-8 |
+| G-8 | 100 节点规模发布场景 | **covered（workstreams/31）**：100 节点 1 artifact + 重跑零写（parity_scale_and_cross_round.rs） | §11.2-1 |
+| G-9 | pending→dead 三轮跨轮集成 | **covered（workstreams/31）**：三败跨轮（pending→dead 状态机 × 发布腿串测，真实账本） | §11.2-3 |
+| G-10 | 双进程/双端口并发触发 | **covered（workstreams/31）**：两条独立 SQLite 连接（= 双进程）并发 POST，恰一起一拒（parity_gaps.rs） | §11.2-5 |
 | G-11 | 24 小时 soak | NOT_RUN：结构禁令 + 零写测试替代 | §11.3-3 |
 
 ## 3. 结论与路线（后续迭代执行）

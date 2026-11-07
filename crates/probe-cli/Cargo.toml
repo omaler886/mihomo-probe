@@ -17,6 +17,8 @@ probe-publish = { path = "../probe-publish" }
 probe-source = { path = "../probe-source" }
 probe-storage = { path = "../probe-storage" }
 probe-substore = { path = "../probe-substore" }
+# The agent subcommand serves POST /jobs (workstreams/31) — a runtime need.
+axum = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }

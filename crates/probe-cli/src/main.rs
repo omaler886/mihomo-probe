@@ -56,6 +56,15 @@ fn main() {
     let mut quarantine_hours: Option<u64> = None;
     // `migrate clean` flags (B8).
     let mut ipmap_prefix: Option<String> = None;
+    // `agent` subcommand flags (workstreams/31, G-3)。
+    let mut agent_id: Option<String> = None;
+    let mut token_env: Option<String> = None;
+    let mut controller_url: Option<String> = None;
+    let mut kernel_api: Option<String> = None;
+    let mut kernel_secret_file: Option<PathBuf> = None;
+    let mut test_url: Option<String> = None;
+    let mut timeout_ms: Option<u64> = None;
+    let mut concurrency: Option<usize> = None;
     let mut backup_file: Option<String> = None;
     // A value flag with no value token is not a default worth guessing: a
     // truncated `probe-cli --root` would silently operate on the fallback
@@ -134,6 +143,48 @@ fn main() {
             "--ipmap-prefix" => {
                 ipmap_prefix = Some(flag_value(&args, &mut i, "--ipmap-prefix"));
             }
+            "--id" => {
+                agent_id = Some(flag_value(&args, &mut i, "--id"));
+            }
+            "--token-env" => {
+                token_env = Some(flag_value(&args, &mut i, "--token-env"));
+            }
+            "--controller" => {
+                controller_url = Some(flag_value(&args, &mut i, "--controller"));
+            }
+            "--kernel-api" => {
+                kernel_api = Some(flag_value(&args, &mut i, "--kernel-api"));
+            }
+            "--kernel-secret-file" => {
+                kernel_secret_file = Some(PathBuf::from(flag_value(
+                    &args,
+                    &mut i,
+                    "--kernel-secret-file",
+                )));
+            }
+            "--test-url" => {
+                test_url = Some(flag_value(&args, &mut i, "--test-url"));
+            }
+            "--timeout-ms" => {
+                let value = flag_value(&args, &mut i, "--timeout-ms");
+                match value.parse() {
+                    Ok(parsed) => timeout_ms = Some(parsed),
+                    Err(_) => {
+                        eprintln!("--timeout-ms expects milliseconds, got {value:?}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--concurrency" => {
+                let value = flag_value(&args, &mut i, "--concurrency");
+                match value.parse() {
+                    Ok(parsed) => concurrency = Some(parsed),
+                    Err(_) => {
+                        eprintln!("--concurrency expects a number, got {value:?}");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--backup" => {
                 backup_file = Some(flag_value(&args, &mut i, "--backup"));
             }
@@ -176,6 +227,30 @@ fn main() {
         "webdav" => {
             let sub = positionals.get(1).map(String::as_str).unwrap_or("");
             std::process::exit(cmd_webdav(&root, sub));
+        }
+        "agent" => {
+            let agent_args = AgentArgs {
+                root: root.clone(),
+                probe_id: agent_id.clone().unwrap_or_default(),
+                token_env: token_env.clone().unwrap_or_default(),
+                controller: controller_url
+                    .clone()
+                    .unwrap_or_else(|| "http://127.0.0.1:8088".into()),
+                host: host.clone(),
+                port,
+                kernel_api: kernel_api.clone(),
+                kernel_secret_file: kernel_secret_file.clone(),
+                test_url: test_url.clone(),
+                timeout_ms: timeout_ms.unwrap_or(5_000),
+                concurrency: concurrency.unwrap_or(10),
+            };
+            if let Err(err) =
+                run_async(async move { cmd_agent(agent_args).await.map_err(std::io::Error::other) })
+            {
+                eprintln!("agent failed: {err}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
         }
         "migrate" => {
             let sub = positionals.get(1).map(String::as_str).unwrap_or("");
@@ -221,6 +296,7 @@ fn print_usage() {
 \x20   substore [init|status]\n\
 \x20   gist <test|init>       test the Gist destination / create the one Gist\n\
 \x20   webdav <test|init>     test the WebDAV collection / MKCOL the directory\n\
+\x20   agent --id ID --token-env ENV: serve /jobs (signed), measure, post results\n\
 \x20   migrate <scan|apply|rollback>\n\
 \x20                          Sub-Store duplicate migration (F-058: plan-only\n\
 \x20                          output; never creates, never deletes)\n\
@@ -472,6 +548,63 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
         domain_pass: settings.verify.domain_pass,
         preserved_sources: std::mem::take(&mut collected.preserved_sources),
     };
+    // Workstreams/31：G-3 dispatch——有启用探测点时，把本轮节点签名派发给
+    // 每个 agent（§4.1/§13.1）。探测点不可达只是「本轮无远程观测」：记录
+    // 汇总后照常测量，绝不让轮次失败。digest 登记（rounds.probe_config_
+    // digest）让结果端点能对 agent 的回传做 DIGEST_MISMATCH 校验。
+    if cfg.probes.iter().any(|probe| probe.enabled) {
+        let digest = cfg.probe_config_digest.clone();
+        {
+            let guard = storage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Err(err) = guard.set_round_config_digest(round_id, &digest) {
+                eprintln!("dispatch: cannot record the round digest: {err}");
+            }
+        }
+        let nodes: Vec<probe_engine::agent::JobNode> = collected
+            .jobs
+            .iter()
+            .filter_map(|job| {
+                let original = collected
+                    .originals
+                    .get(&(job.source_id.clone(), job.fingerprint.clone()))?;
+                Some(probe_engine::agent::JobNode {
+                    fingerprint: Some(job.fingerprint.clone()),
+                    mihomo_name: job.proxy_name.clone(),
+                    proxy: original.clone(),
+                })
+            })
+            .collect();
+        let chain_enabled = cfg.chain.enabled;
+        let jobs = probe_engine::agent::build_jobs(
+            &cfg.probes,
+            round_id,
+            &digest,
+            None,
+            chain_enabled,
+            nodes,
+        );
+        let mut summary = Vec::new();
+        for job in &jobs {
+            let Some(entry) = cfg.probes.iter().find(|probe| probe.id == job.probe_id) else {
+                continue;
+            };
+            let secret = std::env::var(&entry.token_env).unwrap_or_default();
+            if secret.trim().is_empty() {
+                summary.push(format!(
+                    "{}:err(token_env {} 未设置)",
+                    entry.id, entry.token_env
+                ));
+                continue;
+            }
+            match probe_engine::agent::dispatch_job(job, &entry.endpoint, secret.trim()).await {
+                Ok(()) => summary.push(format!("{}:ok({} 节点)", entry.id, job.nodes.len())),
+                Err(reason) => summary.push(format!("{}:err({reason})", entry.id)),
+            }
+        }
+        println!("dispatch: {}", summary.join(", "));
+    }
     let kernel = settings.kernel_prep(controller.clone(), &cfg.core.container_config_path);
     let tester = settings.verified_tester(controller, &cfg.core, &collected.proxies);
     let outcome = probe_engine::run_round_with_ctx(round_id, plan, ctx, kernel, tester, ledger)
@@ -955,6 +1088,182 @@ fn cmd_gist_init(root: &Path) -> i32 {
             }
         }
     })
+}
+
+/// `agent` 子命令的旗标束（workstreams/31，G-3 收口；与 Python
+/// `run_agent` 的 AgentOptions 同面）。
+pub(crate) struct AgentArgs {
+    pub root: PathBuf,
+    pub probe_id: String,
+    pub token_env: String,
+    pub controller: String,
+    pub host: String,
+    pub port: u16,
+    pub kernel_api: Option<String>,
+    pub kernel_secret_file: Option<PathBuf>,
+    pub test_url: Option<String>,
+    pub timeout_ms: u64,
+    pub concurrency: usize,
+}
+
+/// `probe-cli agent`：探测点 agent（HK3 §13.2）。整个 HTTP 面就是
+/// `POST /jobs`（Bearer + 签名复核 → 单飞 busy 门禁 → 内核测量 → Bearer
+/// 回传 Controller）与 `GET /healthz`。没有配置、账本、Sub-Store、admin
+/// token——攻击者能触达的只有「执行递进来的任务」。
+async fn cmd_agent(args: AgentArgs) -> Result<(), String> {
+    use probe_engine::agent;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    if !probe_config::valid_probe_id(&args.probe_id) {
+        return Err(format!(
+            "agent 启动失败：--id {:?} 非法（需匹配 ^[a-z0-9][a-z0-9_-]{{1,31}}$，与 Controller 配置 probes[].id 一致）",
+            args.probe_id
+        ));
+    }
+    let secret = std::env::var(&args.token_env).unwrap_or_default();
+    if secret.trim().is_empty() {
+        return Err(format!(
+            "agent 启动失败：环境变量 {} 未设置（探测点 token 只从环境变量读，不进命令行参数）",
+            args.token_env
+        ));
+    }
+    let secret = secret.trim().to_string();
+    // 内核测量面：external-controller + secret（与内核同机部署，reload 传
+    // 的是内核侧路径视角）。
+    let secret_file = args
+        .kernel_secret_file
+        .clone()
+        .unwrap_or_else(|| args.root.join("data").join("core.secret"));
+    let kernel_secret = std::fs::read_to_string(&secret_file)
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default();
+    let mut core = probe_config::CoreConfig::defaults();
+    if let Some(api) = &args.kernel_api {
+        core.api = api.clone();
+    }
+    let controller = Arc::new(Controller::new(
+        &format!("http://{}", core.api),
+        (!kernel_secret.is_empty()).then_some(kernel_secret.as_str()),
+    ));
+    let config_dir = args.root.join("core").join("agent-jobs");
+    let runner = agent::KernelRunner {
+        controller,
+        core: core.clone(),
+        secret: kernel_secret,
+        config_dir,
+        test_url: args
+            .test_url
+            .clone()
+            .unwrap_or_else(|| "https://www.gstatic.com/generate_204".to_string()),
+        timeout_ms: args.timeout_ms,
+        concurrency: args.concurrency,
+    };
+    let busy = Arc::new(AtomicBool::new(false));
+    let agent_secret = Arc::new(secret);
+    let agent_id = Arc::new(args.probe_id.clone());
+    let controller_url = Arc::new(args.controller.clone());
+    let runner = Arc::new(runner);
+
+    let app = axum::Router::new()
+        .route(
+            "/jobs",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let secret = Arc::clone(&agent_secret);
+                    let busy = Arc::clone(&busy);
+                    let runner = Arc::clone(&runner);
+                    let agent_id = Arc::clone(&agent_id);
+                    let controller_url = Arc::clone(&controller_url);
+                    async move {
+                        let bearer = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.strip_prefix("Bearer "))
+                            .map(str::trim);
+                        let ts = headers
+                            .get(probe_engine::probe_dispatch::TIMESTAMP_HEADER)
+                            .and_then(|value| value.to_str().ok());
+                        let signature = headers
+                            .get(probe_engine::probe_dispatch::SIGNATURE_HEADER)
+                            .and_then(|value| value.to_str().ok());
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        // Token 先于 body 字节：未鉴权的调用方一个字节都不读。
+                        let job =
+                            match agent::verify_job(bearer, ts, signature, &body, &secret, now) {
+                                Ok(job) => job,
+                                Err(reject) => {
+                                    let status = axum::http::StatusCode::from_u16(reject.status())
+                                        .unwrap_or(axum::http::StatusCode::BAD_REQUEST);
+                                    return (
+                                        status,
+                                        axum::Json(serde_json::json!({
+                                            "error": reject.code(),
+                                        })),
+                                    );
+                                }
+                            };
+                        // 单内核单任务：第二个并发 Job 会在第一个脚下重载内核。
+                        if busy
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_err()
+                        {
+                            return (
+                                axum::http::StatusCode::CONFLICT,
+                                axum::Json(serde_json::json!({
+                                    "error": "BUSY",
+                                    "message": "探测点正在执行上一轮任务",
+                                })),
+                            );
+                        }
+                        let started_at = probe_storage::utc_now();
+                        tokio::spawn(async move {
+                            let result = agent::execute_job(
+                                runner.as_ref(),
+                                &job,
+                                started_at,
+                                probe_storage::utc_now(),
+                            )
+                            .await;
+                            let token = agent_secret.trim().to_string();
+                            match agent::post_result(&controller_url, &agent_id, &token, &result)
+                                .await
+                            {
+                                Ok(status) => eprintln!(
+                                    "agent: 轮次 {} 结果已回传（HTTP {status}，{} 节点）",
+                                    result.round_id,
+                                    result.results.len()
+                                ),
+                                Err(reason) => eprintln!(
+                                    "agent: 轮次 {} 结果回传失败: {reason}",
+                                    result.round_id
+                                ),
+                            }
+                            busy.store(false, Ordering::SeqCst);
+                        });
+                        (
+                            axum::http::StatusCode::ACCEPTED,
+                            axum::Json(serde_json::json!({ "accepted": true })),
+                        )
+                    }
+                },
+            ),
+        )
+        .route("/healthz", axum::routing::get(|| async { "ok" }));
+
+    let listener = tokio::net::TcpListener::bind((args.host.as_str(), args.port))
+        .await
+        .map_err(|err| format!("bind {}: {err}", args.port))?;
+    eprintln!(
+        "agent: 探测点 {} 监听 http://{}:{}，Controller {}，内核 {}",
+        args.probe_id, args.host, args.port, args.controller, core.api
+    );
+    axum::serve(listener, app)
+        .await
+        .map_err(|err| format!("serve: {err}"))?;
+    Ok(())
 }
 
 /// `webdav` subcommands (workstreams/26): `test` PROPFINDs the configured

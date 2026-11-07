@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+reqwest = { workspace = true }
 serde_norway = { workspace = true }
 getrandom = { workspace = true }
 time = { workspace = true }
@@ -32,3 +33,6 @@ tracing = { workspace = true }
 # The round lock touches a real filesystem; a temp dir is the honest fixture
 # for it, the same way probe-cli tests its database commands.
 tempfile = "3"
+# The agent round-trip test stubs the agent and controller HTTP surfaces on
+# loopback (workstreams/31) — the request sequence is the behaviour under test.
+axum = { workspace = true }
