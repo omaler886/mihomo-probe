@@ -9,6 +9,7 @@
 //! (workstreams/02). It does no IO of its own -- it decides *when* IO may
 //! happen and *what* a round records.
 
+pub mod aggregation;
 pub mod canonical;
 pub mod canonical_publish;
 pub mod canonical_round;

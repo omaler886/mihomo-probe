@@ -423,6 +423,183 @@ pub struct Config {
     /// alive nodes. Off by default -- it spends real traffic on top of the
     /// verification the round already did.
     pub quality: QualitySection,
+    /// The probe registry (G-3, HK3 §3): the remote probe points that measure
+    /// the same nodes. Empty = 本地单探测点兼容模式.
+    pub probes: Vec<ProbeSpec>,
+    /// The `aggregation` section (G-3): how observations fold into verdicts.
+    pub aggregation: AggregationSection,
+}
+
+/// One registered probe point (HK3 §3). The token itself NEVER lives here —
+/// only the NAME of the environment variable that holds it (`token_env`),
+/// the same contract as the Gist/WebDAV credential files. The list is
+/// rebuilt from a whitelist, so an unexpected key (a hand-written
+/// `authorization` that would leak through /api/status) is dropped, not
+/// carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeSpec {
+    /// Lowercase slug, also the API path segment (`^[a-z0-9][a-z0-9_-]{1,31}$`).
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    /// The probe agent's HTTPS base URL. Empty = dispatch skips it.
+    pub endpoint: String,
+    /// Environment variable name holding the shared secret
+    /// (`^[A-Z][A-Z0-9_]*$`). Empty = the probe is unusable for dispatch.
+    pub token_env: String,
+    pub weight: i64,
+    pub tags: Vec<String>,
+}
+
+impl Default for ProbeSpec {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            enabled: true,
+            endpoint: String::new(),
+            token_env: String::new(),
+            weight: 1,
+            tags: Vec::new(),
+        }
+    }
+}
+
+/// A probe id is a lowercase slug: it is both an API path segment and a
+/// database key, so anything else would change request paths or smuggle keys.
+/// Python `^[a-z0-9][a-z0-9_-]{1,31}$`.
+pub fn valid_probe_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if bytes.is_empty() || bytes.len() > 32 {
+        return false;
+    }
+    let head = in_range_ascii(bytes[0], b'a', b'z') || in_range_ascii(bytes[0], b'0', b'9');
+    let tail = bytes[1..].iter().all(|byte| {
+        in_range_ascii(*byte, b'a', b'z')
+            || in_range_ascii(*byte, b'0', b'9')
+            || *byte == b'_'
+            || *byte == b'-'
+    });
+    head && tail
+}
+
+/// An environment variable name (`^[A-Z][A-Z0-9_]*$`).
+pub fn valid_env_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && in_range_ascii(bytes[0], b'A', b'Z')
+        && bytes.iter().all(|byte| {
+            in_range_ascii(*byte, b'A', b'Z') || in_range_ascii(*byte, b'0', b'9') || *byte == b'_'
+        })
+}
+
+fn in_range_ascii(byte: u8, low: u8, high: u8) -> bool {
+    byte >= low && byte <= high
+}
+
+/// Rebuild the probe registry from the whitelist (HK3 §3): only the six
+/// allowed keys survive, an unusable id or a duplicate is skipped. The
+/// whole-config parser never fails, so a broken entry is DROPPED — a probe
+/// that never dispatches is visible in the summary, which is the honest
+/// failure mode; a config that refuses to load is not.
+fn parse_probes(value: &Value) -> Vec<ProbeSpec> {
+    let Some(entries) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for entry in entries {
+        let Some(map) = entry.as_object() else {
+            continue;
+        };
+        let text = |key: &str| -> Option<String> {
+            map.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        let Some(id) = text("id") else {
+            continue;
+        };
+        if !valid_probe_id(&id) || !seen.insert(id.clone()) {
+            continue;
+        }
+        let token_env = text("token_env").unwrap_or_default();
+        if !token_env.is_empty() && !valid_env_name(&token_env) {
+            continue;
+        }
+        out.push(ProbeSpec {
+            id,
+            name: text("name").unwrap_or_default(),
+            enabled: map.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            endpoint: text("endpoint").unwrap_or_default(),
+            token_env,
+            weight: map.get("weight").and_then(Value::as_i64).unwrap_or(1),
+            tags: map
+                .get("tags")
+                .and_then(Value::as_array)
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        });
+    }
+    out
+}
+
+/// The `aggregation` section (G-3, HK3 §4.3): how observations fold into
+/// verdicts. Defaults mirror Python DEFAULTS["aggregation"].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregationSection {
+    /// Only `any_alive` is implemented; anything else reads as `any_alive`.
+    pub strategy: String,
+    /// Failures below this many completed probes read as `inconclusive`.
+    pub minimum_completed_probes: i64,
+    /// A result arriving this many seconds after the round closed is late
+    /// (the deadline ledger's grace window).
+    pub late_result_seconds: i64,
+}
+
+impl Default for AggregationSection {
+    fn default() -> Self {
+        Self {
+            strategy: "any_alive".to_string(),
+            minimum_completed_probes: 1,
+            late_result_seconds: 90,
+        }
+    }
+}
+
+impl AggregationSection {
+    fn from_value(value: &Value) -> Self {
+        let defaults = Self::default();
+        let number = |key: &str, fallback: i64| -> i64 {
+            value
+                .get(key)
+                .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+                .unwrap_or(fallback)
+        };
+        Self {
+            strategy: value
+                .get("strategy")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .unwrap_or(&defaults.strategy)
+                .to_string(),
+            minimum_completed_probes: number(
+                "minimum_completed_probes",
+                defaults.minimum_completed_probes,
+            )
+            .clamp(0, 64),
+            late_result_seconds: number("late_result_seconds", defaults.late_result_seconds)
+                .clamp(0, 3600),
+        }
+    }
 }
 
 /// `quality`: per-round throughput sampling for a small, spread subset.
@@ -526,6 +703,10 @@ impl Config {
                 verify: VerifySection::from_value(cfg.get("verify").unwrap_or(&Value::Null)),
                 watchdog: WatchdogSection::from_value(cfg.get("watchdog").unwrap_or(&Value::Null)),
                 quality: QualitySection::from_value(cfg.get("quality").unwrap_or(&Value::Null)),
+                probes: parse_probes(cfg.get("probes").unwrap_or(&Value::Null)),
+                aggregation: AggregationSection::from_value(
+                    cfg.get("aggregation").unwrap_or(&Value::Null),
+                ),
             },
             json_valid,
         ))
@@ -2165,6 +2346,67 @@ mod tests {
         assert_eq!(section.webdav.url.as_deref(), Some("u"));
         let bare = PublishSection::from_value(&serde_json::json!({}));
         assert_eq!(bare.webdav, WebdavSection::default());
+    }
+
+    /// workstreams/28: the probe registry parses with the Python whitelist
+    /// semantics — allowed keys survive, unknown keys are dropped, unusable
+    /// ids / duplicate ids / bad token_env names are skipped. Plaintext
+    /// credential key names can never survive (they are not in the whitelist).
+    #[test]
+    fn the_probe_registry_parses_with_the_whitelist() {
+        let probes = parse_probes(&serde_json::json!([
+            {"id": "vps-hk3", "name": "hk3", "endpoint": "https://p.example.com",
+             "token_env": "PROBE_TOKEN_HK3", "weight": 2, "tags": ["fast"]},
+            {"id": "Bad ID", "endpoint": "https://x"},           // 非法 id → 丢弃
+            {"id": "vps-hk3", "endpoint": "https://dup"},        // 重复 → 丢弃
+            {"id": "lxc5", "token_env": "bad-name"},             // 非法 env 名 → 丢弃
+            {"id": "lxc6", "authorization": "secret"},           // 白名单重建 → 键消失
+            {"id": "lxc7", "enabled": false},
+            "not-an-object",
+        ]));
+        let ids: Vec<&str> = probes.iter().map(|probe| probe.id.as_str()).collect();
+        assert_eq!(ids, vec!["vps-hk3", "lxc6", "lxc7"]);
+        let first = &probes[0];
+        assert_eq!(first.name, "hk3");
+        assert_eq!(first.token_env, "PROBE_TOKEN_HK3");
+        assert_eq!(first.weight, 2);
+        assert_eq!(first.tags, vec!["fast"]);
+        // 白名单重建：lxc6 的 authorization 键永远不进内存结构。
+        assert_eq!(probes[1].endpoint, "");
+        assert!(!probes[2].enabled);
+        // 空注册表 = 本地单探测点兼容模式。
+        assert!(parse_probes(&serde_json::json!([])).is_empty());
+        assert!(parse_probes(&serde_json::json!(null)).is_empty());
+        // id/env 校验器本身。
+        assert!(valid_probe_id("vps-hk3"));
+        assert!(valid_probe_id("a"));
+        assert!(!valid_probe_id("_lead"));
+        assert!(!valid_probe_id(""));
+        assert!(!valid_probe_id(&"a".repeat(33)));
+        assert!(valid_env_name("PROBE_TOKEN_HK3"));
+        assert!(!valid_env_name("lower"));
+        assert!(!valid_env_name("1A"));
+    }
+
+    /// workstreams/28: the aggregation section parses with the Python
+    /// defaults and clamps.
+    #[test]
+    fn the_aggregation_section_parses_with_defaults() {
+        let section = AggregationSection::from_value(&serde_json::json!({
+            "strategy": "any_alive",
+            "minimum_completed_probes": 3,
+            "late_result_seconds": 30,
+        }));
+        assert_eq!(section.minimum_completed_probes, 3);
+        assert_eq!(section.late_result_seconds, 30);
+        let defaults = AggregationSection::from_value(&serde_json::json!({}));
+        assert_eq!(defaults, AggregationSection::default());
+        let clamped = AggregationSection::from_value(&serde_json::json!({
+            "minimum_completed_probes": 999,
+            "late_result_seconds": 9999,
+        }));
+        assert_eq!(clamped.minimum_completed_probes, 64);
+        assert_eq!(clamped.late_result_seconds, 3600);
     }
 
     /// B2: a fresh empty data dir parses with every publish/gist key present
