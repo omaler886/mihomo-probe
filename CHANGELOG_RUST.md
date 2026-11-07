@@ -7,6 +7,23 @@ Rust 全量重构的变更台账。每批含影响范围与回滚方法；总控
 
 ---
 
+## HK3-Rust-32 — G-3 语义闭环（轮末聚合消费 + deadline 登记表）（2026-11-08）
+
+- 影响：probe-engine `probe_aggregate`（consume：本地观测落表/等待循环/
+  aggregate_round 折叠/三条语义改写 folded/轮级摘要）、`round.rs`（fold 与
+  persist 之间接线；Ledger 增观测面默认方法；RoundPlan/RoundOutcome 增字段）、
+  `probe_dispatch`（verify_result 增 finished_at 越窗 RESULT_LATE）、
+  probe-config（`AggregationSection.interval_minutes`）、migration **0014**
+  （probe_deadlines）、CLI dispatch 重构（**修复 31 号批 bug：plan 先 take
+  jobs 致派发节点列表恒空**；deadline 登记；dispatched 进 plan）、canonical
+  status 文件增 `probes` 键。
+- 回滚：migration 0014 追加式；consume 在兼容模式（无 probes 无 dispatched）
+  整体跳过——单探测点部署行为零变化。
+- 门禁：cargo test 34 目标 **808 passed / 0 failed**（798 + 10）；clippy/fmt
+  全绿。证据见 workstreams/32。
+
+---
+
 ## HK3-Rust-31 — G-3 收口（dispatch + agent 模式）+ G-7..G-10 平价缺口（2026-11-08）
 
 - 影响：probe-engine `agent`（JobWire/verify_job/build_jobs/dispatch_job/
