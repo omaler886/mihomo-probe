@@ -25,7 +25,7 @@
 | G-1 | canonical 唯一订阅产物（`data/exports/mihomo-alive.yaml` + meta） | P4 已落地（canonical_export.py + engine 接线） | **已落地（G1-R1，workstreams/24；round 接线 + 本地 parity 落盘 = workstreams/27）** |
 | G-2 | Gist 固定四文件 + canonical 幂等门禁（digest 未变零 PATCH） | P4 已落地（gist_store.py） | **已落地（G2-R1，workstreams/25；round 流程接线 = workstreams/27，CLI/API + WebDAV 通道 = workstreams/26）** |
 | G-3 | 多探测点聚合（probes[]/aggregation/any_alive + probe agent CLI） | P3 已落地 | **核心面已落地（workstreams/28）**：聚合纯函数 + probes[]/aggregation config + migration 0013 + HMAC 签名/五类校验 + agent API 端点（heartbeat/result，与 Python agent 同协议）；dispatch 发送与 Rust agent 模式待接线 |
-| G-4 | 人工 Sub-Store 推送三件套（preview/confirm-token/push） | **P5 已落地**（manual_publish.py 三步 + 防重放 + 删自动回灌；P6 发布中心 UI） | 无（Rust 有自动 push 双门禁，语义不同） |
+| G-4 | 人工 Sub-Store 推送三件套（preview/confirm-token/push） | **P5 已落地**（manual_publish.py 三步 + 防重放 + 删自动回灌；P6 发布中心 UI） | **已落地（workstreams/29）**：核心（token 注册表/diff/update-only push）+ API 三端点 + publish_audit；GUI 按钮接线属 30 批 |
 | G-5 | 死亡逻辑 HK3 语义（front_dead 不推 streak） | P3 已修复并契约锁死 | 本就符合（round.rs:1198-1214，20_PLAN 裁决 2） |
 
 ### 2.2 既有平价缺口（19_ACCEPTANCE_MAP 实测记录，非新发现）
