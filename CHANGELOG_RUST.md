@@ -7,6 +7,59 @@ Rust 全量重构的变更台账。每批含影响范围与回滚方法；总控
 
 ---
 
+## HK3-Rust-26..30 — WebDAV 通道 + canonical round 接线 + G-3 探测点面 + G-4 人工推送 + GUI 收口（2026-11-08）
+
+本会话五批（workstreams/26..30），关闭 21 号平价表的 G-1/G-2 接线、G-3 核心
+面、G-4，并新增用户点名的 WebDAV 发布通道。
+
+### 26 — Rust WebDAV 发布通道
+- 影响：probe-config（`WebdavSection` + `PublishProvider::Webdav`）、probe-publish
+  （`WebDavPublisher`：逐 artifact PUT + manifest 合并 + FilesPublisher 四文件
+  gate-最后落 + `webdav init` MKCOL 链）、probe-engine 远程腿分支、probe-cli
+  `webdav test|init`、probe-api `/api/v1/publishers/webdav/test`。
+- 凭据纪律与 Gist 同构：密码只经 `password_file`（0600），URL 禁内嵌凭据，
+  全消息脱敏；错误码 `webdav_auth`/`webdav_missing`。
+- 回滚：`publish.provider` 改回 `local`/`gist` 即可；代码为纯新增面。
+
+### 27 — canonical 四文件 round 接线
+- 影响：probe-engine `canonical_round`（装配→本地 parity 落盘 `mihomo-alive.yaml`
+  + meta→Gist/WebDAV 尽力而为发布）；CLI round 与 API `publish_after_round`
+  各接一段（spawn_blocking 同型）；`Collected` 加 `Clone`。
+- 护栏与逐源发布完全同构；fire-and-forget（结果只进日志/报告，不改节点状态）。
+- 回滚：不调用 `publish_round_canonical` 即回到 26 前行为；本地落盘文件可删。
+
+### 28 — G-3 多探测点聚合 + 回传面（两批）
+- 影响：probe-engine `aggregation`（any_alive/minimum/inconclusive 纯函数）与
+  `probe_dispatch`（HMAC 签名同字节、六段 config_digest、五类结果校验）；
+  probe-config `probes[]`（白名单重建）+ `aggregation` 段；migration 0013
+  （probes/probe_observations/publish_audit + `rounds.probe_config_digest`）；
+  probe-storage `probes` 访问器；probe-api `probe_plane`（heartbeat/result，
+  probe Bearer 与 admin token 刻意分离）。
+- 回滚：migration 0013 为追加式，旧实现可忽略三张表；probe 路由可整体摘除。
+- 边界（诚实）：controller→agent 的 dispatch 发送与 Rust `agent` 模式未接线
+  （协议层已就位，Python agent 可互通）。
+
+### 29 — G-4 人工 Sub-Store 推送三件套
+- 影响：probe-engine `manual_publish`（ConfirmTokens 防重放/diff_preview/
+  update-only push）、probe-api `manual_push` 三端点 + publish_audit、
+  probe-config `substore.target_name`（默认 mihomo-probe-alive）。
+- 全部 admin 门禁、全部落审计；upsert 永不被调用（测试钉住）。
+- 回滚：三个端点摘除即可；publish_audit 表留作审计史。
+
+### 30 — GUI 发布中心收口 + 浏览器级验证
+- 影响：probe-api `gui.rs`（WebDAV 测试按钮、人工推送三按钮、通道徽章、
+  探针 mask 呈现、`summary.publish` 形状修复）、`config_check.rs`
+  （provider/gist_ready/webdav_ready/substore_target_name）。
+- 浏览器自动化实跑证据见 workstreams/30 §2（四页 + 全部按钮 + 审计行）。
+- 回滚：GUI 为静态字符串，还原 gui.rs 即可。
+
+### 门禁（收口实跑）
+- `cargo test --workspace`：31 目标全 ok，**785 passed / 0 failed**
+  （730 基线 + 55 新增）。
+- clippy `-D warnings` / fmt --check / scan_secrets 全绿。
+
+---
+
 ## R0 — 基线审计 + P0 整改（2026-09-30）
 
 基线：HEAD 03cb6ea，Python 3.12.10，`python -m unittest discover -s tests -v`

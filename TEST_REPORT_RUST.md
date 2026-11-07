@@ -3,6 +3,20 @@
 Rust 侧的真实测试证据。每次提交批次追加一节；只记录实际执行过的命令与输出。
 Python 基线见 `workstreams/13_TEST_COMPATIBILITY.md`（R0: 568 通过 / 2 跳过）。
 
+
+## 2026-11-08 — HK3-Rust-26..30（WebDAV/canonical 接线/G-3/G-4/GUI）
+
+- Rust：`cargo test --workspace` → 31 目标全 ok，**785 passed / 0 failed**
+  （730 基线 + 55 新增：WebDAV 12、canonical round 9、聚合 7、config 2、
+  probe_dispatch 4、probe-plane 4、probes 存储 4、manual_publish 5、
+  manual_push 2、engine WebDAV 构造 1、其余接线既有断言扩展）。
+- `cargo clippy --workspace --all-targets -- -D warnings`：零告警。
+- `cargo fmt --all -- --check`：通过。
+- `tools/scan_secrets.py`：clean（工作区）。
+- 浏览器级 GUI 验证（workstreams/30 §2）：throwaway root 实跑 12 步全过，
+  审计行落库核对；NOT_RUN：真实 Gist/WebDAV/Sub-Store 后端（沿用 §11 口径，
+  协议行为由 127.0.0.1 stub 钉住）。
+
 ---
 
 ## CI 基线修复 + 线上部署复核 — 2026-10-20（工作区，未提交）

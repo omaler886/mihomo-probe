@@ -530,10 +530,19 @@ footer{margin-top:22px;color:var(--muted);font-size:12px}
     <div class="kv" id="pub-config"></div>
     <div class="row" id="pub-badges"></div>
     <div class="row">
-      <button type="button" id="pub-test" class="btn">测试连接</button>
+      <button type="button" id="pub-test" class="btn">测试连接 (Gist)</button>
+      <button type="button" id="pub-test-webdav" class="btn">测试连接 (WebDAV)</button>
       <button type="button" id="pub-init" class="btn">初始化 Gist</button>
     </div>
     <div class="panel-note" id="pub-result">尚未执行发布器操作。</div>
+    <h2>人工推送到 Sub-Store</h2>
+    <div class="panel-note" id="pub-push-note">三步流程：预览差异 → 签发一次性确认单（60s）→ 推送（update-only，绝不新建）。目标：<code id="pub-push-target">—</code></div>
+    <div class="row">
+      <button type="button" id="pub-push-preview" class="btn">预览差异</button>
+      <button type="button" id="pub-push-confirm" class="btn">签发确认单</button>
+      <button type="button" id="pub-push" class="btn">推送到 Sub-Store</button>
+    </div>
+    <div class="panel-note" id="pub-push-result">尚未执行人工推送操作。</div>
     <h2>文件名映射</h2>
     <div class="tscroll"><table>
       <thead><tr><th>Source</th><th>文件名映射</th><th>Gist ID</th><th>最近发布 (UTC)</th><th>产物 sha</th></tr></thead>
@@ -1096,13 +1105,22 @@ function renderPublishConfig(res){
     host.appendChild(el('span', 'muted', '配置读取失败，无法显示发布器状态。'));
     return;
   }
-  var cfg = (res.body && res.body.publish) || {};
+  // 端点把发布面放在 summary.publish（顶层是 path/differences 等）；兼容
+  // 两种形状，避免整页 mask 落到空对象的默认值上。
+  var cfg = (res.body && res.body.publish)
+    || ((res.body && res.body.summary && res.body.summary.publish) || {});
   host.appendChild(kvRow('发布功能', cfg.enabled ? '已启用' : '未启用'));
   // 只显示配置布尔，从不回显凭据本身。
   host.appendChild(kvRow('发布凭据', cfg.token_configured ? '已配置' : '未配置'));
   host.appendChild(kvRow('订阅前缀', cfg.prefix || '—'));
   host.appendChild(kvRow('主机名', cfg.hostname || '—'));
+  host.appendChild(kvRow('发布通道', cfg.provider || 'local'));
   badges.appendChild(badge(cfg.enabled ? '发布已启用' : '发布未启用', cfg.enabled ? 'ok' : 'muted'));
+  badges.appendChild(badge('通道 ' + (cfg.provider || 'local'), 'muted'));
+  badges.appendChild(cfg.gist_ready ? badge('Gist 就绪', 'ok') : badge('Gist 未就绪', 'muted'));
+  badges.appendChild(cfg.webdav_ready ? badge('WebDAV 就绪', 'ok') : badge('WebDAV 未就绪', 'muted'));
+  var pushTarget = $('#pub-push-target');
+  if (pushTarget && cfg.substore_target_name) { pushTarget.textContent = cfg.substore_target_name; }
   renderPrecheck(res.body);
 }
 
@@ -1172,14 +1190,83 @@ function publisherAction(path, label){
   api('POST', path, {}, true).then(function(res){
     if (res.status === 404) {
       setPanelText(panel, label + '未启用（404）：发布器端点将在后续批次提供。');
-    } else if (res.status === 401 || res.status === 403) {
+      return;
+    }
+    if (res.status === 401 || res.status === 403) {
       setPanelText(panel, label + '失败（' + res.status + '）：鉴权或 CSRF 未通过。');
-    } else if (res.ok) {
-      setPanelText(panel, label + '成功。');
-    } else {
+      return;
+    }
+    if (!res.ok) {
       setPanelText(panel, errorNote(res, label));
+      return;
+    }
+    // 探针端点恒答 200，真实结论在 body 的 mask 里（configured/ok/error_code）。
+    var body = res.body || {};
+    if (body.ok === true) {
+      setPanelText(panel, label + '：目的地可达（ok）。');
+    } else if (body.configured === false) {
+      setPanelText(panel, label + '：未启用（未配置凭据或 URL，error_code ' + (body.error_code || 'config') + '）。');
+    } else {
+      setPanelText(panel, label + '：目的地应答异常（error_code ' + (body.error_code || '—') + '）。');
     }
   }).catch(function(){ setPanelText(panel, label + '：网络错误。'); });
+}
+
+// --- 人工推送三件套（G-4，workstreams/29） ----------------------------------
+
+function pushPanel(){ return $('#pub-push-result'); }
+
+function pushSay(text){ setPanelText(pushPanel(), text); }
+
+function pushErrorNote(res, label){
+  var code = (res.body && res.body.error) || '';
+  var detail = (res.body && (res.body.message || res.body.detail)) || '';
+  var suffix = code ? ('（' + code + (detail ? '：' + detail : '') + '）') : '';
+  return label + '失败（' + res.status + '）' + suffix + '。';
+}
+
+function pushPreview(){
+  pushSay('预览差异：请求中…');
+  api('POST', '/api/v1/substore/preview', {}, true).then(function(res){
+    if (!res.ok) { pushSay(pushErrorNote(res, '预览差异')); return; }
+    var preview = (res.body && res.body.preview) || {};
+    var missing = res.body && res.body.missing_target;
+    pushSay('预览完成：目标 ' + res.body.target
+      + '，digest ' + String(res.body.digest || '—').slice(0, 12)
+      + (missing ? '（目标对象不存在——推送将被拒绝，绝不新建）' : '')
+      + '。新增 ' + preview.added + '，移除 ' + preview.removed
+      + '，改名 ' + preview.renamed + '，不变 ' + preview.unchanged + '。');
+  }).catch(function(){ pushSay('预览差异：网络错误。'); });
+}
+
+function pushConfirm(){
+  pushSay('签发确认单：请求中…');
+  api('POST', '/api/v1/substore/confirm-token', {}, true).then(function(res){
+    if (!res.ok) { pushSay(pushErrorNote(res, '签发确认单')); return; }
+    pushSay('确认单已签发（' + res.body.expires_in + 's 内有效，绑定 digest '
+      + String(res.body.digest || '—').slice(0, 12) + '）。点击「推送到 Sub-Store」完成。');
+  }).catch(function(){ pushSay('签发确认单：网络错误。'); });
+}
+
+function pushExecute(){
+  if (!window.confirm('即将把 canonical 节点列表 update-only 写入 Sub-Store 目标对象（绝不新建）。继续吗？')) {
+    pushSay('已取消推送。');
+    return;
+  }
+  pushSay('推送：请求中…');
+  // 两段式：先签新确认单（绑定当前 digest），再立即消费——一次点击完成
+  // 「确认单 → 推送」，但仍受 60s/一次性/绑定三重门禁约束。
+  api('POST', '/api/v1/substore/confirm-token', {}, true).then(function(tokenRes){
+    if (!tokenRes.ok) { pushSay(pushErrorNote(tokenRes, '签发确认单')); return; }
+    return api('POST', '/api/v1/substore/push',
+               { confirm_token: tokenRes.body.confirm_token }, true);
+  }).then(function(res){
+    if (!res) { return; }
+    if (!res.ok) { pushSay(pushErrorNote(res, '推送')); return; }
+    pushSay('推送成功：' + res.body.target + '，' + res.body.count
+      + ' 节点（' + res.body.substore_action + '），digest '
+      + String(res.body.digest || '—').slice(0, 12) + '。');
+  }).catch(function(){ pushSay('推送：网络错误。'); });
 }
 
 // --- 清理中心 ---------------------------------------------------------------
@@ -1240,7 +1327,8 @@ function init(){
   $('#tok').addEventListener('keydown', function(ev){ if (ev.key === 'Enter') { enter(); } });
   $('#detail-source').addEventListener('change', function(){ loadDetail(null); });
   $('#detail-refresh').addEventListener('click', function(){ loadDetail(null); });
-  $('#pub-test').addEventListener('click', function(){ publisherAction('/api/v1/publishers/gist/test', '测试连接'); });
+  $('#pub-test').addEventListener('click', function(){ publisherAction('/api/v1/publishers/gist/test', '测试连接 (Gist)'); });
+  $('#pub-test-webdav').addEventListener('click', function(){ publisherAction('/api/v1/publishers/webdav/test', '测试连接 (WebDAV)'); });
   $('#pub-init').addEventListener('click', function(){
     if (!window.confirm('初始化 Gist 将创建并绑定发布对象（调用后续批次的契约端点）。继续吗？')) {
       say('已取消初始化 Gist。');
@@ -1248,6 +1336,9 @@ function init(){
     }
     publisherAction('/api/v1/publishers/gist/init', '初始化 Gist');
   });
+  $('#pub-push-preview').addEventListener('click', pushPreview);
+  $('#pub-push-confirm').addEventListener('click', pushConfirm);
+  $('#pub-push').addEventListener('click', pushExecute);
   $('#clean-scan').addEventListener('click', function(){ lastCleanupBackup = null; runMigration('/api/v1/migrations/substore/cleanup-plan', '扫描清理'); });
   $('#clean-apply').addEventListener('click', function(){
     if (!window.confirm('第一步确认：即将对旧 Sub-Store 测活产物（<prefix>-*-local、front-manual、ipmap 映射）执行删除。继续吗？')) {

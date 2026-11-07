@@ -45,6 +45,13 @@ fn summary(config: &probe_config::Config) -> serde_json::Value {
             "dir": config.publish.dir,
             "keep_snapshots": config.publish.keep_snapshots,
             "token_configured": config.publish.token.is_some(),
+            // 通道状态（workstreams/26）：provider 拼写 + 各远程通道是否
+            // 可构造（凭据文件存在性），从不回显凭据本身。
+            "provider": config.publish.provider.as_str(),
+            "gist_ready": config.publish.gist.gist_id.is_some()
+                && config.publish.gist.token_file.is_some(),
+            "webdav_ready": config.publish.webdav.url.is_some(),
+            "substore_target_name": config.substore.target_name.clone(),
         },
         "schedule": {
             "enabled": config.schedule.enabled,
