@@ -1805,6 +1805,7 @@ async fn cmd_serve(root: &Path, host: &str, port: u16) -> std::io::Result<()> {
                 policy: cfg.policy.clone(),
                 min_run_interval_seconds: cfg.schedule.min_run_interval_seconds,
                 substore_allow_delete: cfg.substore.allow_delete,
+                probes: cfg.probes.clone(),
             },
         )
         .with_publish(cfg.publish.clone()),

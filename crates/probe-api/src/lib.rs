@@ -30,6 +30,7 @@ mod metrics;
 /// Public so `probe-cli migrate` reuses the exact stable-URL convention the
 /// API applies; the routes themselves stay crate-private.
 pub mod migrations;
+pub mod probe_plane;
 mod publishers;
 mod read;
 mod sources;
@@ -91,6 +92,8 @@ pub struct AppState {
     /// just happened instead of queueing another measurement of the same
     /// nodes. `0` disables the spacing check and every trigger claims a slot.
     pub min_run_interval_seconds: i64,
+    /// The probe registry snapshot (G-3): who may heartbeat and post results.
+    pub probes: Vec<probe_config::ProbeSpec>,
 }
 
 impl AppState {
@@ -120,6 +123,18 @@ impl AppState {
             if let Err(err) = synced {
                 tracing::warn!(%err, "source registry sync failed; runs may not resolve a source_id");
             }
+            // G-3: 同步探测点注册表（与 sources 同型）：serve 启动即把配置
+            // 里的 probes[] 落进账本，heartbeat 只对已注册探测点生效。
+            let probes = serve.probes.clone();
+            if let Ok(guard) = storage.lock() {
+                for probe in &probes {
+                    if let Err(err) =
+                        guard.upsert_probe(&probe.id, &probe.name, probe.enabled, None, None, None)
+                    {
+                        tracing::warn!(probe_id = %probe.id, %err, "probe registry sync failed");
+                    }
+                }
+            }
         }
         Self {
             storage,
@@ -145,6 +160,7 @@ impl AppState {
             config_path,
             min_run_interval_seconds: serve.min_run_interval_seconds,
             substore_allow_delete: serve.substore_allow_delete,
+            probes: serve.probes,
         }
     }
     /// Record the config file this process was started from, so the config
@@ -304,6 +320,10 @@ pub struct ServeConfig {
     /// load): the cleanup-apply endpoint refuses a real delete while this is
     /// closed, exactly like the CLI. Plans and dry runs never consult it.
     pub substore_allow_delete: bool,
+    /// The probe registry snapshot (G-3): the remote probe points allowed to
+    /// heartbeat and post results. Their tokens come from `token_env` env
+    /// vars, read ONLY inside the probe endpoints.
+    pub probes: Vec<probe_config::ProbeSpec>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -1411,6 +1431,10 @@ pub fn build_router(state: SharedState) -> Router {
                 .layer(middleware::from_fn(sources::subscription_cache_headers)),
         )
         .merge(gui::gui_routes())
+        // G-3: the probe-agent routes authenticate with the PROBE token
+        // (Bearer from token_env), never the admin token, so they live
+        // outside the guarded group with their own auth (HK3 §13.1).
+        .merge(probe_plane::routes())
         .merge(guarded)
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
@@ -1861,6 +1885,7 @@ mod tests {
                 policy: cfg.policy.clone(),
                 min_run_interval_seconds: 0,
                 substore_allow_delete: false,
+                probes: Vec::new(),
             },
         )
     }

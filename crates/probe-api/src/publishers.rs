@@ -131,6 +131,7 @@ mod tests {
                 policy: cfg.policy.clone(),
                 min_run_interval_seconds: 0,
                 substore_allow_delete: false,
+                probes: Vec::new(),
             },
         ))
     }

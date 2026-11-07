@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use crate::{utc_now, DomainResult};
 
-pub const LATEST_VERSION: i64 = 12;
+pub const LATEST_VERSION: i64 = 13;
 
 /// (version, name, sql). Versions are strictly increasing and append-only:
 /// an applied migration is never edited, corrections come as new files.
@@ -77,6 +77,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         12,
         "0012_source_run_publish",
         include_str!("../../../migrations/0012_source_run_publish.sql"),
+    ),
+    (
+        13,
+        "0013_probe_observations",
+        include_str!("../../../migrations/0013_probe_observations.sql"),
     ),
 ];
 
@@ -289,6 +294,32 @@ mod tests {
             // same declared, additive change results gets below. Pin the column
             // list instead of byte identity: an undeclared column still fails,
             // and deleting 0007's two ALTER statements fails here too.
+            // 0003 gives rounds its inconclusive column and 0013 its
+            // dispatch digest: two additive ALTERs, so the column list is
+            // the pin (byte identity would fail the same way nodes does).
+            if name == "rounds" {
+                assert_eq!(
+                    columns(&conn, "rounds"),
+                    [
+                        "id",
+                        "started_at",
+                        "finished_at",
+                        "trigger",
+                        "total",
+                        "ok",
+                        "failed",
+                        "dropped",
+                        "restored",
+                        "suspect",
+                        "note",
+                        "duration_s",
+                        "mode",
+                        "inconclusive",
+                        "probe_config_digest",
+                    ]
+                );
+                continue;
+            }
             if name == "nodes" {
                 assert_eq!(
                     columns(&conn, "nodes"),

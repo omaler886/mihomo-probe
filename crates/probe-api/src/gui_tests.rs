@@ -42,6 +42,7 @@ fn gui_state(root: &std::path::Path, sources: Vec<SourceSpec>) -> SharedState {
             policy: cfg.policy.clone(),
             min_run_interval_seconds: 0,
             substore_allow_delete: false,
+            probes: Vec::new(),
         },
     ))
 }

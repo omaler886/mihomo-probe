@@ -47,6 +47,7 @@ fn state_with(publish: PublishSection) -> SharedState {
             policy: cfg.policy,
             min_run_interval_seconds: 0,
             substore_allow_delete: false,
+            probes: Vec::new(),
         },
     );
     Arc::new(state.with_publish(publish))
@@ -79,6 +80,7 @@ fn writable_root_state(publish: PublishSection) -> (SharedState, tempfile::TempD
             policy: cfg.policy,
             min_run_interval_seconds: 0,
             substore_allow_delete: false,
+            probes: Vec::new(),
         },
     );
     (Arc::new(state.with_publish(publish)), tmp)

@@ -189,6 +189,7 @@ fn pipeline_state_tuned(
             policy: cfg.policy,
             min_run_interval_seconds: 0,
             substore_allow_delete: false,
+            probes: Vec::new(),
         },
     ))
 }
