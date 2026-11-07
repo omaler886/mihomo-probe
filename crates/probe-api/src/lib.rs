@@ -854,6 +854,108 @@ async fn round_task(
             round_settings.blocked = Some(reason);
         }
     }
+    // Workstreams/33：G-3 dispatch——API 轮与 CLI 轮同构。有启用探测点时
+    // 把本轮节点签名派发给每个 agent（§4.1/§13.1）：探测点不可达只是「本轮
+    // 无远程观测」（逐探测点记录，绝不让轮次失败）；digest 登记进
+    // rounds.probe_config_digest 供结果端点比对；截止时间登记进
+    // probe_deadlines（migration 0014）供迟到回传 RESULT_LATE。派发先于
+    // plan 构造：Job 节点来自 collected.jobs（plan 会 take 走），派发被
+    // 接受的探测点 id 进 plan.dispatched 供轮内等待与聚合消费。
+    let mut dispatched_probes: Vec<String> = Vec::new();
+    let mut dispatch_deadline = String::new();
+    if task_state.probes.iter().any(|probe| probe.enabled) {
+        let digest = task_state.probe_config_digest.clone();
+        {
+            let storage = task_state.storage.lock().unwrap_or_else(|p| p.into_inner());
+            if let Err(err) = storage.set_round_config_digest(round_id, &digest) {
+                tracing::warn!(round_id, %err, "dispatch: cannot record the round digest");
+            }
+        }
+        // 截止 = 派发时刻 + interval_minutes（§4.1 Job.deadline）。
+        let interval_s = task_state.aggregation.interval_minutes.clamp(1, 1440) * 60;
+        let format =
+            time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+        let dispatch_epoch = time::PrimitiveDateTime::parse(&probe_storage::utc_now(), &format)
+            .map(|dt| dt.assume_utc().unix_timestamp())
+            .unwrap_or(0);
+        dispatch_deadline = time::OffsetDateTime::from_unix_timestamp(dispatch_epoch + interval_s)
+            .map(|dt| dt.format(&format).unwrap_or_default())
+            .unwrap_or_default();
+        let nodes: Vec<probe_engine::agent::JobNode> = collected
+            .jobs
+            .iter()
+            .filter_map(|job| {
+                let original = collected
+                    .originals
+                    .get(&(job.source_id.clone(), job.fingerprint.clone()))?;
+                Some(probe_engine::agent::JobNode {
+                    fingerprint: Some(job.fingerprint.clone()),
+                    mihomo_name: job.proxy_name.clone(),
+                    proxy: original.clone(),
+                })
+            })
+            .collect();
+        let chain_enabled = task_state.chain.enabled;
+        let jobs = probe_engine::agent::build_jobs(
+            &task_state.probes,
+            round_id,
+            &digest,
+            (!dispatch_deadline.is_empty()).then_some(dispatch_deadline.as_str()),
+            chain_enabled,
+            nodes,
+        );
+        for job in &jobs {
+            let Some(entry) = task_state
+                .probes
+                .iter()
+                .find(|probe| probe.id == job.probe_id)
+            else {
+                continue;
+            };
+            let secret = std::env::var(&entry.token_env).unwrap_or_default();
+            if secret.trim().is_empty() {
+                tracing::warn!(
+                    round_id,
+                    probe_id = %entry.id,
+                    "dispatch skipped: token_env {} is not set",
+                    entry.token_env
+                );
+                continue;
+            }
+            match probe_engine::agent::dispatch_job(job, &entry.endpoint, secret.trim()).await {
+                Ok(()) => {
+                    dispatched_probes.push(entry.id.clone());
+                    let storage = task_state.storage.lock().unwrap_or_else(|p| p.into_inner());
+                    let _ = storage.note_probe_deadline(
+                        &entry.id,
+                        &round_id.to_string(),
+                        &dispatch_deadline,
+                    );
+                    tracing::info!(
+                        round_id,
+                        probe_id = %entry.id,
+                        nodes = job.nodes.len(),
+                        "dispatch accepted"
+                    );
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        round_id,
+                        probe_id = %entry.id,
+                        %reason,
+                        "dispatch failed; the round continues without remote observations"
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            round_id,
+            dispatched = ?dispatched_probes,
+            deadline = %dispatch_deadline,
+            "probe dispatch complete"
+        );
+    }
+
     // `take` keeps `collected` whole: the publication step below needs its
     // originals, and `RoundPlan` owns the job list.
     let plan = RoundPlan {
@@ -863,12 +965,12 @@ async fn round_task(
         policy: task_state.policy.clone().into(),
         domain_pass: round_settings.verify.domain_pass,
         preserved_sources: std::mem::take(&mut collected.preserved_sources),
-        // G-3（workstreams/32）：注册表与聚合配置进轮次；API 轮暂不派发
-        // （dispatched 空 = 无等待窗口），但已落库的远程观测仍会被聚合消费。
+        // G-3（workstreams/32+33）：注册表与聚合配置进轮次；dispatched 来自
+        // 上面的派发（空 = 兼容模式，无等待窗口）。
         probes: task_state.probes.clone(),
         aggregation: task_state.aggregation.clone(),
-        dispatched: Vec::new(),
-        probe_deadline: None,
+        dispatched: dispatched_probes,
+        probe_deadline: (!dispatch_deadline.is_empty()).then_some(dispatch_deadline),
         probe_config_digest: task_state.probe_config_digest.clone(),
     };
     let kernel = round_settings.kernel_prep(

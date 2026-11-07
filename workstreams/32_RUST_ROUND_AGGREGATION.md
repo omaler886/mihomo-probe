@@ -66,6 +66,5 @@
 
 - 等待循环的真实超时路径（窗口到点）与多秒轮询未做长跑验证——窗口逻辑由
   单测的立即满足/立即到点分支钉住；真实跨进程时序属 NOT_RUN（§8 口径）。
-- API 轮不派发（dispatched 空），但已落库的远程观测仍被聚合消费；API 侧
-  dispatch 发送与 CLI 同构，待接线时复用 `probe_engine::agent::dispatch_job`。
+- API 轮 dispatch 发送已接线（workstreams/33，与 CLI 同构）。
 - 21 号「生产双跑 ≥2 周无回归」的完全替代宣告仍依赖部署环境（会话外）。

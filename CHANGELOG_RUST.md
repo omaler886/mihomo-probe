@@ -7,6 +7,16 @@ Rust 全量重构的变更台账。每批含影响范围与回滚方法；总控
 
 ---
 
+## HK3-Rust-33 — API 轮 dispatch 接线（2026-11-08）
+
+- 影响：probe-api `spawn_round` dispatch 块（与 CLI 同构：签名 POST /jobs、
+  digest/deadline 簿记、plan.dispatched）+ 集成测试（真 router + 假 agent，
+  签名复核 + 簿记断言）。
+- 门禁：cargo test 34 目标 **809 passed / 0 failed**；clippy/fmt 全绿。
+  证据见 workstreams/33。
+
+---
+
 ## HK3-Rust-32 — G-3 语义闭环（轮末聚合消费 + deadline 登记表）（2026-11-08）
 
 - 影响：probe-engine `probe_aggregate`（consume：本地观测落表/等待循环/

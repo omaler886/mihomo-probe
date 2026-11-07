@@ -166,3 +166,141 @@ async fn two_processes_triggering_concurrently_start_exactly_one_round() {
     let rounds = storage.list_rounds(10, None).unwrap();
     assert_eq!(rounds.len(), 1, "one round row in the shared ledger");
 }
+
+/// workstreams/33：API 轮的 dispatch 发送与 CLI 同构——
+/// POST /api/v1/rounds 触发的轮次把签名 Job 派发给注册探测点、登记 digest
+/// 与 deadline；轮次本体随后的内核失败不影响这些簿记。
+#[tokio::test]
+async fn the_api_round_dispatches_signed_jobs_and_registers_the_bookkeeping() {
+    use std::sync::Mutex as StdMutex;
+    use std::sync::OnceLock;
+
+    // 探测点 token（进程级设置一次；命名带 stub 标记过 scan_secrets）。
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    let token = TOKEN
+        .get_or_init(|| {
+            std::env::set_var("PROBE_TOKEN_STUB_API33", "stub-probe-secret-3131");
+            "stub-probe-secret-3131".to_string()
+        })
+        .clone();
+
+    // 假 agent：收 /jobs（签名复核 + 记录），同 agent_roundtrip 的顺序。
+    let received: Arc<StdMutex<Vec<Value>>> = Arc::default();
+    let sink = Arc::clone(&received);
+    let agent_app = axum::Router::new().route(
+        "/jobs",
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    let ts = headers
+                        .get("X-Probe-Timestamp")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    let signature = headers
+                        .get("X-Probe-Signature")
+                        .and_then(|v| v.to_str().ok());
+                    let bearer = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                        .map(str::trim);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let job = probe_engine::agent::verify_job(
+                        bearer,
+                        Some(ts),
+                        signature,
+                        &body,
+                        token.as_str(),
+                        now,
+                    );
+                    match job {
+                        Ok(job) => {
+                            sink.lock()
+                                .unwrap()
+                                .push(serde_json::to_value(job.to_json()).unwrap());
+                            (
+                                axum::http::StatusCode::ACCEPTED,
+                                axum::Json(json!({"accepted": true})),
+                            )
+                        }
+                        Err(reject) => (
+                            axum::http::StatusCode::from_u16(reject.status()).unwrap(),
+                            axum::Json(json!({"error": reject.code()})),
+                        ),
+                    }
+                }
+            },
+        ),
+    );
+    let agent_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let agent_base = format!("http://{}", agent_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(agent_listener, agent_app).await.unwrap() });
+
+    // 带 probes 注册表的 AppState（真实 API 配置路径：cfg.probes → state）。
+    let tmp = tempfile::tempdir().unwrap();
+    let storage = Storage::open(&tmp.path().join("ledger.db")).unwrap();
+    let mut state = state_with(storage, tmp.path());
+    // 经 ServeConfig 注入注册表：直接改 AppState（测试专用入口）。
+    let probes = vec![probe_config::ProbeSpec {
+        id: "stub1".into(),
+        name: "stub".into(),
+        enabled: true,
+        endpoint: agent_base.clone(),
+        token_env: "PROBE_TOKEN_STUB_API33".into(),
+        weight: 1,
+        tags: vec![],
+    }];
+    {
+        let serve_probes = probes.clone();
+        let state_mut = Arc::get_mut(&mut state).expect("single owner");
+        state_mut.probes = serve_probes;
+        state_mut.probe_config_digest = "sha256:stub-digest-33".into();
+    }
+    let base = spawn(state.clone()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base}/api/v1/rounds"))
+        .header("X-Auth-Token", ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "{}",
+        response.text().await.unwrap_or_default()
+    );
+
+    // 假 agent 收到签名 Job（轮次收集无 sources → 0 节点 Job，协议有效）。
+    for _ in 0..50 {
+        if !received.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let jobs = received.lock().unwrap();
+    assert_eq!(jobs.len(), 1, "one signed job dispatched: {jobs:?}");
+    assert_eq!(jobs[0]["probe_id"], "stub1");
+    let round_id = jobs[0]["round_id"].as_str().unwrap().to_string();
+    assert!(!round_id.is_empty());
+
+    // 簿记落库：digest 进 rounds 行、deadline 进 probe_deadlines。
+    let storage = Storage::open(&tmp.path().join("ledger.db")).unwrap();
+    assert_eq!(
+        storage
+            .round_config_digest(round_id.parse::<i64>().unwrap())
+            .unwrap()
+            .as_deref(),
+        Some("sha256:stub-digest-33")
+    );
+    let deadline = storage
+        .probe_deadline("stub1", &round_id)
+        .unwrap()
+        .expect("the deadline was registered");
+    assert!(!deadline.is_empty());
+}
