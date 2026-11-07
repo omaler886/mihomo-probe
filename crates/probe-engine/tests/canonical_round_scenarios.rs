@@ -157,6 +157,7 @@ fn request<'a>(
             ..RoundCounts::default()
         },
         suspect: false,
+        aggregate_summary: None,
     }
 }
 
@@ -397,6 +398,45 @@ async fn the_history_file_describes_ledger_rounds() {
     let history = probe_engine::canonical_round::build_history(&storage);
     assert!(history.contains("\"round_id\":"), "{history}");
     assert!(history.contains("\"publish\":\"ok\""), "{history}");
+}
+
+/// workstreams/32：聚合摘要进 status 文件的 probes 键（探测点面板口径）。
+#[tokio::test]
+async fn the_status_file_carries_the_probe_aggregate_summary() {
+    let (collected, verdicts) = fixture();
+    let publish = PublishSection::default();
+    let sources = vec![source()];
+    let storage = Storage::open_in_memory().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let fake = FakeFiles::new();
+    let mut request = request(
+        &publish,
+        &sources,
+        &collected,
+        &verdicts,
+        GuardDecision::ApplyConvergence,
+    );
+    request.aggregate_summary = Some(serde_json::json!({
+        "strategy": "any_alive",
+        "minimum_completed_probes": 1,
+        "completed_probes": ["local", "p1"],
+        "missing_probes": ["p2"],
+        "offline_probes": [],
+        "unresolved_probes": [],
+    }));
+    let report =
+        publish_round_canonical(Some(&fake), "gist0001", &storage, root.path(), &request).await;
+    assert_eq!(report.status, probe_storage::runs::PUBLISH_PUBLISHED);
+    let status: Value = serde_json::from_str(&fake.stored(STATUS_FILE).unwrap()).unwrap();
+    assert_eq!(status["probes"]["strategy"], "any_alive");
+    assert_eq!(
+        status["probes"]["completed_probes"],
+        serde_json::json!(["local", "p1"])
+    );
+    assert_eq!(
+        status["probes"]["missing_probes"],
+        serde_json::json!(["p2"])
+    );
 }
 
 /// digest「只进不退」的调用方判定复用 canonical_publish 的口径。

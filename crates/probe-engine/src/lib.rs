@@ -20,6 +20,7 @@ pub mod manual_publish;
 pub mod measure;
 pub mod network;
 pub mod preflight;
+pub mod probe_aggregate;
 pub mod probe_dispatch;
 pub mod publish;
 pub mod publish_remote;

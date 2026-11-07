@@ -51,6 +51,8 @@ fn state() -> SharedState {
             substore_allow_delete: false,
             probes: Vec::new(),
             substore_target_name: probe_config::DEFAULT_SUBSTORE_TARGET_NAME.into(),
+            aggregation: probe_config::AggregationSection::default(),
+            probe_config_digest: String::new(),
         },
     ))
 }

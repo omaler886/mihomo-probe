@@ -362,6 +362,8 @@ mod tests {
                 substore_allow_delete: false,
                 probes: Vec::new(),
                 substore_target_name: probe_config::DEFAULT_SUBSTORE_TARGET_NAME.into(),
+                aggregation: probe_config::AggregationSection::default(),
+                probe_config_digest: String::new(),
             },
         ));
         let export_root = state.publish.export_root(&state.root);
@@ -423,6 +425,8 @@ mod tests {
                 substore_allow_delete: false,
                 probes: Vec::new(),
                 substore_target_name: probe_config::DEFAULT_SUBSTORE_TARGET_NAME.into(),
+                aggregation: probe_config::AggregationSection::default(),
+                probe_config_digest: String::new(),
             },
         ));
         let app = build_router(state.clone());

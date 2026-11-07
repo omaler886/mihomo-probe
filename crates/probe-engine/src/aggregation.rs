@@ -432,6 +432,7 @@ mod tests {
             strategy: STRATEGY_ANY_ALIVE.to_string(),
             minimum_completed_probes: minimum,
             late_result_seconds: 90,
+            interval_minutes: 30,
         }
     }
 

@@ -66,7 +66,7 @@ impl InlineAgent {
         let received: Arc<Mutex<Vec<JobWire>>> = Arc::default();
         let agent_busy = Arc::clone(&busy);
         let agent_received = Arc::clone(&received);
-        let secret = "probe-secret-3131".to_string();
+        let secret = "stub-probe-secret-3131".to_string();
         let agent_secret = secret.clone();
         let controller = controller.to_string();
         let app = axum::Router::new().route(

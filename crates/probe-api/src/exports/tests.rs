@@ -49,6 +49,8 @@ fn state_with(publish: PublishSection) -> SharedState {
             substore_allow_delete: false,
             probes: Vec::new(),
             substore_target_name: probe_config::DEFAULT_SUBSTORE_TARGET_NAME.into(),
+            aggregation: probe_config::AggregationSection::default(),
+            probe_config_digest: String::new(),
         },
     );
     Arc::new(state.with_publish(publish))
@@ -83,6 +85,8 @@ fn writable_root_state(publish: PublishSection) -> (SharedState, tempfile::TempD
             substore_allow_delete: false,
             probes: Vec::new(),
             substore_target_name: probe_config::DEFAULT_SUBSTORE_TARGET_NAME.into(),
+            aggregation: probe_config::AggregationSection::default(),
+            probe_config_digest: String::new(),
         },
     );
     (Arc::new(state.with_publish(publish)), tmp)

@@ -106,6 +106,10 @@ pub struct CanonicalRoundRequest<'a> {
     pub counts: RoundCounts,
     /// 本轮护栏是否判了 suspect（`RoundOutcome::suspect`）。
     pub suspect: bool,
+    /// G-3 轮末聚合摘要（`RoundOutcome::aggregate_summary`）：进 status 文件
+    /// 的 `probes` 键（completed/missing/offline/unresolved——探测点面板的
+    /// 诚实口径）。None = 兼容模式。
+    pub aggregate_summary: Option<Value>,
 }
 
 /// 一次 canonical round 发布的结果。`attempted=false` 时 `status` 恒为
@@ -209,7 +213,7 @@ fn assemble_round_canonical(request: &CanonicalRoundRequest<'_>) -> Option<Round
         Ok(Some(artifact)) => artifact,
         _ => return None,
     };
-    let status = json!({
+    let mut status = json!({
         "updated_at": probe_storage::utc_now(),
         "round_id": request.round_id,
         "total": request.counts.total,
@@ -219,6 +223,9 @@ fn assemble_round_canonical(request: &CanonicalRoundRequest<'_>) -> Option<Round
         // digest 显式随行：status 文件与幂等门禁都用它，不依赖发布器兜底。
         "digest": artifact.meta.digest,
     });
+    if let Some(summary) = &request.aggregate_summary {
+        status["probes"] = summary.clone();
+    }
     Some(RoundCanonical { artifact, status })
 }
 

@@ -539,19 +539,16 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
         collected.proxies = proxies;
     }
 
-    let plan = RoundPlan {
-        trigger: trigger.to_string(),
-        mode: mode.map(str::to_string),
-        // `take` keeps `collected` whole for the publication step below.
-        jobs: std::mem::take(&mut collected.jobs),
-        policy: cfg.policy.clone().into(),
-        domain_pass: settings.verify.domain_pass,
-        preserved_sources: std::mem::take(&mut collected.preserved_sources),
-    };
-    // Workstreams/31：G-3 dispatch——有启用探测点时，把本轮节点签名派发给
+    // Workstreams/31+32：G-3 dispatch——有启用探测点时，把本轮节点签名派发给
     // 每个 agent（§4.1/§13.1）。探测点不可达只是「本轮无远程观测」：记录
     // 汇总后照常测量，绝不让轮次失败。digest 登记（rounds.probe_config_
-    // digest）让结果端点能对 agent 的回传做 DIGEST_MISMATCH 校验。
+    // digest）让结果端点能对 agent 的回传做 DIGEST_MISMATCH 校验；截止时间
+    // 登记进 probe_deadlines（migration 0014），结果端点据此给迟到回传
+    // RESULT_LATE。派发先于 plan 构造：Job 节点来自 collected.jobs（plan
+    // 会 take 走），派发被接受的探测点 id 进 plan.dispatched 供轮内等待与
+    // 聚合消费（workstreams/32）。
+    let mut dispatched_probes = Vec::new();
+    let mut dispatch_deadline = String::new();
     if cfg.probes.iter().any(|probe| probe.enabled) {
         let digest = cfg.probe_config_digest.clone();
         {
@@ -562,6 +559,16 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
                 eprintln!("dispatch: cannot record the round digest: {err}");
             }
         }
+        // 截止 = 派发时刻 + interval_minutes（§4.1 Job.deadline）。
+        let interval_s = cfg.aggregation.interval_minutes.clamp(1, 1440) * 60;
+        let format =
+            time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+        let dispatch_epoch = time::PrimitiveDateTime::parse(&probe_storage::utc_now(), &format)
+            .map(|dt| dt.assume_utc().unix_timestamp())
+            .unwrap_or(0);
+        dispatch_deadline = time::OffsetDateTime::from_unix_timestamp(dispatch_epoch + interval_s)
+            .map(|dt| dt.format(&format).unwrap_or_default())
+            .unwrap_or_default();
         let nodes: Vec<probe_engine::agent::JobNode> = collected
             .jobs
             .iter()
@@ -581,7 +588,7 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
             &cfg.probes,
             round_id,
             &digest,
-            None,
+            (!dispatch_deadline.is_empty()).then_some(dispatch_deadline.as_str()),
             chain_enabled,
             nodes,
         );
@@ -599,12 +606,41 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
                 continue;
             }
             match probe_engine::agent::dispatch_job(job, &entry.endpoint, secret.trim()).await {
-                Ok(()) => summary.push(format!("{}:ok({} 节点)", entry.id, job.nodes.len())),
+                Ok(()) => {
+                    dispatched_probes.push(entry.id.clone());
+                    let guard = storage
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let _ = guard.note_probe_deadline(
+                        &entry.id,
+                        &round_id.to_string(),
+                        &dispatch_deadline,
+                    );
+                    summary.push(format!("{}:ok({} 节点)", entry.id, job.nodes.len()));
+                }
                 Err(reason) => summary.push(format!("{}:err({reason})", entry.id)),
             }
         }
-        println!("dispatch: {}", summary.join(", "));
+        println!(
+            "dispatch: {}（截止 {dispatch_deadline}）",
+            summary.join(", ")
+        );
     }
+
+    let plan = RoundPlan {
+        trigger: trigger.to_string(),
+        mode: mode.map(str::to_string),
+        // `take` keeps `collected` whole for the publication step below.
+        jobs: std::mem::take(&mut collected.jobs),
+        policy: cfg.policy.clone().into(),
+        domain_pass: settings.verify.domain_pass,
+        preserved_sources: std::mem::take(&mut collected.preserved_sources),
+        probes: cfg.probes.clone(),
+        aggregation: cfg.aggregation.clone(),
+        dispatched: dispatched_probes,
+        probe_deadline: (!dispatch_deadline.is_empty()).then_some(dispatch_deadline),
+        probe_config_digest: cfg.probe_config_digest.clone(),
+    };
     let kernel = settings.kernel_prep(controller.clone(), &cfg.core.container_config_path);
     let tester = settings.verified_tester(controller, &cfg.core, &collected.proxies);
     let outcome = probe_engine::run_round_with_ctx(round_id, plan, ctx, kernel, tester, ledger)
@@ -815,6 +851,7 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
         let canonical_round_id = outcome.round_id;
         let canonical_counts = outcome.counts;
         let canonical_suspect = outcome.suspect;
+        let canonical_aggregate = outcome.aggregate_summary.clone();
         let resolved = match probe_engine::canonical_round::CanonicalPublisher::resolve(
             &cfg.publish,
         ) {
@@ -854,6 +891,7 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
                 round_id: canonical_round_id,
                 counts: canonical_counts,
                 suspect: canonical_suspect,
+                aggregate_summary: canonical_aggregate.clone(),
             };
             Some(
                 runtime.block_on(probe_engine::canonical_round::publish_round_canonical(
@@ -2116,6 +2154,8 @@ async fn cmd_serve(root: &Path, host: &str, port: u16) -> std::io::Result<()> {
                 substore_allow_delete: cfg.substore.allow_delete,
                 probes: cfg.probes.clone(),
                 substore_target_name: cfg.substore.target_name.clone(),
+                aggregation: cfg.aggregation.clone(),
+                probe_config_digest: cfg.probe_config_digest.clone(),
             },
         )
         .with_publish(cfg.publish.clone()),

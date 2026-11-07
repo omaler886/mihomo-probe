@@ -40,6 +40,7 @@ use probe_domain::{DomainError, DomainPass, DomainResult, RoundId};
 use probe_mihomo::{Controller, DelayOutcome, KernelError};
 use probe_source::Role;
 use probe_storage::{ResultRow, Storage, VERDICT_EXCLUDED, VERDICT_FAIL, VERDICT_OK};
+use serde_json::Value;
 
 use crate::limits::{Job, Limits, RoundCtx};
 
@@ -257,6 +258,36 @@ pub trait Ledger: Send + Sync {
         suspect: bool,
         inconclusive: bool,
     ) -> DomainResult<()>;
+
+    // ---- G-3 轮末聚合消费的账本面（workstreams/32）。默认空实现让假账本
+    // ---- 与单探测点兼容模式零成本通过：没有探测点注册表时轮内行为不变。
+
+    /// 把一条观测写进 probe_observations（PK round+probe+fingerprint 幂等
+    /// 覆盖）。默认无表可写：单探测点兼容模式在内存里聚合，不落表。
+    #[allow(clippy::too_many_arguments)]
+    fn record_observation(
+        &self,
+        _round_id: &str,
+        _probe_id: &str,
+        _fingerprint: &str,
+        _alive: Option<bool>,
+        _delay_ms: Option<i64>,
+        _reason: Option<&str>,
+        _egress_country: Option<&str>,
+        _payload_digest: &str,
+    ) -> DomainResult<()> {
+        Ok(())
+    }
+
+    /// 本轮全部观测行（probe → fingerprint 序）。默认无表可读。
+    fn get_observations(&self, _round_id: &str) -> Vec<probe_storage::ObservationRow> {
+        Vec::new()
+    }
+
+    /// 探测点注册表（心跳/状态/启用）。默认空注册表。
+    fn list_probes(&self) -> Vec<probe_storage::ProbeRow> {
+        Vec::new()
+    }
 
     /// Close the round and record its measured wall-clock duration in seconds.
     ///
@@ -554,6 +585,18 @@ pub struct RoundPlan {
     pub policy: probe_domain::Policy,
     pub domain_pass: DomainPass,
     pub preserved_sources: Vec<String>,
+    // ---- G-3 多探测点面（workstreams/32）。空 probes + 空 dispatched =
+    // ---- 本地单探测点兼容模式，轮内聚合消费整体跳过（灰度第 1 步 no-op）。
+    /// 探测点注册表（汇总口径：missing/offline 的期望集合）。
+    pub probes: Vec<probe_config::ProbeSpec>,
+    /// 聚合配置（strategy/minimum_completed_probes/late_result_seconds）。
+    pub aggregation: probe_config::AggregationSection,
+    /// 本轮派发被接受的探测点 id（调用方派发后填；空 = 未派发）。
+    pub dispatched: Vec<String>,
+    /// 派发登记的回传截止（ISO 秒精度 UTC；None = 未登记，不等待）。
+    pub probe_deadline: Option<String>,
+    /// 六段配置 digest（观测过滤的 digest 门禁输入）。
+    pub probe_config_digest: String,
 }
 
 /// What happened.
@@ -578,6 +621,9 @@ pub struct RoundOutcome {
     /// True when the alive count fell below the floor: the convergence still
     /// landed, but the publication is preserved (R8 reads this flag).
     pub suspect: bool,
+    /// G-3 轮末聚合摘要（completed/missing/offline/unresolved probes）。
+    /// `None` = 本地单探测点兼容模式（无探测点、无派发）。
+    pub aggregate_summary: Option<Value>,
     /// Convergence transition stats, from the fold.
     pub dropped_nodes: i64,
     pub restored_nodes: i64,
@@ -687,7 +733,23 @@ pub async fn run_round_with_ctx(
         .map(|v| v.job.proxy_name.clone())
         .collect::<HashSet<_>>()
         .len();
-    let folded = fold_verdicts(&verdicts, plan.domain_pass);
+    let mut folded = fold_verdicts(&verdicts, plan.domain_pass);
+    // G-3 轮末聚合消费（workstreams/32）：远程观测 + 本地观测经
+    // aggregate_round 改写 folded——alive/fail/inconclusive 三条语义；
+    // 兼容模式（无探测点、无派发）整体跳过。计数在改写后统计。
+    let aggregate_summary =
+        crate::probe_aggregate::consume(crate::probe_aggregate::AggregateConsumeRequest {
+            round_id,
+            probes: &plan.probes,
+            aggregation: &plan.aggregation,
+            dispatched: &plan.dispatched,
+            config_digest: &plan.probe_config_digest,
+            probe_deadline: plan.probe_deadline.as_deref(),
+            folded: &mut folded,
+            ledger: ledger.as_ref(),
+            ctx: &ctx,
+        })
+        .await;
     let front_dead = folded
         .iter()
         .filter(|node| !node.is_inconclusive && node.reason.as_deref() == Some(FRONT_DEAD))
@@ -833,6 +895,7 @@ pub async fn run_round_with_ctx(
         dropped_nodes: convergence.dropped,
         restored_nodes: convergence.restored,
         preserved_sources,
+        aggregate_summary,
     })
 }
 
@@ -1076,21 +1139,21 @@ impl NodeFold {
 
 /// The owned per-node aggregation `fold_verdicts` produces; the ledger borrows
 /// it as [`probe_storage::ConvergeNode`] for the duration of the fold.
-struct FoldedNode {
-    source: String,
-    fingerprint: String,
-    display: String,
-    category: Option<String>,
-    ok: bool,
-    delay_ms: Option<i64>,
-    reason: Option<String>,
-    protocol: Option<String>,
-    server: Option<String>,
-    is_excluded: bool,
-    is_inconclusive: bool,
-    ip_alive: usize,
-    ip_total: usize,
-    exit: Option<probe_domain::ExitIdentity>,
+pub(crate) struct FoldedNode {
+    pub(crate) source: String,
+    pub(crate) fingerprint: String,
+    pub(crate) display: String,
+    pub(crate) category: Option<String>,
+    pub(crate) ok: bool,
+    pub(crate) delay_ms: Option<i64>,
+    pub(crate) reason: Option<String>,
+    pub(crate) protocol: Option<String>,
+    pub(crate) server: Option<String>,
+    pub(crate) is_excluded: bool,
+    pub(crate) is_inconclusive: bool,
+    pub(crate) ip_alive: usize,
+    pub(crate) ip_total: usize,
+    pub(crate) exit: Option<probe_domain::ExitIdentity>,
 }
 
 /// The failure class Python records for a chain whose every front was dead:
@@ -1298,6 +1361,48 @@ fn compose_note(
 /// is why a `std` mutex is correct here -- and why the runner can hold this
 /// while other request handlers still reach `/readyz` and `/api/v1/status`.
 impl Ledger for Mutex<Storage> {
+    fn record_observation(
+        &self,
+        round_id: &str,
+        probe_id: &str,
+        fingerprint: &str,
+        alive: Option<bool>,
+        delay_ms: Option<i64>,
+        reason: Option<&str>,
+        egress_country: Option<&str>,
+        payload_digest: &str,
+    ) -> DomainResult<()> {
+        self.lock()
+            .map_err(|_| DomainError::Storage("ledger lock poisoned".into()))?
+            .record_observation(
+                round_id,
+                probe_id,
+                fingerprint,
+                alive,
+                delay_ms,
+                reason,
+                egress_country,
+                payload_digest,
+            )
+    }
+
+    fn get_observations(&self, round_id: &str) -> Vec<probe_storage::ObservationRow> {
+        match self.lock() {
+            Ok(guard) => guard.get_observations(round_id).unwrap_or_default(),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .get_observations(round_id)
+                .unwrap_or_default(),
+        }
+    }
+
+    fn list_probes(&self) -> Vec<probe_storage::ProbeRow> {
+        match self.lock() {
+            Ok(guard) => guard.list_probes().unwrap_or_default(),
+            Err(poisoned) => poisoned.into_inner().list_probes().unwrap_or_default(),
+        }
+    }
+
     fn node_statuses(&self) -> DomainResult<std::collections::HashMap<(String, String), String>> {
         self.lock()
             .map_err(|_| DomainError::Storage("ledger lock poisoned".into()))?
@@ -1765,6 +1870,11 @@ mod tests {
             policy: probe_domain::Policy::default(),
             domain_pass: DomainPass::Any,
             preserved_sources: Vec::new(),
+            probes: Vec::new(),
+            aggregation: probe_config::AggregationSection::default(),
+            dispatched: Vec::new(),
+            probe_deadline: None,
+            probe_config_digest: String::new(),
         }
     }
 

@@ -16,6 +16,7 @@ use rusqlite::Connection;
 pub mod cache;
 pub mod migrations;
 pub mod probes;
+pub use probes::{ObservationRow, ProbeRow};
 pub mod publication;
 pub mod runs;
 pub mod sources;

@@ -605,6 +605,10 @@ pub struct AggregationSection {
     /// A result arriving this many seconds after the round closed is late
     /// (the deadline ledger's grace window).
     pub late_result_seconds: i64,
+    /// The dispatch deadline window in minutes (Python `probe_policy
+    /// .interval_minutes`，默认 30）：jobs carry `now + interval` as the
+    /// agent's deadline, and the controller waits until deadline + late.
+    pub interval_minutes: i64,
 }
 
 impl Default for AggregationSection {
@@ -613,6 +617,7 @@ impl Default for AggregationSection {
             strategy: "any_alive".to_string(),
             minimum_completed_probes: 1,
             late_result_seconds: 90,
+            interval_minutes: 30,
         }
     }
 }
@@ -641,6 +646,7 @@ impl AggregationSection {
             .clamp(0, 64),
             late_result_seconds: number("late_result_seconds", defaults.late_result_seconds)
                 .clamp(0, 3600),
+            interval_minutes: number("interval_minutes", defaults.interval_minutes).clamp(1, 1440),
         }
     }
 }

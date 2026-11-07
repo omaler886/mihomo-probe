@@ -6,7 +6,7 @@
 //! 人工推送与发布动作的审计行。三张表都来自 migration 0013，与 Python
 //! `V3_SCHEMA` 逐字同构——同一账本两种实现的行可互换。
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 
 use crate::{utc_now, DomainError, DomainResult, Storage};
@@ -332,6 +332,39 @@ impl Storage {
             )
             .map_err(|e| DomainError::Storage(e.to_string()))?;
         Ok(())
+    }
+}
+
+impl Storage {
+    /// dispatch 侧登记：本轮该探测点的回传截止（幂等覆盖，PK probe+round）。
+    pub fn note_probe_deadline(
+        &self,
+        probe_id: &str,
+        round_id: &str,
+        deadline: &str,
+    ) -> DomainResult<()> {
+        self.conn
+            .execute(
+                "INSERT INTO probe_deadlines(probe_id, round_id, deadline) VALUES(?,?,?)\
+                 ON CONFLICT(probe_id, round_id) DO UPDATE SET deadline=excluded.deadline",
+                params![probe_id, round_id, deadline],
+            )
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 该探测点本轮登记的截止时间；None = 未登记（无诚实 deadline 可 enforce）。
+    pub fn probe_deadline(&self, probe_id: &str, round_id: &str) -> DomainResult<Option<String>> {
+        let deadline = self
+            .conn
+            .query_row(
+                "SELECT deadline FROM probe_deadlines WHERE probe_id=? AND round_id=?",
+                params![probe_id, round_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        Ok(deadline.filter(|deadline| !deadline.is_empty()))
     }
 }
 

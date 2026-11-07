@@ -199,9 +199,18 @@ async fn result(
         .unwrap_or_default();
     // 列空 = 尚未启用 dispatch 的部署：任何非空 digest 都接受（Python
     // expected_digest=None 的重算口径在 dispatch 落列后生效）。
-    // deadline 登记（dispatch 侧）尚未落列：传 None = 无诚实 deadline 可
-    // enforce，round-match 门禁兜底（Python _deadline_for 的 None 分支）。
-    let deadline_epoch: Option<i64> = None;
+    // dispatch 登记的截止时间（probe_deadlines 表，migration 0014）：
+    // None = 未启用 dispatch 的部署，RESULT_LATE 由 round-match 门禁兜底
+    // （Python _deadline_for 的 None 分支）。
+    let deadline_epoch = storage
+        .probe_deadline(&probe_id, &path_round_id)
+        .ok()
+        .flatten()
+        .and_then(|stamp| parse_epoch(&stamp));
+    let finished_at_epoch = payload
+        .get("finished_at")
+        .and_then(Value::as_str)
+        .and_then(parse_epoch);
     let probe_known = state.probes.iter().any(|probe| probe.id == probe_id)
         || storage
             .list_probes()
@@ -214,6 +223,7 @@ async fn result(
         probe_known,
         &expected_digest,
         deadline_epoch,
+        finished_at_epoch,
         now_epoch(),
     ) {
         Ok((items, payload_digest)) => {
@@ -253,6 +263,15 @@ async fn result(
             )
         }
     }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS`（UTC，秒精度，无时区后缀）→ Unix epoch；
+/// 解析失败 = None。存储值恒为 UTC（`utc_now()`），按 naive 解析后假设 UTC。
+fn parse_epoch(stamp: &str) -> Option<i64> {
+    let format = time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+    time::PrimitiveDateTime::parse(stamp, &format)
+        .ok()
+        .map(|dt| dt.assume_utc().unix_timestamp())
 }
 
 fn rejection_detail(rejection: &VerifyReject) -> String {
@@ -335,6 +354,8 @@ mod tests {
                 root: root.to_path_buf(),
                 substore: None,
                 substore_target_name: probe_config::DEFAULT_SUBSTORE_TARGET_NAME.into(),
+                aggregation: probe_config::AggregationSection::default(),
+                probe_config_digest: String::new(),
                 chain: cfg.chain.clone(),
                 publish_prefix: cfg.publish_prefix.clone(),
                 publish: cfg.publish.clone(),

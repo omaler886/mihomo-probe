@@ -97,6 +97,10 @@ pub struct AppState {
     pub probes: Vec<probe_config::ProbeSpec>,
     /// The manual-push target (G-4): the ONE pre-bound Sub-Store sub.
     pub substore_target_name: String,
+    /// The aggregation section snapshot (G-3 轮末聚合消费).
+    pub aggregation: probe_config::AggregationSection,
+    /// The six-section dispatch digest, computed at config load (workstreams/31).
+    pub probe_config_digest: String,
 }
 
 impl AppState {
@@ -165,6 +169,8 @@ impl AppState {
             substore_allow_delete: serve.substore_allow_delete,
             probes: serve.probes,
             substore_target_name: serve.substore_target_name,
+            aggregation: serve.aggregation,
+            probe_config_digest: serve.probe_config_digest,
         }
     }
     /// Record the config file this process was started from, so the config
@@ -331,6 +337,10 @@ pub struct ServeConfig {
     /// The manual-push target (G-4): the ONE pre-bound Sub-Store sub the
     /// three-step flow may update, never create (`substore.target_name`).
     pub substore_target_name: String,
+    /// The aggregation section snapshot (G-3 轮末聚合消费).
+    pub aggregation: probe_config::AggregationSection,
+    /// The six-section dispatch digest, computed at config load (workstreams/31).
+    pub probe_config_digest: String,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -853,6 +863,13 @@ async fn round_task(
         policy: task_state.policy.clone().into(),
         domain_pass: round_settings.verify.domain_pass,
         preserved_sources: std::mem::take(&mut collected.preserved_sources),
+        // G-3（workstreams/32）：注册表与聚合配置进轮次；API 轮暂不派发
+        // （dispatched 空 = 无等待窗口），但已落库的远程观测仍会被聚合消费。
+        probes: task_state.probes.clone(),
+        aggregation: task_state.aggregation.clone(),
+        dispatched: Vec::new(),
+        probe_deadline: None,
+        probe_config_digest: task_state.probe_config_digest.clone(),
     };
     let kernel = round_settings.kernel_prep(
         task_state.controller.clone(),
@@ -938,6 +955,7 @@ async fn publish_after_round(
     let canonical_guard = outcome.guard;
     let canonical_measured = !outcome.cancelled && outcome.results_written > 0;
     let canonical_suspect = outcome.suspect;
+    let canonical_aggregate = outcome.aggregate_summary.clone();
     let canonical_counts = outcome.counts;
     // `publish_round` never creates the root: an existing exclusive directory
     // is its contract. A fresh deployment has no `exports/` yet, so create it
@@ -1186,6 +1204,7 @@ async fn publish_after_round(
                 round_id,
                 counts,
                 suspect,
+                aggregate_summary: canonical_aggregate.clone(),
             };
             Some(
                 runtime.block_on(probe_engine::canonical_round::publish_round_canonical(
@@ -1895,6 +1914,8 @@ mod tests {
                 substore_allow_delete: false,
                 probes: Vec::new(),
                 substore_target_name: probe_config::DEFAULT_SUBSTORE_TARGET_NAME.into(),
+                aggregation: probe_config::AggregationSection::default(),
+                probe_config_digest: String::new(),
             },
         )
     }

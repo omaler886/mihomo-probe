@@ -133,13 +133,15 @@ pub struct RoundState {
 /// 每一种拒绝都只进审计——绝不产生观测行，绝不改死亡计数（§4.2）。
 ///
 /// `deadline_epoch`：dispatch 侧登记的本轮 deadline（None = 无诚实 deadline
-/// 可 enforce，由 round-match 门禁兜底）。
+/// 可 enforce，由 round-match 门禁兜底）。`finished_at_epoch`：回传 payload
+/// 自报的完成时刻（None = 不比）——晚于 deadline 同判 RESULT_LATE（§14）。
 pub fn verify_result(
     payload: &Value,
     round: RoundState,
     probe_known: bool,
     expected_digest: &str,
     deadline_epoch: Option<i64>,
+    finished_at_epoch: Option<i64>,
     now_epoch: i64,
 ) -> Result<(Vec<ValidatedItem>, String), VerifyReject> {
     let Some(map) = payload.as_object() else {
@@ -194,13 +196,17 @@ pub fn verify_result(
         return Err(VerifyReject::DigestMismatch);
     }
 
-    // 4) deadline：超时回传只入审计（§4.2/§14 集成场景）。
+    // 4) deadline：超时回传只入审计（§4.2/§14 集成场景）。迟到包括两种：
+    //    接收时刻越过截止，与 payload 自报的 finished_at 越过截止。
     if let Some(deadline) = deadline_epoch {
         if now_epoch > deadline {
             return Err(VerifyReject::ResultLate("超过本轮 deadline"));
         }
-        // finished_at 晚于 deadline 同判（ISO8601 → epoch 由调用方注入，
-        // 这里只比较传入的 finished_epoch）。
+        if let Some(finished) = finished_at_epoch {
+            if finished > deadline {
+                return Err(VerifyReject::ResultLate("finished_at 晚于 deadline"));
+            }
+        }
     }
 
     // payload digest = 整体 sorted-JSON sha256（"sha256:" 前缀）；观测行
@@ -257,6 +263,16 @@ pub fn clean_result_item(item: &Value) -> Option<ValidatedItem> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// ISO 秒精度时间戳 → epoch（测试内联，避免为断言引 time 依赖到生产路径）。
+    fn parse_stamp_epoch(stamp: &str) -> Option<i64> {
+        let format =
+            time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+        // 存储值是 UTC（utc_now() 无时区后缀）：按 naive 解析后假设 UTC。
+        time::PrimitiveDateTime::parse(stamp, &format)
+            .ok()
+            .map(|dt| dt.assume_utc().unix_timestamp())
+    }
 
     /// 签名与 Python 同字节：ts + "\n" + body 的 HMAC-SHA256 hex。
     #[test]
@@ -345,7 +361,7 @@ mod tests {
         };
         // 接受：观测项 + payload digest。
         let (items, payload_digest) =
-            verify_result(&payload, good, true, "sha256:abc", None, 1_000).unwrap();
+            verify_result(&payload, good, true, "sha256:abc", None, None, 1_000).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].fingerprint, "fp-1");
         assert!(payload_digest.starts_with("sha256:"));
@@ -359,7 +375,8 @@ mod tests {
             json!({"round_id": 7, "probe_id": "p1", "config_digest": "d", "results": [{"fingerprint": "f", "alive": "yes"}]}),
             json!({"round_id": 7, "probe_id": "p1", "config_digest": "d", "results": [{"fingerprint": "f", "alive": true, "egress_country": "TOOLONGER"}]}),
         ] {
-            let error = verify_result(&broken, good, true, "sha256:abc", None, 1_000).unwrap_err();
+            let error =
+                verify_result(&broken, good, true, "sha256:abc", None, None, 1_000).unwrap_err();
             assert_eq!(error.as_str(), "BAD_PAYLOAD", "{broken}");
         }
 
@@ -370,7 +387,7 @@ mod tests {
             is_newest: false,
         };
         assert_eq!(
-            verify_result(&payload, missing, true, "sha256:abc", None, 1_000)
+            verify_result(&payload, missing, true, "sha256:abc", None, None, 1_000)
                 .unwrap_err()
                 .as_str(),
             "ROUND_STALE"
@@ -381,7 +398,7 @@ mod tests {
             is_newest: true,
         };
         assert_eq!(
-            verify_result(&payload, settled, true, "sha256:abc", None, 1_000)
+            verify_result(&payload, settled, true, "sha256:abc", None, None, 1_000)
                 .unwrap_err()
                 .as_str(),
             "ROUND_STALE"
@@ -392,7 +409,7 @@ mod tests {
             is_newest: false,
         };
         assert_eq!(
-            verify_result(&payload, superseded, true, "sha256:abc", None, 1_000)
+            verify_result(&payload, superseded, true, "sha256:abc", None, None, 1_000)
                 .unwrap_err()
                 .as_str(),
             "ROUND_STALE"
@@ -400,23 +417,80 @@ mod tests {
 
         // UNKNOWN_PROBE / DIGEST_MISMATCH / RESULT_LATE。
         assert_eq!(
-            verify_result(&payload, good, false, "sha256:abc", None, 1_000)
+            verify_result(&payload, good, false, "sha256:abc", None, None, 1_000)
                 .unwrap_err()
                 .as_str(),
             "UNKNOWN_PROBE"
         );
         assert_eq!(
-            verify_result(&payload, good, true, "sha256:other", None, 1_000)
+            verify_result(&payload, good, true, "sha256:other", None, None, 1_000)
                 .unwrap_err()
                 .as_str(),
             "DIGEST_MISMATCH"
         );
         assert_eq!(
-            verify_result(&payload, good, true, "sha256:abc", Some(500), 1_000)
+            verify_result(&payload, good, true, "sha256:abc", Some(500), None, 1_000)
                 .unwrap_err()
                 .as_str(),
             "RESULT_LATE"
         );
+    }
+
+    /// deadline 登记生效后的两种迟到：接收时刻越窗与 finished_at 越窗；
+    /// 无登记 deadline 时 RESULT_LATE 永不触发。
+    #[test]
+    fn result_late_fires_on_both_arrival_and_finished_at() {
+        let payload = json!({
+            "round_id": 7,
+            "probe_id": "p1",
+            "config_digest": "sha256:abc",
+            "finished_at": "2026-11-08T00:05:00",
+            "results": [{"fingerprint": "fp-1", "alive": true}],
+        });
+        let good = RoundState {
+            exists: true,
+            finished: false,
+            is_newest: true,
+        };
+        let deadline = 1_000;
+        let finished = parse_stamp_epoch("2026-11-08T00:05:00");
+        assert!(finished.is_some());
+
+        // finished_at 晚于 deadline → RESULT_LATE（即使接收时刻没越窗）。
+        assert_eq!(
+            verify_result(
+                &payload,
+                good,
+                true,
+                "sha256:abc",
+                Some(deadline),
+                finished,
+                deadline - 10,
+            )
+            .unwrap_err()
+            .as_str(),
+            "RESULT_LATE"
+        );
+        // finished_at 在窗内 → 接受。
+        let early = json!({
+            "round_id": 7,
+            "probe_id": "p1",
+            "config_digest": "sha256:abc",
+            "finished_at": "1970-01-01T00:10:00",
+            "results": [{"fingerprint": "fp-1", "alive": true}],
+        });
+        assert!(verify_result(
+            &early,
+            good,
+            true,
+            "sha256:abc",
+            Some(deadline),
+            parse_stamp_epoch("1970-01-01T00:10:00"),
+            deadline - 10
+        )
+        .is_ok());
+        // 无登记 deadline：finished_at 再晚也不比（诚实 None 分支）。
+        assert!(verify_result(&payload, good, true, "sha256:abc", None, finished, 1_000).is_ok());
     }
 
     /// 0/负 delay 与缺字段按畸形拒；reason 保留原文。
