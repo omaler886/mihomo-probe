@@ -88,17 +88,17 @@ fn lock_for(gist_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// an object keyed by `source_id`, so merging this source's entry preserves
 /// every other entry untouched.
 #[derive(Debug, Clone)]
-struct ManifestEntry {
-    source_id: String,
-    file: String,
-    sha256: String,
-    revision: String,
-    published_at: String,
-    status: &'static str,
+pub(crate) struct ManifestEntry {
+    pub(crate) source_id: String,
+    pub(crate) file: String,
+    pub(crate) sha256: String,
+    pub(crate) revision: String,
+    pub(crate) published_at: String,
+    pub(crate) status: &'static str,
 }
 
 impl ManifestEntry {
-    fn new(source_id: &str, file: &str, sha256: &str) -> Self {
+    pub(crate) fn new(source_id: &str, file: &str, sha256: &str) -> Self {
         Self {
             source_id: source_id.to_string(),
             file: file.to_string(),
@@ -109,7 +109,7 @@ impl ManifestEntry {
         }
     }
 
-    fn to_json(&self) -> Value {
+    pub(crate) fn to_json(&self) -> Value {
         json!({
             "source_id": self.source_id,
             "file": self.file,
@@ -123,7 +123,7 @@ impl ManifestEntry {
 
 /// RFC3339 UTC now; a clock that cannot format still yields a stable string
 /// so a manifest write never fails on the timestamp alone.
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     use time::format_description::well_known::Rfc3339;
     time::OffsetDateTime::now_utc()
         .format(&Rfc3339)
@@ -153,7 +153,7 @@ fn validate_gist_id(gist_id: &str) -> Result<(), PublishError> {
 /// Remove any accidental occurrence of `secret` from `text`. Defense in
 /// depth: response bodies and client error strings are third-party input,
 /// and a message echoing the token would put it in logs and SQLite.
-fn redact(text: &str, secret: &str) -> String {
+pub(crate) fn redact(text: &str, secret: &str) -> String {
     if secret.is_empty() {
         return text.to_string();
     }
@@ -161,7 +161,7 @@ fn redact(text: &str, secret: &str) -> String {
 }
 
 /// A char-safe prefix of `text`, for the bounded body snippets in messages.
-fn truncate(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
@@ -629,7 +629,7 @@ fn status_error(
 
 /// The `Retry-After` header in seconds; the HTTP-date form is ignored (the
 /// backoff covers it).
-fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+pub(crate) fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     let raw = headers.get(RETRY_AFTER)?.to_str().ok()?;
     let seconds: u64 = raw.trim().parse().ok()?;
     Some(Duration::from_secs(seconds))
@@ -638,7 +638,7 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
 /// ±10% jitter from clock entropy: spreads retry storms across clients
 /// without making the delay unpredictable enough to matter (tests assert
 /// attempt counts, not delays).
-fn jitter(delay: Duration) -> Duration {
+pub(crate) fn jitter(delay: Duration) -> Duration {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|t| u64::from(t.subsec_nanos()))
@@ -651,7 +651,10 @@ fn jitter(delay: Duration) -> Duration {
 /// with this source's entry merged in. Foreign entries are preserved
 /// verbatim (F-031). A manifest that is not a JSON object is a hard stop --
 /// overwriting it could destroy the other sources' records.
-fn merged_manifest(existing: Option<&str>, entry: &ManifestEntry) -> Result<String, PublishError> {
+pub(crate) fn merged_manifest(
+    existing: Option<&str>,
+    entry: &ManifestEntry,
+) -> Result<String, PublishError> {
     let mut root = match existing.map(str::trim).filter(|raw| !raw.is_empty()) {
         None => Map::new(),
         Some(raw) => match serde_json::from_str::<Value>(raw) {
@@ -677,7 +680,7 @@ fn merged_manifest(existing: Option<&str>, entry: &ManifestEntry) -> Result<Stri
 /// Whether the raw manifest already carries this source's entry with exactly
 /// this file, sha and an active status. Anything else (missing, drifted,
 /// corrupt) reads as "needs a manifest write".
-fn manifest_entry_matches(existing: Option<&str>, entry: &ManifestEntry) -> bool {
+pub(crate) fn manifest_entry_matches(existing: Option<&str>, entry: &ManifestEntry) -> bool {
     existing
         .map(str::trim)
         .filter(|raw| !raw.is_empty())

@@ -35,6 +35,7 @@ pub mod files;
 pub mod gist;
 pub mod local;
 pub mod types;
+pub mod webdav;
 
 use std::future::Future;
 
@@ -47,6 +48,7 @@ pub use local::LocalPublisher;
 pub use types::{
     revision_of, sha256_hex, ArtifactRef, PublishError, PublishErrorCode, PublishOutcome,
 };
+pub use webdav::{create_collection, WebDavPublisher};
 
 /// One publish destination.
 ///

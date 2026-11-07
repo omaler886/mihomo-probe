@@ -1,12 +1,13 @@
-//! The admin publish diagnostics surface (workstreams/18 B2).
+//! The admin publish diagnostics surface (workstreams/18 B2, workstreams/26).
 //!
-//! One endpoint so far: `POST /api/v1/publishers/gist/test`, the GUI's
-//! 「测试连接」 button. It constructs the publisher (the token file is read
-//! there, and ONLY there) and runs one healthcheck -- nothing is published,
-//! nothing is created.
+//! Two endpoints so far, one per remote destination: `POST
+//! /api/v1/publishers/gist/test` and `POST /api/v1/publishers/webdav/test`,
+//! the GUI's 「测试连接」 buttons. Each constructs the publisher (the
+//! credential file is read there, and ONLY there) and runs one healthcheck
+//! -- nothing is published, nothing is created.
 //!
 //! The response is a mask, not a report: `configured`, `ok` and, on failure,
-//! the frozen `error_code`. Never the token, never a gist id, never a
+//! the frozen `error_code`. Never the password, never a gist id, never a
 //! message body (a message can carry a filesystem path; the code cannot
 //! carry anything but its frozen spelling). An unconfigured deployment
 //! answers `configured: false` with `error_code: "config"` -- the exact
@@ -15,20 +16,52 @@
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
-use probe_config::GistSection;
-use probe_publish::{GistPublisher, PublishErrorCode, Publisher};
+use probe_config::{GistSection, WebdavSection};
+use probe_publish::{GistPublisher, PublishErrorCode, Publisher, WebDavPublisher};
 use serde_json::{json, Value};
 
 use crate::SharedState;
 
-/// The admin route this module adds to the guarded group.
+/// The admin routes this module adds to the guarded group.
 pub(crate) fn admin_routes() -> Router<SharedState> {
-    Router::new().route("/api/v1/publishers/gist/test", post(gist_test))
+    Router::new()
+        .route("/api/v1/publishers/gist/test", post(gist_test))
+        .route("/api/v1/publishers/webdav/test", post(webdav_test))
 }
 
 /// `POST /api/v1/publishers/gist/test` -- probe the configured Gist.
 async fn gist_test(State(state): State<SharedState>) -> Json<Value> {
     Json(gist_test_result(&state.publish.gist, probe_publish::GITHUB_API_BASE).await)
+}
+
+/// `POST /api/v1/publishers/webdav/test` -- probe the configured WebDAV
+/// collection (workstreams/26).
+async fn webdav_test(State(state): State<SharedState>) -> Json<Value> {
+    Json(webdav_test_result(&state.publish.webdav).await)
+}
+
+/// The masked probe result for one WebDAV section. `base_url` is injectable
+/// (the `None` here means "use the configured URL") so the tests can aim the
+/// publisher at a local stub instead of a real server.
+async fn webdav_test_result(section: &WebdavSection) -> Value {
+    let publisher = match WebDavPublisher::from_config(section) {
+        Ok(publisher) => publisher,
+        // Construction failure = unconfigured (no URL, no readable password
+        // file): the reason is always the config code, because construction
+        // only fails on config.
+        Err(_) => return json!({"configured": false, "ok": false, "error_code": "config"}),
+    };
+    match publisher.healthcheck("").await {
+        Ok(()) => json!({"configured": true, "ok": true}),
+        Err(error) => json!({
+            // A config-shaped failure means the destination cannot even be
+            // addressed; everything else is a live destination answering
+            // badly.
+            "configured": !matches!(error.code, PublishErrorCode::Config),
+            "ok": false,
+            "error_code": error.code.as_str(),
+        }),
+    }
 }
 
 /// The masked probe result for one gist section. `api_base` is injectable so
@@ -158,6 +191,69 @@ mod tests {
         let body = gist_test_result(&section, "http://127.0.0.1:1").await;
         assert_eq!(body["configured"], false);
         assert_eq!(body["error_code"], "config");
+    }
+
+    /// workstreams/26: the WebDAV probe shares the mask contract. An
+    /// unconfigured deployment answers `configured=false, error_code=config`
+    /// and no credential material ever appears in the body.
+    #[tokio::test]
+    async fn webdav_test_shares_the_mask_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = spawn(state(tmp.path())).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{base}/api/v1/publishers/webdav/test"))
+            .header("X-Auth-Token", ADMIN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["configured"], false);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error_code"], "config");
+        let text = body.to_string();
+        assert!(!text.contains(ADMIN), "no admin token echo: {text}");
+    }
+
+    /// workstreams/26: a configured, healthy WebDAV stub answers
+    /// `configured=true, ok=true`; a 404 answers the frozen `webdav_missing`
+    /// code with `configured=true`. No request ever leaves 127.0.0.1.
+    #[tokio::test]
+    async fn the_webdav_probe_maps_destination_answers() {
+        for status in [200u16, 404] {
+            let app = axum::Router::new()
+                .fallback(move |method: axum::http::Method| async move {
+                    let ok = method == axum::http::Method::from_bytes(b"PROPFIND").unwrap();
+                    if ok {
+                        (StatusCode::from_u16(status).unwrap(), String::new())
+                    } else {
+                        (StatusCode::METHOD_NOT_ALLOWED, String::new())
+                    }
+                })
+                .with_state(());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let section = WebdavSection {
+                url: Some(base),
+                username: "probe".into(),
+                password_file: None,
+                directory: "mihomo-probe".into(),
+                timeout_seconds: 5,
+                max_retries: 1,
+            };
+            let body = webdav_test_result(&section).await;
+            if status == 200 {
+                assert_eq!(body["configured"], true);
+                assert_eq!(body["ok"], true, "{body}");
+            } else {
+                assert_eq!(body["configured"], true);
+                assert_eq!(body["ok"], false);
+                assert_eq!(body["error_code"], "webdav_missing", "{body}");
+            }
+        }
     }
 
     /// A local stub plays api.github.com: a healthy destination answers

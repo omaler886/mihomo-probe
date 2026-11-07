@@ -68,6 +68,14 @@ pub enum PublishErrorCode {
     /// The Gist does not exist, or the token cannot see it (404). Never
     /// retried; `gist init` must run first.
     GistMissing,
+    /// The WebDAV server rejected the credentials (401/403). Never retried;
+    /// the password must be rotated before anything can succeed
+    /// (workstreams/26).
+    WebdavAuth,
+    /// The WebDAV collection does not exist (404 on the healthcheck, or 409
+    /// on a PUT whose parent collection is absent). Never retried;
+    /// `webdav init` must run first (workstreams/26).
+    WebdavMissing,
     /// Rate limited (429) and the bounded Retry-After budget ran out.
     RateLimited,
     /// GitHub answered 5xx (or an unexpected 4xx) past the retry budget.
@@ -92,6 +100,8 @@ impl PublishErrorCode {
         match self {
             Self::GistAuth => "gist_auth",
             Self::GistMissing => "gist_missing",
+            Self::WebdavAuth => "webdav_auth",
+            Self::WebdavMissing => "webdav_missing",
             Self::RateLimited => "rate_limited",
             Self::Remote => "remote",
             Self::Network => "network",

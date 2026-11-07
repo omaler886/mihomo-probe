@@ -1013,13 +1013,18 @@ pub struct PublishSection {
     pub keep_snapshots: Option<usize>,
     /// Which publisher chain carries an artifact out (workstreams/18 B2).
     /// `local` (default) keeps today's on-disk exports; `gist` publishes to a
-    /// GitHub Gist; `composite` writes locally first and then to the Gist,
-    /// where a Gist failure never fails the whole publish.
+    /// GitHub Gist; `webdav` publishes to a WebDAV collection (workstreams/26);
+    /// `composite` writes locally first and then to the Gist, where a Gist
+    /// failure never fails the whole publish.
     pub provider: PublishProvider,
     /// The `publish.gist` sub-section: GitHub Gist credentials and retry
     /// bounds. Parsed (and clamped) even when `provider` is `local`, so a
     /// provider switch in the config file needs no other edit.
     pub gist: GistSection,
+    /// The `publish.webdav` sub-section: WebDAV collection credentials and
+    /// retry bounds (workstreams/26). Same parsing contract as `gist`: read
+    /// and clamped even when `provider` is not `webdav`.
+    pub webdav: WebdavSection,
 }
 
 /// The `publish.provider` choice. An unknown or blank stored value reads as
@@ -1030,6 +1035,10 @@ pub enum PublishProvider {
     Local,
     /// GitHub Gist only.
     Gist,
+    /// WebDAV collection only (workstreams/26). The local pipeline always
+    /// commits first; this selects the REMOTE leg's destination, exactly as
+    /// `Gist` does.
+    Webdav,
     /// Local first, then Gist; a Gist failure is reported, not fatal.
     Composite,
 }
@@ -1040,6 +1049,7 @@ impl PublishProvider {
         match self {
             Self::Local => "local",
             Self::Gist => "gist",
+            Self::Webdav => "webdav",
             Self::Composite => "composite",
         }
     }
@@ -1050,6 +1060,7 @@ impl PublishProvider {
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "gist" => Self::Gist,
+            "webdav" => Self::Webdav,
             "composite" => Self::Composite,
             // "local" and every typo: the default pipeline stays in charge.
             _ => Self::Local,
@@ -1153,6 +1164,105 @@ impl GistSection {
     }
 }
 
+/// Default `publish.webdav.timeout_seconds`: same reasoning as the Gist
+/// default — a self-hosted WebDAV (Nextcloud/Alist/Synology) can be slow
+/// through a tunnel, so the floor is generous but bounded.
+pub const DEFAULT_WEBDAV_TIMEOUT_SECONDS: u64 = 30;
+
+/// The clamp a hand-edited WebDAV timeout passes through (same table as the
+/// Gist timeout: 1s..300s).
+pub const WEBDAV_TIMEOUT_RANGE: (u64, u64) = (1, 300);
+
+/// Default `publish.webdav.max_retries`: the same 1s -> 2s -> 4s backoff the
+/// Gist publisher runs (F-037), so both remote legs behave identically.
+pub const DEFAULT_WEBDAV_MAX_RETRIES: u32 = 3;
+
+/// The clamp for the WebDAV attempt count (same table as the Gist retries).
+pub const WEBDAV_MAX_RETRIES_RANGE: (u32, u32) = (0, 10);
+
+/// The `publish.webdav` sub-section: everything the WebDAV publisher needs
+/// (workstreams/26).
+///
+/// The password itself never lives here — only the PATH of the file that
+/// holds it (0600, outside config.json and SQLite), the same contract as
+/// [`GistSection::token_file`]. With no `password_file` the requests are
+/// anonymous (no `Authorization` header), which is what a LAN-only WebDAV
+/// or an authenticated reverse proxy in front of one needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebdavSection {
+    /// The WebDAV base URL, e.g. `https://dav.example.com/dav` or
+    /// `http://127.0.0.1:5244/dav`. `None` = not configured; the publisher
+    /// refuses to construct.
+    pub url: Option<String>,
+    /// Basic-auth user name. Default empty (anonymous or password-less).
+    pub username: String,
+    /// Path of the file holding the WebDAV password. `None` = anonymous.
+    pub password_file: Option<PathBuf>,
+    /// Collection path UNDER the base URL where artifacts live, e.g.
+    /// `mihomo-probe`. Empty = publish straight into the base collection.
+    pub directory: String,
+    /// Per-request HTTP timeout in seconds, clamped to `WEBDAV_TIMEOUT_RANGE`.
+    pub timeout_seconds: u64,
+    /// Attempts per HTTP call (first try included), clamped to
+    /// `WEBDAV_MAX_RETRIES_RANGE`.
+    pub max_retries: u32,
+}
+
+impl Default for WebdavSection {
+    fn default() -> Self {
+        Self {
+            url: None,
+            username: String::new(),
+            password_file: None,
+            directory: String::new(),
+            timeout_seconds: DEFAULT_WEBDAV_TIMEOUT_SECONDS,
+            max_retries: DEFAULT_WEBDAV_MAX_RETRIES,
+        }
+    }
+}
+
+impl WebdavSection {
+    fn from_value(value: &Value) -> Self {
+        let defaults = Self::default();
+        let text = |key: &str| -> Option<String> {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        let number = |key: &str| -> Option<i64> {
+            value.get(key).and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_f64().map(|f| f as i64))
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+            })
+        };
+        Self {
+            url: text("url"),
+            username: text("username").unwrap_or_default(),
+            // A stored path is trimmed but otherwise verbatim: Windows paths
+            // contain backslashes and colons that a whitelist would reject.
+            password_file: text("password_file").map(PathBuf::from),
+            directory: text("directory").unwrap_or_default(),
+            timeout_seconds: number("timeout_seconds")
+                .map(|secs| {
+                    secs.clamp(WEBDAV_TIMEOUT_RANGE.0 as i64, WEBDAV_TIMEOUT_RANGE.1 as i64) as u64
+                })
+                .unwrap_or(defaults.timeout_seconds),
+            max_retries: number("max_retries")
+                .map(|retries| {
+                    retries.clamp(
+                        WEBDAV_MAX_RETRIES_RANGE.0 as i64,
+                        WEBDAV_MAX_RETRIES_RANGE.1 as i64,
+                    ) as u32
+                })
+                .unwrap_or(defaults.max_retries),
+        }
+    }
+}
+
 /// Directory under the service root that holds exports by default.
 pub const EXPORT_DIR_NAME: &str = "exports";
 
@@ -1208,6 +1318,7 @@ impl Default for PublishSection {
             keep_snapshots: None,
             provider: PublishProvider::Local,
             gist: GistSection::default(),
+            webdav: WebdavSection::default(),
         }
     }
 }
@@ -1269,6 +1380,7 @@ impl PublishSection {
                 .map(PublishProvider::parse)
                 .unwrap_or(defaults.provider),
             gist: GistSection::from_value(value.get("gist").unwrap_or(&Value::Null)),
+            webdav: WebdavSection::from_value(value.get("webdav").unwrap_or(&Value::Null)),
         }
     }
 }
@@ -1930,6 +2042,10 @@ mod tests {
         assert_eq!(section.provider, PublishProvider::Gist);
         let section = PublishSection::from_value(&serde_json::json!({"provider": "COMPOSITE"}));
         assert_eq!(section.provider, PublishProvider::Composite);
+        // workstreams/26: the WebDAV provider parses with the same tolerance.
+        let section = PublishSection::from_value(&serde_json::json!({"provider": " WebDav "}));
+        assert_eq!(section.provider, PublishProvider::Webdav);
+        assert_eq!(PublishProvider::Webdav.as_str(), "webdav");
         let section = PublishSection::from_value(&serde_json::json!({"provider": "local"}));
         assert_eq!(section.provider, PublishProvider::Local);
         // Unknown, blank and non-string values all read as the default.
@@ -1999,6 +2115,56 @@ mod tests {
         assert_eq!(empty.gist_id, None);
         assert_eq!(empty.token_file, None);
         assert_eq!(empty, GistSection::default());
+    }
+
+    /// workstreams/26: the WebDAV section parses with the same contract as
+    /// the Gist section — trims, clamps, and reads absent/blank as default.
+    #[test]
+    fn the_webdav_section_parses_with_the_same_contract() {
+        let webdav = WebdavSection::from_value(&serde_json::json!({
+            "url": " https://dav.example.com/dav/ ",
+            "username": " probe ",
+            "password_file": "C:\\secrets\\dav.pass",
+            "directory": "mihomo-probe",
+            "timeout_seconds": 5,
+            "max_retries": 0,
+        }));
+        assert_eq!(webdav.url.as_deref(), Some("https://dav.example.com/dav/"));
+        assert_eq!(webdav.username, "probe");
+        assert_eq!(
+            webdav.password_file.as_deref(),
+            Some(Path::new("C:\\secrets\\dav.pass"))
+        );
+        assert_eq!(webdav.directory, "mihomo-probe");
+        assert_eq!(webdav.timeout_seconds, 5);
+        assert_eq!(webdav.max_retries, 0, "0 keeps the single first attempt");
+
+        // Clamps mirror the Gist table.
+        let clamped = WebdavSection::from_value(&serde_json::json!({
+            "timeout_seconds": 100_000,
+            "max_retries": 99,
+        }));
+        assert_eq!(clamped.timeout_seconds, WEBDAV_TIMEOUT_RANGE.1);
+        assert_eq!(clamped.max_retries, WEBDAV_MAX_RETRIES_RANGE.1);
+        let zeroed = WebdavSection::from_value(&serde_json::json!({
+            "timeout_seconds": 0,
+            "max_retries": -5,
+        }));
+        assert_eq!(zeroed.timeout_seconds, WEBDAV_TIMEOUT_RANGE.0);
+        assert_eq!(zeroed.max_retries, WEBDAV_MAX_RETRIES_RANGE.0);
+
+        // Absent / blank / wrong-typed values read as unconfigured; the
+        // default section is anonymous with no URL.
+        let empty = WebdavSection::from_value(&serde_json::json!({
+            "url": "   ",
+            "username": 42,
+            "password_file": "",
+        }));
+        assert_eq!(empty, WebdavSection::default());
+        let section = PublishSection::from_value(&serde_json::json!({"webdav": {"url": "u"}}));
+        assert_eq!(section.webdav.url.as_deref(), Some("u"));
+        let bare = PublishSection::from_value(&serde_json::json!({}));
+        assert_eq!(bare.webdav, WebdavSection::default());
     }
 
     /// B2: a fresh empty data dir parses with every publish/gist key present

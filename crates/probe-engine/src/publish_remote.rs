@@ -34,6 +34,7 @@
 use probe_config::{PublishProvider, PublishSection, SourceSpec};
 use probe_publish::{
     ArtifactRef, CompositePublisher, GistPublisher, LocalPublisher, PublishOutcome, Publisher,
+    WebDavPublisher,
 };
 use probe_storage::runs::{
     PUBLISH_CONFIG_ERROR, PUBLISH_FAILED, PUBLISH_NO_CHANGE, PUBLISH_PUBLISHED,
@@ -109,6 +110,10 @@ pub async fn publish_round_remote(
             entries: Vec::new(),
         },
         PublishProvider::Gist => match GistPublisher::from_config(&request.publish.gist) {
+            Ok(publisher) => publish_round_remote_with(storage, request, &publisher).await,
+            Err(error) => construction_failed(storage, request, &error),
+        },
+        PublishProvider::Webdav => match WebDavPublisher::from_config(&request.publish.webdav) {
             Ok(publisher) => publish_round_remote_with(storage, request, &publisher).await,
             Err(error) => construction_failed(storage, request, &error),
         },
@@ -739,6 +744,42 @@ mod tests {
         let report = publish_round_remote(&storage, request).await;
         assert!(!report.constructed);
         assert_eq!(report.entries[0].status, PUBLISH_CONFIG_ERROR);
+    }
+
+    /// workstreams/26: an unconfigured WebDAV section (no URL) is the same
+    /// construction failure through the same path -- the round's local
+    /// results stand and every eligible source learns the reason.
+    #[tokio::test]
+    async fn an_unconfigured_webdav_marks_config_error_and_keeps_local_results() {
+        let (storage, round_id, outcome) = fixture();
+        let source_id = storage.source_id_for_key("air").unwrap().unwrap();
+        let publish = PublishSection {
+            provider: PublishProvider::Webdav,
+            // `url: None` is the construction failure.
+            webdav: probe_config::WebdavSection::default(),
+            ..PublishSection::default()
+        };
+        let request = RemotePublishRequest {
+            publish: &publish,
+            export_root: std::path::Path::new("/unused"),
+            outcome: &outcome,
+            round_id,
+            sources: &[],
+        };
+        let report = publish_round_remote(&storage, request).await;
+        assert_eq!(report.provider, PublishProvider::Webdav);
+        assert!(!report.constructed);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].status, PUBLISH_CONFIG_ERROR);
+        assert_eq!(
+            report.entries[0].source_id, source_id,
+            "the entry still names the real registry identity"
+        );
+        assert_eq!(
+            artifact_of(&storage, &source_id).last_content_sha256,
+            None,
+            "nothing remote happened, so nothing advanced"
+        );
     }
 
     /// A source that published locally but whose snapshot vanished before the

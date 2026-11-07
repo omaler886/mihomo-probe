@@ -173,6 +173,10 @@ fn main() {
             let sub = positionals.get(1).map(String::as_str).unwrap_or("");
             std::process::exit(cmd_gist(&root, sub));
         }
+        "webdav" => {
+            let sub = positionals.get(1).map(String::as_str).unwrap_or("");
+            std::process::exit(cmd_webdav(&root, sub));
+        }
         "migrate" => {
             let sub = positionals.get(1).map(String::as_str).unwrap_or("");
             let args = MigrateArgs {
@@ -216,6 +220,7 @@ fn print_usage() {
 \x20   db <migrate|check|backup|verify|rollback>\n\
 \x20   substore [init|status]\n\
 \x20   gist <test|init>       test the Gist destination / create the one Gist\n\
+\x20   webdav <test|init>     test the WebDAV collection / MKCOL the directory\n\
 \x20   migrate <scan|apply|rollback>\n\
 \x20                          Sub-Store duplicate migration (F-058: plan-only\n\
 \x20                          output; never creates, never deletes)\n\
@@ -646,9 +651,9 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
                     }
                     probe_storage::runs::PUBLISH_PUBLISHED => {
                         // Composite: the local artifact is authoritative; the
-                        // Gist-side failure rides along as a note.
+                        // remote-side failure rides along as a note.
                         println!(
-                            "remote publish {}: published (gist note: {note})",
+                            "remote publish {}: published (remote note: {note})",
                             entry.key
                         );
                     }
@@ -850,6 +855,82 @@ fn cmd_gist_init(root: &Path) -> i32 {
                     }))
                     .unwrap_or_else(|_| "{{\"publish\": {}}}".to_string())
                 );
+                0
+            }
+            Err(error) => {
+                println!("ok=false");
+                println!("error_code={}", error.code.as_str());
+                1
+            }
+        }
+    })
+}
+
+/// `webdav` subcommands (workstreams/26): `test` PROPFINDs the configured
+/// collection, `init` MKCOLs the directory chain. Both are masked: the
+/// password (which lives only in its file) and any content are never
+/// printed -- configured/ok/error codes only.
+fn cmd_webdav(root: &Path, subcommand: &str) -> i32 {
+    match subcommand {
+        "test" => cmd_webdav_test(root),
+        "init" => cmd_webdav_init(root),
+        other => {
+            eprintln!("unknown webdav subcommand: {other:?} (expected test | init)");
+            2
+        }
+    }
+}
+
+/// `webdav test`: one PROPFIND against the configured collection. Every
+/// answer is `configured`/`ok`/`error_code` -- never a message, never a URL,
+/// never the password. Exit 0 only when the destination answers.
+fn cmd_webdav_test(root: &Path) -> i32 {
+    let cfg = load(root);
+    tokio_block(async {
+        let publisher = match probe_publish::WebDavPublisher::from_config(&cfg.publish.webdav) {
+            Ok(publisher) => publisher,
+            // Construction failure IS the unconfigured case: no URL or no
+            // readable password file, no request, nothing beyond the code.
+            Err(_) => {
+                println!("configured=false");
+                println!("error_code=config");
+                return 1;
+            }
+        };
+        match publisher.healthcheck("").await {
+            Ok(()) => {
+                println!("configured=true");
+                println!("ok=true");
+                0
+            }
+            Err(error) => {
+                let configured = !matches!(error.code, probe_publish::PublishErrorCode::Config);
+                println!("configured={configured}");
+                println!("ok=false");
+                println!("error_code={}", error.code.as_str());
+                1
+            }
+        }
+    })
+}
+
+/// `webdav init`: MKCOL the configured directory chain. Idempotent by
+/// protocol (405 = already exists is success), so unlike `gist init` there
+/// is no create-once decision to guard -- re-running is always safe.
+fn cmd_webdav_init(root: &Path) -> i32 {
+    let cfg = load(root);
+    tokio_block(async {
+        let publisher = match probe_publish::WebDavPublisher::from_config(&cfg.publish.webdav) {
+            Ok(publisher) => publisher,
+            Err(_) => {
+                println!("configured=false");
+                println!("error_code=config");
+                return 1;
+            }
+        };
+        match probe_publish::create_collection(&publisher).await {
+            Ok(()) => {
+                println!("collection ready");
                 0
             }
             Err(error) => {
