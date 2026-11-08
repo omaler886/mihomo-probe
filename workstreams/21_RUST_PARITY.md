@@ -49,3 +49,19 @@
    Python 侧进入只读维护并宣布「Rust 完全替代」达成；G-11 soak 在切换前执行。
 4. **诚实声明**：在 2/3 完成前，任何「已完全替代」的说法都不成立 —— 当前真实状态是
    「双轨并存，Rust 覆盖核心测活/发布/存储，Python 覆盖 HK3 全部新增面」。
+
+## 4. 独立运维工具的移植决策（workstreams/34 R6）
+
+| 工具 | 类别 | 决策 | 理由 |
+|---|---|---|---|
+| ipmap（F-05/F-35..F-40） | extension（独立 Docker 工具，与轮次完全隔离） | **保持 Python 运行，移植列 P2 待办**：订阅拉取（UA 门禁）+ 族过滤 + 一次性内核容器 + 回显探测 + 报告渲染 + 写回 Sub-Store，是完整子系统（依赖 docker.sock 的独立容器编排）；移植不含入轮次路径，收益是运维工具单语言化，风险是 docker 编排重写 | 21 号目标「Rust 完全替代」的操作化定义覆盖轮次/发布/存储主链；运维旁路工具单列 |
+| link_substore.py | adapter（F-001 收口后降级） | 保持（只读代理面） | 已降级为最小面 |
+| setup_tunnel.py | 部署辅助 | 保持 | 一次性部署动作 |
+
+## 5. 轮末告警（workstreams/34 R1+R2）
+
+Python notifier.py 已在 Rust 闭环：`AlertSection`（telegram/webhook/cooldown/
+alive_floor）+ `probe-engine::notifier`（冷却**只记送达**——投递失败不消耗
+窗口；全失败按 error 记录）+ CLI/API 轮末接线（suspect → error、
+alive_floor → warn，与 `_maybe_alert` 同位）。token/chat_id 沿用 config 内
+存储（config.json 不入库，Python 既有 schema 的诚实平移）。
