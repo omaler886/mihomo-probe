@@ -1641,6 +1641,8 @@ mod tests {
         baseline: Mutex<i64>,
         /// What `node_statuses` reports: the (source, fingerprint) -> status map.
         statuses: Mutex<std::collections::HashMap<(String, String), String>>,
+        /// G-3（workstreams/34 R5）：远程观测行（get_observations 读回）。
+        observations: Mutex<Vec<probe_storage::ObservationRow>>,
     }
 
     impl FakeLedger {
@@ -1672,6 +1674,39 @@ mod tests {
     }
 
     impl Ledger for FakeLedger {
+        fn get_observations(&self, _round_id: &str) -> Vec<probe_storage::ObservationRow> {
+            self.observations.lock().unwrap().clone()
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn record_observation(
+            &self,
+            round_id: &str,
+            probe_id: &str,
+            fingerprint: &str,
+            alive: Option<bool>,
+            delay_ms: Option<i64>,
+            reason: Option<&str>,
+            egress_country: Option<&str>,
+            payload_digest: &str,
+        ) -> probe_domain::DomainResult<()> {
+            self.observations
+                .lock()
+                .unwrap()
+                .push(probe_storage::ObservationRow {
+                    round_id: round_id.into(),
+                    probe_id: probe_id.into(),
+                    fingerprint: fingerprint.into(),
+                    alive,
+                    delay_ms,
+                    reason: reason.map(str::to_string),
+                    egress_country: egress_country.map(str::to_string),
+                    received_at: String::new(),
+                    payload_digest: payload_digest.into(),
+                });
+            Ok(())
+        }
+
         fn node_statuses(
             &self,
         ) -> DomainResult<std::collections::HashMap<(String, String), String>> {
@@ -2330,6 +2365,82 @@ mod tests {
             assert!(recorded.results.is_empty());
             assert!(recorded.converged.is_empty());
         }
+    }
+
+    /// G-3（workstreams/34 R5）：远程观测经轮末聚合消费改写收敛——
+    /// 本地 Dead + 远程 alive = 活（any_alive），converge 收到的节点 ok=true；
+    /// 摘要随 RoundOutcome 出站（status payload 的数据源）。
+    #[tokio::test]
+    async fn a_remote_pass_aggregates_into_the_convergence() {
+        let ledger = FakeLedger::new();
+        // 远程 p1 对本节点报活（payload digest 与 plan 的六段 digest 同形）。
+        ledger
+            .observations
+            .lock()
+            .unwrap()
+            .push(probe_storage::ObservationRow {
+                round_id: "1".into(),
+                probe_id: "p1".into(),
+                fingerprint: "air-192.0.2.1-fp".into(),
+                alive: Some(true),
+                delay_ms: Some(88),
+                reason: None,
+                egress_country: Some("JP".into()),
+                received_at: "2026-11-08T00:00:00".into(),
+                payload_digest: "sha256:d".into(),
+            });
+        let mut plan = plan(vec![job("air", "192.0.2.1")]);
+        plan.probes = vec![probe_config::ProbeSpec {
+            id: "p1".into(),
+            ..Default::default()
+        }];
+        plan.dispatched = vec!["p1".into()];
+        plan.aggregation = probe_config::AggregationSection {
+            minimum_completed_probes: 1,
+            ..Default::default()
+        };
+        plan.probe_config_digest = "sha256:d".into();
+        // 本地拨号失败：聚合前这是 Dead——远程活把它拉回 Alive。
+        let outcome = run_round_in_test(
+            plan,
+            loose(),
+            Arc::new(FakeKernel(KernelState::Reloaded)),
+            Arc::new(FakeTester::new(false)),
+            ledger.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.counts.ok, 1,
+            "any_alive: the remote pass IS the verdict"
+        );
+        let summary = outcome.aggregate_summary.expect("aggregation ran");
+        assert_eq!(
+            summary["completed_probes"],
+            serde_json::json!(["local", "p1"])
+        );
+        // converge 收到的节点（经 commit_verdicts）确实 ok——账本不会被
+        // 本地单点失败拖死。
+        let recorded = ledger.recorded.lock().unwrap();
+        assert_eq!(recorded.converged.len(), 1);
+        assert_eq!(recorded.results[0].1.len(), 1);
+    }
+
+    /// 兼容模式：plan 无 probes 无 dispatched → 摘要 None（no-op 契约）。
+    #[tokio::test]
+    async fn the_compat_round_skips_the_aggregation_summary() {
+        let ledger = FakeLedger::new();
+        let outcome = run_round_in_test(
+            plan(vec![job("air", "192.0.2.1")]),
+            loose(),
+            Arc::new(FakeKernel(KernelState::Reloaded)),
+            Arc::new(FakeTester::new(true)),
+            ledger.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.aggregate_summary.is_none());
+        assert_eq!(outcome.counts.ok, 1);
     }
 
     /// An empty collection cannot replace the guard's last measured baseline.
