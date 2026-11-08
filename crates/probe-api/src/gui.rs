@@ -729,6 +729,20 @@ function renderDashCards(status){
   host.appendChild(dashCard('上次轮次', (last.round_id === undefined || last.round_id === null) ? '—' : '#' + last.round_id));
   host.appendChild(dashCard('上次结果', last.total !== undefined ? ('存活 ' + last.ok + ' / 失败 ' + last.failed + ' / 共 ' + last.total) : '—'));
   host.appendChild(dashCard('下次轮次', schedule.next_run || (schedule.enabled ? '待定' : '已关闭')));
+  // G-3（workstreams/34 R3）：探测点面板——最近一轮聚合摘要的诚实口径。
+  var probes = (status && status.probes) || null;
+  if (probes) {
+    var completed = (probes.completed_probes || []).join('、') || '—';
+    var missing = (probes.missing_probes || []);
+    var offline = (probes.offline_probes || []);
+    var text = '已回传 ' + completed
+      + '（缺 ' + missing.length + '、离线 ' + offline.length + '）'
+      + '，最少完成 ' + (probes.minimum_completed_probes === undefined ? '—' : probes.minimum_completed_probes);
+    host.appendChild(dashCard('探测点', text));
+    if (missing.length || offline.length) {
+      host.lastChild.classList.add('warn');
+    }
+  }
 }
 
 function runBadge(status){

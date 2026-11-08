@@ -504,8 +504,16 @@ async fn status(State(state): State<SharedState>) -> Response {
             })
         })
         .collect();
+    // G-3（workstreams/34 R4）：最近一轮的探测点聚合摘要（None = 兼容模式）。
+    let probe_summary = state
+        .storage
+        .lock()
+        .ok()
+        .and_then(|storage| storage.latest_round_probe_summary().ok())
+        .flatten();
     Json(serde_json::json!({
         "service": "mihomo-probe-rs",
+        "probes": probe_summary,
         "rounds": {
             "running": running,
             "running_round_id": state.running_round_id(),
@@ -1015,6 +1023,13 @@ async fn round_task(
                     outcome.counts.dropped,
                 ),
             );
+            // Workstreams/34 R4：轮末聚合摘要落列（探测点面板读取）。
+            if let Some(summary) = &outcome.aggregate_summary {
+                let storage = task_state.storage.lock().unwrap_or_else(|p| p.into_inner());
+                if let Err(err) = storage.set_round_probe_summary(round_id, summary) {
+                    tracing::warn!(round_id, %err, "cannot record the probe summary");
+                }
+            }
             // Workstreams/34 R2：轮末告警（Python `_maybe_alert` 的调用位），
             // 与 CLI 同位——行关闭后、发布前；best-effort。
             if task_state.alert.enabled {

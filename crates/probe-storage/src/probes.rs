@@ -368,6 +368,57 @@ impl Storage {
     }
 }
 
+impl Storage {
+    /// 轮末聚合摘要落列（status 端点与面板读取；NULL = 兼容模式）。
+    pub fn set_round_probe_summary(
+        &self,
+        round_id: i64,
+        summary: &serde_json::Value,
+    ) -> DomainResult<()> {
+        self.conn
+            .execute(
+                "UPDATE rounds SET probe_summary=? WHERE id=?",
+                params![summary.to_string(), round_id],
+            )
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 最近一轮（或指定轮）的聚合摘要；None = 兼容模式或列空。
+    pub fn round_probe_summary(&self, round_id: i64) -> DomainResult<Option<serde_json::Value>> {
+        let text = self
+            .conn
+            .query_row(
+                "SELECT probe_summary FROM rounds WHERE id=?",
+                params![round_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        Ok(text.and_then(|text| match text {
+            Some(text) if !text.is_empty() => serde_json::from_str::<serde_json::Value>(&text).ok(),
+            _ => None,
+        }))
+    }
+
+    /// 最近已完成轮的聚合摘要（status 端点口径；含 suspect/inconclusive 轮）。
+    pub fn latest_round_probe_summary(&self) -> DomainResult<Option<serde_json::Value>> {
+        let text = self
+            .conn
+            .query_row(
+                "SELECT probe_summary FROM rounds WHERE id = (SELECT MAX(id) FROM rounds)",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|e| DomainError::Storage(e.to_string()))?;
+        Ok(text.and_then(|text| match text {
+            Some(text) if !text.is_empty() => serde_json::from_str::<serde_json::Value>(&text).ok(),
+            _ => None,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,5 +564,41 @@ mod tests {
         assert_eq!(rows[0]["audit_id"], "a2");
         assert_eq!(rows[0]["summary"]["why"], "expired");
         assert_eq!(rows[1]["status"], "pushed");
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    /// 轮末摘要落列 + 最近轮读取（status 端点口径）。
+    #[test]
+    fn the_round_summary_round_trips() {
+        let storage = Storage::open_in_memory().unwrap();
+        assert!(storage.latest_round_probe_summary().unwrap().is_none());
+        let round = storage.start_round("test", None).unwrap();
+        let summary = serde_json::json!({
+            "strategy": "any_alive",
+            "completed_probes": ["local", "p1"],
+            "missing_probes": ["p2"],
+            "offline_probes": [],
+        });
+        storage.set_round_probe_summary(round, &summary).unwrap();
+        let read = storage.latest_round_probe_summary().unwrap().unwrap();
+        assert_eq!(read["completed_probes"], summary["completed_probes"]);
+        assert_eq!(read["missing_probes"], serde_json::json!(["p2"]));
+        // 指定轮读取同答。
+        assert_eq!(
+            storage.round_probe_summary(round).unwrap().unwrap()["strategy"],
+            "any_alive"
+        );
+    }
+
+    /// 兼容模式（列空/无行）读出 None，绝不假装有摘要。
+    #[test]
+    fn a_missing_summary_reads_as_none() {
+        let storage = Storage::open_in_memory().unwrap();
+        let round = storage.start_round("test", None).unwrap();
+        assert!(storage.round_probe_summary(round).unwrap().is_none());
     }
 }

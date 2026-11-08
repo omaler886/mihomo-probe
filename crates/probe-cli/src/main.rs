@@ -679,6 +679,15 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
             println!("alert: {result}");
         }
     }
+    // Workstreams/34 R4：轮末聚合摘要落列（status 端点与探测点面板读取）。
+    if let Some(summary) = &outcome.aggregate_summary {
+        let guard = storage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(err) = guard.set_round_probe_summary(round_id, summary) {
+            eprintln!("round: cannot record the probe summary: {err}");
+        }
+    }
     match outcome.guard {
         probe_engine::round::GuardDecision::ApplyConvergence => {}
         probe_engine::round::GuardDecision::PreservePreviousState => {

@@ -13,7 +13,7 @@ use rusqlite::Connection;
 
 use crate::{utc_now, DomainResult};
 
-pub const LATEST_VERSION: i64 = 14;
+pub const LATEST_VERSION: i64 = 15;
 
 /// (version, name, sql). Versions are strictly increasing and append-only:
 /// an applied migration is never edited, corrections come as new files.
@@ -87,6 +87,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         14,
         "0014_probe_deadlines",
         include_str!("../../../migrations/0014_probe_deadlines.sql"),
+    ),
+    (
+        15,
+        "0015_round_probe_summary",
+        include_str!("../../../migrations/0015_round_probe_summary.sql"),
     ),
 ];
 
@@ -321,6 +326,7 @@ mod tests {
                         "mode",
                         "inconclusive",
                         "probe_config_digest",
+                        "probe_summary",
                     ]
                 );
                 continue;
