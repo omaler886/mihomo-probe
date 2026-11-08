@@ -664,6 +664,21 @@ async fn cmd_round_async(root: &Path, cfg: Config, trigger: &str, mode: Option<&
             outcome.front_dead
         );
     }
+    // Workstreams/34 R2：轮末告警（Python `_maybe_alert` 的调用位）。 suspects
+    // → error、alive_floor 命中 → warn；best-effort，任何通道故障只进日志，
+    // 绝不影响轮次结果。
+    if cfg.alert.enabled {
+        let notifier = probe_engine::notifier::Notifier::from_config(&cfg.alert, root);
+        let results = probe_engine::notifier::maybe_alert_after_round(
+            &notifier,
+            outcome.suspect,
+            outcome.counts.ok,
+        )
+        .await;
+        for result in results {
+            println!("alert: {result}");
+        }
+    }
     match outcome.guard {
         probe_engine::round::GuardDecision::ApplyConvergence => {}
         probe_engine::round::GuardDecision::PreservePreviousState => {
@@ -2156,6 +2171,7 @@ async fn cmd_serve(root: &Path, host: &str, port: u16) -> std::io::Result<()> {
                 substore_target_name: cfg.substore.target_name.clone(),
                 aggregation: cfg.aggregation.clone(),
                 probe_config_digest: cfg.probe_config_digest.clone(),
+                alert: cfg.alert.clone(),
             },
         )
         .with_publish(cfg.publish.clone()),

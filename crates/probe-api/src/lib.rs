@@ -101,6 +101,8 @@ pub struct AppState {
     pub aggregation: probe_config::AggregationSection,
     /// The six-section dispatch digest, computed at config load (workstreams/31).
     pub probe_config_digest: String,
+    /// The alert section snapshot (workstreams/34 R2): 轮末告警通道与冷却.
+    pub alert: probe_config::AlertSection,
 }
 
 impl AppState {
@@ -171,6 +173,7 @@ impl AppState {
             substore_target_name: serve.substore_target_name,
             aggregation: serve.aggregation,
             probe_config_digest: serve.probe_config_digest,
+            alert: serve.alert,
         }
     }
     /// Record the config file this process was started from, so the config
@@ -341,6 +344,8 @@ pub struct ServeConfig {
     pub aggregation: probe_config::AggregationSection,
     /// The six-section dispatch digest, computed at config load (workstreams/31).
     pub probe_config_digest: String,
+    /// The alert section snapshot (workstreams/34 R2): 轮末告警通道与冷却.
+    pub alert: probe_config::AlertSection,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -1010,6 +1015,23 @@ async fn round_task(
                     outcome.counts.dropped,
                 ),
             );
+            // Workstreams/34 R2：轮末告警（Python `_maybe_alert` 的调用位），
+            // 与 CLI 同位——行关闭后、发布前；best-effort。
+            if task_state.alert.enabled {
+                let notifier = probe_engine::notifier::Notifier::from_config(
+                    &task_state.alert,
+                    &task_state.root,
+                );
+                let results = probe_engine::notifier::maybe_alert_after_round(
+                    &notifier,
+                    outcome.suspect,
+                    outcome.counts.ok,
+                )
+                .await;
+                for result in results {
+                    record_event(&task_state, "warn", &format!("alert: {result}"));
+                }
+            }
             // R8: publish after the row closed, while this task still holds
             // the in-flight flag -- a client that sees the flag clear can
             // trust that this round's exports are durable.
@@ -2018,6 +2040,7 @@ mod tests {
                 substore_target_name: probe_config::DEFAULT_SUBSTORE_TARGET_NAME.into(),
                 aggregation: probe_config::AggregationSection::default(),
                 probe_config_digest: String::new(),
+                alert: probe_config::AlertSection::default(),
             },
         )
     }

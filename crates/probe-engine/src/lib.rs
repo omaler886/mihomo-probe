@@ -19,6 +19,7 @@ pub mod limits;
 pub mod manual_publish;
 pub mod measure;
 pub mod network;
+pub mod notifier;
 pub mod preflight;
 pub mod probe_aggregate;
 pub mod probe_dispatch;

@@ -466,6 +466,8 @@ pub struct Config {
     pub probes: Vec<ProbeSpec>,
     /// The `aggregation` section (G-3): how observations fold into verdicts.
     pub aggregation: AggregationSection,
+    /// The `alert` section (workstreams/34 R1): 轮末告警通道与冷却。
+    pub alert: AlertSection,
     /// G-3 dispatch digest: the six-section config digest computed at load
     /// time from the raw JSON (`six_section_digest`). Dispatch writes it onto
     /// the round row; the result endpoint compares the agent's echo against
@@ -651,6 +653,103 @@ impl AggregationSection {
     }
 }
 
+/// `alert`：轮末告警（Python DEFAULTS["alert"]；workstreams/34 R1）。
+/// token/chat_id 沿用 Python 的 config 内存储（config.json 不入库、被
+/// .gitignore 覆盖；与 Gist/探测点凭据的「只经文件/环境变量」纪律不同源，
+/// 属既有 schema 的诚实平移，MIGRATION_MAPPING 已登记）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertSection {
+    pub enabled: bool,
+    /// Telegram bot 通道。
+    pub telegram: TelegramAlertSection,
+    /// 通用 webhook 通道（POST JSON payload）。
+    pub webhook: WebhookAlertSection,
+    /// 同 key 告警的冷却分钟数（Python 默认 240）。
+    pub cooldown_minutes: i64,
+    /// 存活下限：本轮 alive 低于它发 warn 告警。0 = 关。
+    pub alive_floor: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TelegramAlertSection {
+    pub enabled: bool,
+    pub token: String,
+    pub chat_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebhookAlertSection {
+    pub enabled: bool,
+    pub url: String,
+}
+
+pub const DEFAULT_ALERT_COOLDOWN_MINUTES: i64 = 240;
+
+impl Default for AlertSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            telegram: TelegramAlertSection::default(),
+            webhook: WebhookAlertSection::default(),
+            cooldown_minutes: DEFAULT_ALERT_COOLDOWN_MINUTES,
+            alive_floor: 0,
+        }
+    }
+}
+
+impl AlertSection {
+    fn from_value(value: &Value) -> Self {
+        let defaults = Self::default();
+        let telegram = value.get("telegram");
+        let webhook = value.get("webhook");
+        let number = |key: &str, fallback: i64| -> i64 {
+            value
+                .get(key)
+                .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+                .unwrap_or(fallback)
+        };
+        Self {
+            enabled: value
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(defaults.enabled),
+            telegram: TelegramAlertSection {
+                enabled: telegram
+                    .and_then(|v| v.get("enabled"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                token: telegram
+                    .and_then(|v| v.get("token"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+                chat_id: telegram
+                    .and_then(|v| v.get("chat_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            },
+            webhook: WebhookAlertSection {
+                enabled: webhook
+                    .and_then(|v| v.get("enabled"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                url: webhook
+                    .and_then(|v| v.get("url"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            },
+            cooldown_minutes: number("cooldown_minutes", defaults.cooldown_minutes)
+                .clamp(1, 10_080),
+            alive_floor: number("alive_floor", defaults.alive_floor).clamp(0, 1_000_000),
+        }
+    }
+}
+
 /// `quality`: per-round throughput sampling for a small, spread subset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QualitySection {
@@ -756,6 +855,7 @@ impl Config {
                 aggregation: AggregationSection::from_value(
                     cfg.get("aggregation").unwrap_or(&Value::Null),
                 ),
+                alert: AlertSection::from_value(cfg.get("alert").unwrap_or(&Value::Null)),
                 probe_config_digest: six_section_digest(&cfg),
             },
             json_valid,

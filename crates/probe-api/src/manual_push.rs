@@ -364,6 +364,7 @@ mod tests {
                 substore_target_name: probe_config::DEFAULT_SUBSTORE_TARGET_NAME.into(),
                 aggregation: probe_config::AggregationSection::default(),
                 probe_config_digest: String::new(),
+                alert: probe_config::AlertSection::default(),
             },
         ));
         let export_root = state.publish.export_root(&state.root);
@@ -427,6 +428,7 @@ mod tests {
                 substore_target_name: probe_config::DEFAULT_SUBSTORE_TARGET_NAME.into(),
                 aggregation: probe_config::AggregationSection::default(),
                 probe_config_digest: String::new(),
+                alert: probe_config::AlertSection::default(),
             },
         ));
         let app = build_router(state.clone());

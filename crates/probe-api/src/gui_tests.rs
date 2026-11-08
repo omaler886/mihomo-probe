@@ -46,6 +46,7 @@ fn gui_state(root: &std::path::Path, sources: Vec<SourceSpec>) -> SharedState {
             substore_target_name: probe_config::DEFAULT_SUBSTORE_TARGET_NAME.into(),
             aggregation: probe_config::AggregationSection::default(),
             probe_config_digest: String::new(),
+            alert: probe_config::AlertSection::default(),
         },
     ))
 }

@@ -356,6 +356,7 @@ mod tests {
                 substore_target_name: probe_config::DEFAULT_SUBSTORE_TARGET_NAME.into(),
                 aggregation: probe_config::AggregationSection::default(),
                 probe_config_digest: String::new(),
+                alert: probe_config::AlertSection::default(),
                 chain: cfg.chain.clone(),
                 publish_prefix: cfg.publish_prefix.clone(),
                 publish: cfg.publish.clone(),
